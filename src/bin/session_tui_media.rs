@@ -39,21 +39,27 @@ pub struct AttachmentMeta {
     pub height: Option<u32>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImagePreview {
     /// Each terminal cell is the top and bottom pixel of a half-block glyph.
     pub rows: Vec<Vec<([u8; 3], [u8; 3])>>,
 }
 
+/// Cache path of one attachment of a message. Index 0 keeps the original
+/// single-attachment layout so existing caches stay valid.
 pub fn attachment_blob_path(
     root: &std::path::Path,
     peer: &str,
     timestamp: u64,
+    index: usize,
 ) -> std::path::PathBuf {
     let mut params = blake2b_simd::Params::new();
     params.hash_length(16);
     let mut input = peer.as_bytes().to_vec();
     input.extend_from_slice(&timestamp.to_le_bytes());
+    if index > 0 {
+        input.extend_from_slice(&(index as u64).to_le_bytes());
+    }
     root.join("attachments").join(format!(
         "{}.blob",
         hex::encode(params.hash(&input).as_bytes())

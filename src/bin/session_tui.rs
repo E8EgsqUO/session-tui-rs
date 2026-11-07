@@ -36,7 +36,8 @@ use libsession::{
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
     },
     execute,
@@ -99,32 +100,97 @@ fn debug_log(event: &str, detail: &str) {
 
 #[derive(Clone)]
 struct Message {
+    /// Text body; for attachment messages this is the caption, as in Session.
     body: String,
-    time: String,
     timestamp_ms: u64,
     outgoing: bool,
     receipt_status: u8,
     is_read: bool,
-    attachment: Option<AttachmentMeta>,
-    image_preview: Option<ImagePreview>,
+    /// Session ID of the author for incoming group messages.
+    sender: Option<String>,
+    /// All attachments of the message (Session sends albums as one
+    /// DataMessage with several AttachmentPointers).
+    attachments: Vec<AttachmentMeta>,
+    /// One preview slot per attachment.
+    image_previews: Vec<Option<ImagePreview>>,
+}
+
+impl Message {
+    fn new(body: String, timestamp_ms: u64, outgoing: bool) -> Self {
+        Self {
+            body,
+            timestamp_ms,
+            outgoing,
+            receipt_status: 0,
+            is_read: outgoing,
+            sender: None,
+            attachments: Vec::new(),
+            image_previews: Vec::new(),
+        }
+    }
+
+    fn preview_text(&self) -> String {
+        message_preview_text(&self.body, &self.attachments)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredMessage {
     body: String,
+    /// Legacy single-attachment fields (read for old rows, never written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     attachment: Option<AttachmentMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     image_preview: Option<ImagePreview>,
+    #[serde(default)]
+    attachments: Vec<AttachmentMeta>,
+    #[serde(default)]
+    image_previews: Vec<Option<ImagePreview>>,
+    #[serde(default)]
+    sender: Option<String>,
 }
 
 const STORED_MESSAGE_PREFIX: &str = "\0session-tui-message-v1:";
+
+/// Session clients accept at most 32 attachments in one message.
+const MAX_ATTACHMENTS: usize = 32;
+
+/// Upper bound on `more` pages fetched per namespace in one sync.
+const MAX_RETRIEVE_PAGES: usize = 20;
 
 struct Conversation {
     name: String,
     id: String,
     preview: String,
-    unread: u8,
     messages: Vec<Message>,
     selected_message: usize,
+}
+
+impl Conversation {
+    fn unread(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| !m.outgoing && !m.is_read)
+            .count()
+    }
+
+    fn last_activity(&self) -> u64 {
+        self.messages.last().map_or(0, |m| m.timestamp_ms)
+    }
+
+    fn refresh_preview(&mut self) {
+        self.preview = self
+            .messages
+            .last()
+            .map(Message::preview_text)
+            .unwrap_or_else(|| "Start a conversation".into());
+    }
+
+    fn clamp_selection(&mut self) {
+        self.selected_message = self
+            .selected_message
+            .min(self.messages.len().saturating_sub(1));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -153,8 +219,12 @@ struct App {
     profile_name: String,
     image_viewer: Option<ImageViewer>,
     contact_list_area: Option<Rect>,
+    contact_list_offset: usize,
     message_viewport: Option<Rect>,
-    message_hitboxes: Vec<(u16, u16, usize)>,
+    /// (first row, last row, message index, attachment index)
+    message_hitboxes: Vec<(u16, u16, usize, Option<usize>)>,
+    /// Display names of group members and other senders, by Session ID.
+    display_names: HashMap<String, String>,
 }
 
 impl App {
@@ -172,62 +242,57 @@ impl App {
             profile_name: String::new(),
             image_viewer: None,
             contact_list_area: None,
+            contact_list_offset: 0,
             message_viewport: None,
             message_hitboxes: Vec::new(),
+            display_names: HashMap::new(),
         }
     }
 
-    fn append_message(&mut self, body: String, timestamp_ms: u64, outgoing: bool) {
-        let Some(conversation) = self.conversations.get_mut(self.selected) else {
-            return;
-        };
-        conversation.preview = body.clone();
-        conversation.messages.push(Message {
-            body,
-            time: format_time(timestamp_ms),
-            timestamp_ms,
-            outgoing,
-            receipt_status: 0,
-            is_read: outgoing,
-            attachment: None,
-            image_preview: None,
-        });
-        conversation.selected_message = conversation.messages.len() - 1;
+    /// Order chats by latest activity (newest first) like Session, keeping
+    /// the currently selected chat selected.
+    fn sort_conversations(&mut self) {
+        let selected_id = self.conversations.get(self.selected).map(|c| c.id.clone());
+        self.conversations
+            .sort_by_key(|c| std::cmp::Reverse(c.last_activity()));
+        if let Some(id) = selected_id
+            && let Some(index) = self.conversations.iter().position(|c| c.id == id)
+        {
+            self.selected = index;
+        }
     }
 
-    fn selected_message(&self) -> Option<(u64, bool)> {
+    fn sender_label(&self, sender: &str) -> String {
+        self.display_names
+            .get(sender)
+            .cloned()
+            .unwrap_or_else(|| short_id(sender))
+    }
+
+    fn selected_message(&self) -> Option<&Message> {
         let conversation = self.conversations.get(self.selected)?;
-        let message = conversation.messages.get(conversation.selected_message)?;
-        Some((message.timestamp_ms, message.outgoing))
+        conversation.messages.get(conversation.selected_message)
     }
 
-    fn remove_selected_message(&mut self) -> Option<bool> {
+    fn remove_selected_message(&mut self) -> Option<Message> {
         let conversation = self.conversations.get_mut(self.selected)?;
         if conversation.selected_message >= conversation.messages.len() {
             return None;
         }
-        conversation.messages.remove(conversation.selected_message);
-        conversation.selected_message = conversation
-            .selected_message
-            .min(conversation.messages.len().saturating_sub(1));
-        conversation.preview = conversation
-            .messages
-            .last()
-            .map(|message| message.body.clone())
-            .unwrap_or_else(|| "Start a conversation".into());
-        Some(true)
+        let removed = conversation.messages.remove(conversation.selected_message);
+        conversation.clamp_selection();
+        conversation.refresh_preview();
+        Some(removed)
     }
 
     fn ensure_contact(&mut self, id: &str) -> usize {
         if let Some(index) = self.conversations.iter().position(|c| c.id == id) {
             return index;
         }
-        let name = format!("{}…{}", &id[..8], &id[id.len() - 4..]);
         self.conversations.push(Conversation {
-            name,
+            name: short_id(id),
             id: id.to_owned(),
             preview: "Start a conversation".into(),
-            unread: 0,
             messages: Vec::new(),
             selected_message: 0,
         });
@@ -247,8 +312,10 @@ impl App {
     }
 }
 
-fn open_selected_image(app: &mut App) -> Result<(), String> {
-    let (peer, timestamp, metadata) = {
+/// Open an image of the selected message. `index` is the 0-based attachment
+/// index; `None` opens the first image of the message.
+fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String> {
+    let (peer, timestamp, attachment_index, metadata) = {
         let conversation = app
             .conversations
             .get(app.selected)
@@ -257,19 +324,43 @@ fn open_selected_image(app: &mut App) -> Result<(), String> {
             .messages
             .get(conversation.selected_message)
             .ok_or("select an image message with ↑/↓ first")?;
+        if message.attachments.is_empty() {
+            return Err("selected message has no attachment".into());
+        }
+        let attachment_index = match index {
+            Some(index) => index,
+            None => message
+                .attachments
+                .iter()
+                .position(|a| a.content_type.starts_with("image/"))
+                .ok_or("selected message has no image")?,
+        };
         let metadata = message
-            .attachment
-            .clone()
-            .ok_or("selected message is not an attachment")?;
+            .attachments
+            .get(attachment_index)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "message has {} attachment(s); use /view 1-{}",
+                    message.attachments.len(),
+                    message.attachments.len()
+                )
+            })?;
         if !metadata.content_type.starts_with("image/") {
             return Err("selected attachment is not an image".into());
         }
-        (conversation.id.clone(), message.timestamp_ms, metadata)
+        (
+            conversation.id.clone(),
+            message.timestamp_ms,
+            attachment_index,
+            metadata,
+        )
     };
     let root = session_data_dir()?;
-    let cache_path = session_tui_media::attachment_blob_path(&root, &peer, timestamp);
+    let cache_path =
+        session_tui_media::attachment_blob_path(&root, &peer, timestamp, attachment_index);
     let encrypted = std::fs::read(&cache_path)
-        .map_err(|_| "image is not cached yet; use /save to download it first".to_string())?;
+        .map_err(|_| "image is still downloading; try again shortly".to_string())?;
     let plaintext = session_tui_media::decrypt_attachment(
         &encrypted,
         &metadata.key,
@@ -293,8 +384,15 @@ fn open_selected_image(app: &mut App) -> Result<(), String> {
         picker.set_protocol_type(protocol);
     }
     let protocol = picker.new_resize_protocol(image);
+    let count = app
+        .selected_message()
+        .map_or(1, |message| message.attachments.len());
     app.image_viewer = Some(ImageViewer {
-        title: metadata.file_name,
+        title: if count > 1 {
+            format!("{} ({}/{count})", metadata.file_name, attachment_index + 1)
+        } else {
+            metadata.file_name
+        },
         protocol,
     });
     Ok(())
@@ -316,7 +414,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     if app.contact_list_area.is_some_and(in_rect) {
         app.focus = FocusArea::Contacts;
         let area = app.contact_list_area.expect("checked above");
-        let row = (mouse.row.saturating_sub(area.y) / 3) as usize;
+        let row = (mouse.row.saturating_sub(area.y) / 3) as usize + app.contact_list_offset;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if row < app.conversations.len() {
@@ -350,23 +448,27 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, _, index)) = app
+                // Attachment hitboxes are pushed after their message's
+                // hitbox, so search from the end to prefer the most specific.
+                if let Some((_, _, index, attachment)) = app
                     .message_hitboxes
                     .iter()
-                    .find(|(start, end, _)| mouse.row >= *start && mouse.row <= *end)
+                    .rev()
+                    .find(|(start, end, _, _)| mouse.row >= *start && mouse.row <= *end)
                 {
-                    let index = *index;
+                    let (index, attachment) = (*index, *attachment);
                     if let Some(conversation) = app.conversations.get_mut(app.selected) {
                         conversation.selected_message = index;
                     }
-                    let is_image = app
-                        .conversations
-                        .get(app.selected)
-                        .and_then(|conversation| conversation.messages.get(index))
-                        .and_then(|message| message.attachment.as_ref())
-                        .is_some_and(|attachment| attachment.content_type.starts_with("image/"));
+                    let is_image = attachment.is_some_and(|attachment| {
+                        app.conversations
+                            .get(app.selected)
+                            .and_then(|conversation| conversation.messages.get(index))
+                            .and_then(|message| message.attachments.get(attachment))
+                            .is_some_and(|meta| meta.content_type.starts_with("image/"))
+                    });
                     if is_image {
-                        app.status = match open_selected_image(app) {
+                        app.status = match open_selected_image(app, attachment) {
                             Ok(()) => "IMAGE PREVIEW · PRESS ESC TO CLOSE".into(),
                             Err(error) => format!("IMAGE PREVIEW FAILED · {error}"),
                         };
@@ -378,19 +480,41 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     }
 }
 
-fn message_preview_text(body: &str, attachment: Option<&AttachmentMeta>) -> String {
-    if !body.trim().is_empty() {
-        return body.to_owned();
+fn short_id(id: &str) -> String {
+    if id.len() < 12 {
+        return id.to_owned();
     }
-    match attachment {
-        Some(attachment) if attachment.content_type.starts_with("image/") => {
-            format!("[Photo] {}", attachment.file_name)
+    format!("{}…{}", &id[..8], &id[id.len() - 4..])
+}
+
+fn attachment_label(attachment: &AttachmentMeta) -> String {
+    let kind = if attachment.content_type.starts_with("image/") {
+        "Photo"
+    } else if attachment.content_type.starts_with("audio/") {
+        "Audio"
+    } else if attachment.content_type.starts_with("video/") {
+        "Video"
+    } else {
+        "File"
+    };
+    format!("[{kind}] {}", attachment.file_name)
+}
+
+/// Single-line summary used for the chat list.
+fn message_preview_text(body: &str, attachments: &[AttachmentMeta]) -> String {
+    if !body.trim().is_empty() {
+        return body.lines().next().unwrap_or_default().to_owned();
+    }
+    match attachments {
+        [] => String::new(),
+        [only] => attachment_label(only),
+        _ if attachments
+            .iter()
+            .all(|a| a.content_type.starts_with("image/")) =>
+        {
+            format!("[{} Photos]", attachments.len())
         }
-        Some(attachment) if attachment.content_type.starts_with("audio/") => {
-            format!("[Audio] {}", attachment.file_name)
-        }
-        Some(attachment) => format!("[File] {}", attachment.file_name),
-        None => String::new(),
+        [first, rest @ ..] => format!("{} +{}", attachment_label(first), rest.len()),
     }
 }
 
@@ -413,6 +537,10 @@ fn mime_type_for_name(name: &str) -> &'static str {
         "zip" => "application/zip",
         "mp3" => "audio/mpeg",
         "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "flac" => "audio/flac",
         "wav" => "audio/wav",
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
@@ -428,8 +556,16 @@ fn default_attachment_extension(content_type: &str) -> Option<&'static str> {
         "image/webp" => Some("webp"),
         "image/heic" | "image/heif" => Some("heic"),
         "audio/mpeg" => Some("mp3"),
-        "audio/mp4" => Some("m4a"),
+        "audio/mp4" | "audio/x-m4a" => Some("m4a"),
+        "audio/aac" => Some("aac"),
+        "audio/ogg" => Some("ogg"),
+        "audio/opus" => Some("opus"),
+        "audio/flac" => Some("flac"),
         "audio/wav" | "audio/x-wav" => Some("wav"),
+        "image/bmp" => Some("bmp"),
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        "application/zip" => Some("zip"),
         "video/mp4" => Some("mp4"),
         "video/quicktime" => Some("mov"),
         _ => None,
@@ -477,6 +613,15 @@ fn attachment_pointer_from_meta(meta: &AttachmentMeta) -> AttachmentPointer {
     }
 }
 
+fn profile_for(profile_name: &str, timestamp_ms: u64) -> Option<LokiProfile> {
+    let name = profile_name.trim();
+    (!name.is_empty()).then(|| LokiProfile {
+        display_name: Some(name.to_owned()),
+        last_update_seconds: Some(timestamp_ms / 1000),
+        ..Default::default()
+    })
+}
+
 fn split_host_port(host: &str) -> (&str, Option<u16>) {
     if let Some((name, port)) = host.rsplit_once(':')
         && let Ok(port) = port.parse::<u16>()
@@ -504,9 +649,26 @@ struct IncomingMessage {
     timestamp_ms: u64,
     unsend: Option<(u64, String)>,
     receipt: Option<(i32, Vec<u64>)>,
-    attachment: Option<AttachmentMeta>,
-    encrypted_attachment: Option<Vec<u8>>,
-    image_preview: Option<ImagePreview>,
+    /// Attachment pointers only; the files are fetched by a separate
+    /// background download queue after the message is stored.
+    attachments: Vec<AttachmentMeta>,
+}
+
+impl IncomingMessage {
+    fn control(hash: String, sender_id: String, contact_id: String, timestamp_ms: u64) -> Self {
+        Self {
+            hash,
+            sender_id,
+            contact_id,
+            outgoing: false,
+            sender_name: None,
+            body: None,
+            timestamp_ms,
+            unsend: None,
+            receipt: None,
+            attachments: Vec::new(),
+        }
+    }
 }
 
 struct RetrieveResult {
@@ -517,6 +679,24 @@ struct RetrieveResult {
     bad_content: usize,
     last_hash: Option<String>,
     groups: Vec<DiscoveredGroup>,
+    /// Updated per-group message cursors (group id → last hash).
+    group_cursors: HashMap<String, String>,
+}
+
+/// One attachment waiting to be downloaded into the local cache.
+#[derive(Clone)]
+struct PendingDownload {
+    peer: String,
+    timestamp_ms: u64,
+    outgoing: bool,
+    index: usize,
+    meta: AttachmentMeta,
+}
+
+struct DownloadedAttachment {
+    job: PendingDownload,
+    encrypted: Vec<u8>,
+    preview: Option<ImagePreview>,
 }
 
 #[derive(Clone)]
@@ -539,11 +719,11 @@ struct SessionClient {
     groups: Mutex<HashMap<String, GroupRuntime>>,
 }
 
-struct SentAttachment {
+struct SentAttachments {
     timestamp_ms: u64,
-    metadata: AttachmentMeta,
-    encrypted: Vec<u8>,
-    preview: Option<ImagePreview>,
+    caption: String,
+    /// (metadata, encrypted blob, preview) per attachment, in send order.
+    files: Vec<(AttachmentMeta, Vec<u8>, Option<ImagePreview>)>,
     sync_copy_sent: bool,
 }
 
@@ -591,7 +771,8 @@ impl LocalStore {
                     UNIQUE(peer_id, timestamp_ms, outgoing)
                  );
                  CREATE TABLE IF NOT EXISTS seen_hashes (hash TEXT PRIMARY KEY);
-                 CREATE TABLE IF NOT EXISTS sync_state (id INTEGER PRIMARY KEY CHECK(id = 1), last_hash TEXT NOT NULL);",
+                 CREATE TABLE IF NOT EXISTS sync_state (id INTEGER PRIMARY KEY CHECK(id = 1), last_hash TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS profiles (session_id TEXT PRIMARY KEY, display_name TEXT NOT NULL);",
             )
             .map_err(|e| e.to_string())?;
         let _ = connection.execute(
@@ -705,52 +886,76 @@ impl LocalStore {
                 ))
             })
             .map_err(|e| e.to_string())?;
+        let root = session_data_dir().ok();
         for row in rows {
             let (peer, timestamp_ms, outgoing, encrypted, receipt_status, is_read) =
                 row.map_err(|e| e.to_string())?;
             let stored = self.decrypt_body(&encrypted)?;
-            let (body, attachment, cached_preview) =
-                if let Some(json) = stored.strip_prefix(STORED_MESSAGE_PREFIX) {
-                    let payload: StoredMessage =
-                        serde_json::from_str(json).map_err(|e| e.to_string())?;
-                    (payload.body, payload.attachment, payload.image_preview)
-                } else {
-                    (stored, None, None)
-                };
-            let image_preview = cached_preview.or_else(|| {
-                attachment.as_ref().and_then(|meta| {
-                    let path = session_tui_media::attachment_blob_path(
-                        &session_data_dir().ok()?,
-                        &peer,
-                        timestamp_ms,
-                    );
-                    let ciphertext = std::fs::read(path).ok()?;
-                    let plaintext = session_tui_media::decrypt_attachment(
-                        &ciphertext,
+            let mut message = Message::new(String::new(), timestamp_ms, outgoing);
+            message.receipt_status = receipt_status;
+            message.is_read = is_read;
+            if let Some(json) = stored.strip_prefix(STORED_MESSAGE_PREFIX) {
+                let payload: StoredMessage =
+                    serde_json::from_str(json).map_err(|e| e.to_string())?;
+                message.body = payload.body;
+                message.sender = payload.sender;
+                message.attachments = payload.attachments;
+                message.image_previews = payload.image_previews;
+                if let Some(legacy) = payload.attachment {
+                    message.attachments.insert(0, legacy);
+                    message.image_previews.insert(0, payload.image_preview);
+                }
+            } else {
+                message.body = stored;
+            }
+            message
+                .image_previews
+                .resize(message.attachments.len(), None);
+            // Rebuild missing previews from cached image blobs.
+            for (index, meta) in message.attachments.iter().enumerate() {
+                if message.image_previews[index].is_some()
+                    || !meta.content_type.starts_with("image/")
+                {
+                    continue;
+                }
+                let Some(root) = root.as_deref() else { break };
+                let path =
+                    session_tui_media::attachment_blob_path(root, &peer, timestamp_ms, index);
+                message.image_previews[index] = std::fs::read(path).ok().and_then(|blob| {
+                    session_tui_media::decrypt_attachment(
+                        &blob,
                         &meta.key,
                         &meta.digest,
                         meta.deterministic,
                     )
-                    .ok()?;
-                    session_tui_media::image_preview(&plaintext)
-                })
-            });
+                    .ok()
+                    .and_then(|plaintext| session_tui_media::image_preview(&plaintext))
+                });
+            }
             let index = app.ensure_contact(&peer);
             let convo = &mut app.conversations[index];
-            convo.preview = message_preview_text(&body, attachment.as_ref());
-            convo.messages.push(Message {
-                body,
-                time: format_time(timestamp_ms),
-                timestamp_ms,
-                outgoing,
-                receipt_status,
-                is_read,
-                attachment,
-                image_preview,
-            });
+            convo.preview = message.preview_text();
+            convo.messages.push(message);
             convo.selected_message = convo.messages.len() - 1;
         }
         drop(statement);
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT session_id, display_name FROM profiles")
+            .map_err(|e| e.to_string())?;
+        let profiles = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for profile in profiles {
+            let (id, name) = profile.map_err(|e| e.to_string())?;
+            app.display_names.insert(id, name);
+        }
+        drop(statement);
+        app.sort_conversations();
+        app.selected = 0;
 
         let mut statement = self
             .connection
@@ -791,14 +996,21 @@ impl LocalStore {
         Ok(())
     }
 
-    fn save_message(&self, peer: &str, message: &Message) -> Result<(), String> {
+    fn encrypted_payload(&self, message: &Message) -> Result<Vec<u8>, String> {
         let payload = serde_json::to_string(&StoredMessage {
             body: message.body.clone(),
-            attachment: message.attachment.clone(),
-            image_preview: message.image_preview.clone(),
+            attachment: None,
+            image_preview: None,
+            attachments: message.attachments.clone(),
+            image_previews: message.image_previews.clone(),
+            sender: message.sender.clone(),
         })
         .map_err(|e| e.to_string())?;
-        let body = self.encrypt_body(&format!("{STORED_MESSAGE_PREFIX}{payload}"))?;
+        self.encrypt_body(&format!("{STORED_MESSAGE_PREFIX}{payload}"))
+    }
+
+    fn save_message(&self, peer: &str, message: &Message) -> Result<(), String> {
+        let body = self.encrypted_payload(message)?;
         self.connection.execute(
             "INSERT OR IGNORE INTO messages(peer_id, timestamp_ms, outgoing, body, receipt_status, is_read) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![peer, message.timestamp_ms as i64, message.outgoing, body, message.receipt_status, message.is_read],
@@ -806,12 +1018,64 @@ impl LocalStore {
         self.save_contact(peer)
     }
 
-    fn save_attachment_blob(&self, peer: &str, timestamp: u64, bytes: &[u8]) -> Result<(), String> {
+    /// Rewrite the stored payload (e.g. after an attachment preview arrives).
+    fn update_message(&self, peer: &str, message: &Message) -> Result<(), String> {
+        let body = self.encrypted_payload(message)?;
+        self.connection.execute(
+            "UPDATE messages SET body = ?4 WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3",
+            params![peer, message.timestamp_ms as i64, message.outgoing, body],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn save_display_name(&self, id: &str, name: &str) -> Result<(), String> {
+        self.connection.execute(
+            "INSERT INTO profiles(session_id, display_name) VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET display_name=excluded.display_name",
+            params![id, name],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn save_attachment_blob(
+        &self,
+        peer: &str,
+        timestamp: u64,
+        index: usize,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         let root = session_data_dir()?;
-        let path = session_tui_media::attachment_blob_path(&root, peer, timestamp);
+        let path = session_tui_media::attachment_blob_path(&root, peer, timestamp, index);
         let parent = path.parent().ok_or("invalid attachment cache path")?;
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         std::fs::write(path, bytes).map_err(|e| e.to_string())
+    }
+
+    fn get_group_cursors(&self) -> Result<HashMap<String, String>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT key, value FROM settings WHERE key LIKE 'group_cursor:%'")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut cursors = HashMap::new();
+        for row in rows {
+            let (key, value) = row.map_err(|e| e.to_string())?;
+            if let Some(group) = key.strip_prefix("group_cursor:") {
+                cursors.insert(group.to_owned(), value);
+            }
+        }
+        Ok(cursors)
+    }
+
+    fn set_group_cursor(&self, group: &str, hash: &str) -> Result<(), String> {
+        self.connection.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("group_cursor:{group}"), hash],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn update_receipt_status(&self, peer: &str, timestamp: u64, status: u8) -> Result<(), String> {
@@ -860,16 +1124,6 @@ impl LocalStore {
         Ok(())
     }
 
-    fn delete_incoming_message(&self, peer: &str, timestamp_ms: u64) -> Result<(), String> {
-        self.connection
-            .execute(
-                "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = 0",
-                params![peer, timestamp_ms as i64],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
     fn delete_empty_contact(&self, peer: &str) -> Result<(), String> {
         self.connection.execute(
             "DELETE FROM contacts WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE peer_id = ?1)",
@@ -878,13 +1132,24 @@ impl LocalStore {
         Ok(())
     }
 
-    fn delete_message(&self, peer: &str, timestamp_ms: u64) -> Result<(), String> {
+    /// Delete one stored message and its cached attachment files.
+    fn delete_message(&self, peer: &str, message: &Message) -> Result<(), String> {
         self.connection
             .execute(
-                "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2",
-                params![peer, timestamp_ms as i64],
+                "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3",
+                params![peer, message.timestamp_ms as i64, message.outgoing],
             )
             .map_err(|e| e.to_string())?;
+        if let Ok(root) = session_data_dir() {
+            for index in 0..message.attachments.len() {
+                let _ = std::fs::remove_file(session_tui_media::attachment_blob_path(
+                    &root,
+                    peer,
+                    message.timestamp_ms,
+                    index,
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1062,6 +1327,53 @@ impl SessionClient {
         namespace: i32,
         signing_key: &[u8],
     ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.retrieve_namespace_since(pubkey, pubkey_ed25519, namespace, signing_key, None)
+            .await
+            .map(|(messages, _)| messages)
+    }
+
+    /// Retrieve every message after `cursor`, following the swarm's `more`
+    /// flag. Returns the messages and the hash of the newest one seen.
+    async fn retrieve_namespace_since(
+        &self,
+        pubkey: &str,
+        pubkey_ed25519: &str,
+        namespace: i32,
+        signing_key: &[u8],
+        cursor: Option<&str>,
+    ) -> Result<(Vec<(String, Vec<u8>)>, Option<String>), String> {
+        let mut all = Vec::new();
+        let mut last_hash = cursor.map(str::to_owned);
+        for _ in 0..MAX_RETRIEVE_PAGES {
+            let (page, more) = self
+                .retrieve_namespace_page(
+                    pubkey,
+                    pubkey_ed25519,
+                    namespace,
+                    signing_key,
+                    last_hash.as_deref(),
+                )
+                .await?;
+            let empty = page.is_empty();
+            if let Some((hash, _)) = page.last() {
+                last_hash = Some(hash.clone());
+            }
+            all.extend(page);
+            if !more || empty {
+                break;
+            }
+        }
+        Ok((all, last_hash))
+    }
+
+    async fn retrieve_namespace_page(
+        &self,
+        pubkey: &str,
+        pubkey_ed25519: &str,
+        namespace: i32,
+        signing_key: &[u8],
+        last_hash: Option<&str>,
+    ) -> Result<(Vec<(String, Vec<u8>)>, bool), String> {
         let response = if pubkey.starts_with("03") {
             // Group namespace requests use the group signature format: pubkey,
             // namespace, timestamp and signature. They do not include the
@@ -1080,6 +1392,9 @@ impl SessionClient {
             params.insert("timestamp".to_owned(), Value::from(timestamp_ms));
             params.insert("signature".to_owned(), Value::String(signature));
             params.insert("max_size".to_owned(), Value::from(1_000_000u32));
+            if let Some(last_hash) = last_hash {
+                params.insert("last_hash".to_owned(), Value::String(last_hash.to_owned()));
+            }
             self.network
                 .send_rpc("retrieve", Value::Object(params), Some(pubkey))
                 .await
@@ -1091,7 +1406,7 @@ impl SessionClient {
                     pubkey_ed25519,
                     namespace,
                     timestamp_ms: now_ms(),
-                    last_hash: None,
+                    last_hash,
                     max_size: Some(1_000_000),
                     signing_key,
                 })
@@ -1135,6 +1450,7 @@ impl SessionClient {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or_else(|| format!("namespace {namespace} response has no messages"))?;
+        let more = value.get("more").and_then(Value::as_bool).unwrap_or(false);
         let mut result = Vec::new();
         for item in messages {
             let (Some(hash), Some(data)) = (
@@ -1164,7 +1480,7 @@ impl SessionClient {
                 result.iter().map(|(_, bytes)| bytes.len()).sum::<usize>()
             ),
         );
-        Ok(result)
+        Ok((result, more))
     }
 
     async fn discover_groups(&self) -> Result<Vec<DiscoveredGroup>, String> {
@@ -1482,14 +1798,16 @@ impl SessionClient {
     async fn retrieve_group_messages(
         &self,
         group: &GroupRuntime,
-    ) -> Result<Vec<IncomingMessage>, String> {
+        cursor: Option<&str>,
+    ) -> Result<(Vec<IncomingMessage>, Option<String>), String> {
         let group_pubkey = format!("03{}", hex::encode(group.public_key));
-        let raw_messages = self
-            .retrieve_namespace_raw(
+        let (raw_messages, last_hash) = self
+            .retrieve_namespace_since(
                 &group_pubkey,
                 &hex::encode(group.public_key),
                 11,
                 &group.secret_key,
+                cursor,
             )
             .await?;
         let key_refs: [&[u8]; 1] = [&group.encryption_key];
@@ -1510,21 +1828,16 @@ impl SessionClient {
                 continue;
             };
             let sender_id = format!("05{}", hex::encode(decoded.sender_x25519_pubkey));
+            let outgoing = sender_id == self.identity.session_id;
             if let Some(unsend) = content.unsend_request {
-                incoming.push(IncomingMessage {
+                let mut message = IncomingMessage::control(
                     hash,
-                    sender_id: sender_id.clone(),
-                    contact_id: group.id.clone(),
-                    outgoing: sender_id == self.identity.session_id,
-                    sender_name: None,
-                    body: None,
-                    timestamp_ms: decoded.envelope.timestamp,
-                    unsend: Some((unsend.timestamp, unsend.author)),
-                    receipt: None,
-                    attachment: None,
-                    encrypted_attachment: None,
-                    image_preview: None,
-                });
+                    sender_id,
+                    group.id.clone(),
+                    decoded.envelope.timestamp,
+                );
+                message.unsend = Some((unsend.timestamp, unsend.author));
+                incoming.push(message);
                 continue;
             }
             if content.receipt_message.is_some() {
@@ -1534,26 +1847,15 @@ impl SessionClient {
                 continue;
             };
             let timestamp_ms = data_message.timestamp.unwrap_or(decoded.envelope.timestamp);
-            let attachment_pointer = data_message.attachments.into_iter().next();
+            let attachments: Vec<AttachmentMeta> = data_message
+                .attachments
+                .iter()
+                .map(attachment_meta_from_pointer)
+                .collect();
             let text = data_message.body.unwrap_or_default();
-            if text.is_empty() && attachment_pointer.is_none() {
+            if text.is_empty() && attachments.is_empty() {
                 continue;
             }
-            let (attachment, encrypted_attachment, image_preview) =
-                if let Some(pointer) = attachment_pointer.as_ref() {
-                    match self.download_attachment(pointer).await {
-                        Ok((meta, encrypted, preview)) => (Some(meta), Some(encrypted), preview),
-                        Err(error) => {
-                            debug_log(
-                                "group.attachment.download_failed",
-                                &format!("error={error}"),
-                            );
-                            (Some(attachment_meta_from_pointer(pointer)), None, None)
-                        }
-                    }
-                } else {
-                    (None, None, None)
-                };
             let sender_name = data_message
                 .profile
                 .and_then(|profile| profile.display_name)
@@ -1561,20 +1863,18 @@ impl SessionClient {
                 .filter(|name| !name.is_empty());
             incoming.push(IncomingMessage {
                 hash,
-                sender_id: sender_id.clone(),
+                sender_id,
                 contact_id: group.id.clone(),
-                outgoing: sender_id == self.identity.session_id,
+                outgoing,
                 sender_name,
                 body: Some(text),
                 timestamp_ms,
                 unsend: None,
                 receipt: None,
-                attachment,
-                encrypted_attachment,
-                image_preview,
+                attachments,
             });
         }
-        Ok(incoming)
+        Ok((incoming, last_hash))
     }
 
     async fn send_message(
@@ -1584,15 +1884,10 @@ impl SessionClient {
         profile_name: &str,
     ) -> Result<(u64, bool), String> {
         let timestamp_ms = now_ms();
-        let profile = (!profile_name.trim().is_empty()).then(|| LokiProfile {
-            display_name: Some(profile_name.trim().to_owned()),
-            last_update_seconds: Some(timestamp_ms / 1000),
-            ..Default::default()
-        });
         let data_message = DataMessage {
             body: Some(body.to_owned()),
             timestamp: Some(timestamp_ms),
-            profile,
+            profile: profile_for(profile_name, timestamp_ms),
             ..Default::default()
         };
         let content = Content {
@@ -1602,78 +1897,37 @@ impl SessionClient {
         };
         self.send_content(recipient_id, content, timestamp_ms)
             .await?;
-
-        // Session devices with the same seed poll the account's own swarm.
-        // Mirror outgoing DMs there and identify the real peer with syncTarget
-        // so another device can place the copy in the correct conversation.
-        let sync_content = Content {
-            data_message: Some(DataMessage {
-                sync_target: Some(recipient_id.to_owned()),
-                ..data_message
-            }),
-            sig_timestamp: Some(timestamp_ms),
-            ..Default::default()
-        };
-        let sync_copy_sent = match self
-            .send_content(&self.identity.session_id, sync_content, timestamp_ms)
-            .await
-        {
-            Ok(()) => {
-                debug_log(
-                    "send.sync_copy",
-                    &format!(
-                        "peer_prefix={} sent=true",
-                        &recipient_id[..recipient_id.len().min(8)]
-                    ),
-                );
-                true
-            }
-            Err(error) => {
-                debug_log("send.sync_copy", &format!("sent=false error={error}"));
-                false
-            }
-        };
+        let sync_copy_sent = self.send_sync_copy(recipient_id, data_message, timestamp_ms).await;
         Ok((timestamp_ms, sync_copy_sent))
     }
 
-    async fn send_attachment(
+    /// Encrypt and upload one file to the Session file server.
+    async fn upload_attachment(
         &self,
-        recipient_id: &str,
         path: &std::path::Path,
-    ) -> Result<SentAttachment, String> {
+    ) -> Result<(AttachmentPointer, AttachmentMeta, Vec<u8>, Option<ImagePreview>), String> {
         debug_log("attachment.begin", "reading local file");
         let plaintext = std::fs::read(path).map_err(|e| {
             debug_log("attachment.read_failed", &format!("error={e}"));
-            format!("read attachment: {e}")
+            format!("read {}: {e}", path.display())
         })?;
         if plaintext.is_empty() {
             debug_log("attachment.read_failed", "reason=empty_file");
-            return Err("attachment is empty".into());
+            return Err(format!("{} is empty", path.display()));
         }
         let mut config = libsession::network::backends::file_server::default_config();
         // Use the AES-CBC/HMAC attachment format accepted by current mobile
         // clients. The stream format is not yet interoperable with them.
         config.use_stream_encryption = false;
-        debug_log(
-            "attachment.encrypt.begin",
-            &format!(
-                "plaintext_bytes={} max_bytes={}",
-                plaintext.len(),
-                config.max_file_size
-            ),
-        );
         let (encrypted, key, digest) =
             session_tui_media::encrypt_attachment(&plaintext).map_err(|e| {
                 debug_log("attachment.encrypt_failed", &format!("error={e}"));
                 e.to_string()
             })?;
         if encrypted.len() as u64 > config.max_file_size {
-            debug_log(
-                "attachment.upload_failed",
-                &format!("reason=too_large encrypted_bytes={}", encrypted.len()),
-            );
             return Err(format!(
-                "attachment exceeds Session's {} MB file limit",
+                "{} exceeds Session's {} MB file limit",
+                path.display(),
                 config.max_file_size / 1_000_000
             ));
         }
@@ -1704,14 +1958,6 @@ impl SessionClient {
                 debug_log("attachment.upload_failed", &format!("error={e}"));
                 format!("attachment upload failed: {e}")
             })?;
-        debug_log(
-            "attachment.upload.response",
-            &format!(
-                "http_status={} response_bytes={}",
-                upload.status_code,
-                upload.body.as_ref().map_or(0, String::len)
-            ),
-        );
         if upload.status_code != 200 {
             debug_log(
                 "attachment.upload_failed",
@@ -1719,24 +1965,14 @@ impl SessionClient {
             );
             return Err(format!("file server returned HTTP {}", upload.status_code));
         }
-        let response = upload.body.ok_or_else(|| {
-            debug_log("attachment.upload_failed", "reason=empty_response");
-            "file server returned no upload response"
-        })?;
+        let response = upload
+            .body
+            .ok_or("file server returned no upload response")?;
         let file_id = serde_json::from_str::<Value>(&response)
-            .map_err(|e| {
-                debug_log(
-                    "attachment.upload_failed",
-                    &format!("reason=invalid_json error={e}"),
-                );
-                format!("invalid file server response: {e}")
-            })?
+            .map_err(|e| format!("invalid file server response: {e}"))?
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                debug_log("attachment.upload_failed", "reason=no_file_id");
-                "file server response has no file id"
-            })?
+            .ok_or("file server response has no file id")?
             .to_owned();
         let url =
             libsession::network::backends::file_server::generate_download_url(&file_id, &config);
@@ -1748,35 +1984,52 @@ impl SessionClient {
             .to_owned();
         let content_type = mime_type_for_name(&file_name).to_owned();
         let dimensions = session_tui_media::image_dimensions(&plaintext);
-        let timestamp_ms = now_ms();
         let metadata = AttachmentMeta {
-            file_name: file_name.clone(),
-            content_type: content_type.clone(),
+            file_name,
+            content_type,
             url,
             key: key.to_vec(),
-            digest: digest.clone(),
+            digest,
             size: plaintext.len() as u32,
             deterministic: false,
             width: dimensions.map(|d| d.0),
             height: dimensions.map(|d| d.1),
         };
-        let pointer = AttachmentPointer {
-            id: u64::from_le_bytes(random::random(8).try_into().expect("8 random bytes")),
-            content_type: Some(content_type.clone()),
-            key: Some(key.to_vec()),
-            size: Some(plaintext.len() as u32),
-            thumbnail: None,
-            digest: Some(digest),
-            file_name: Some(file_name),
-            flags: None,
-            width: dimensions.map(|d| d.0),
-            height: dimensions.map(|d| d.1),
-            caption: None,
-            url: Some(metadata.url.clone()),
-        };
+        let mut pointer = attachment_pointer_from_meta(&metadata);
+        pointer.id = u64::from_le_bytes(random::random(8).try_into().expect("8 random bytes"));
+        let preview = session_tui_media::image_preview(&plaintext);
+        Ok((pointer, metadata, encrypted, preview))
+    }
+
+    /// Send one or more files as a single Session message (an album when
+    /// there are several), with `caption` as the message body.
+    async fn send_attachments(
+        &self,
+        recipient_id: &str,
+        paths: &[std::path::PathBuf],
+        caption: &str,
+        profile_name: &str,
+    ) -> Result<SentAttachments, String> {
+        if paths.is_empty() {
+            return Err("no files given".into());
+        }
+        if paths.len() > MAX_ATTACHMENTS {
+            return Err(format!("Session allows at most {MAX_ATTACHMENTS} files per message"));
+        }
+        let mut pointers = Vec::with_capacity(paths.len());
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let (pointer, metadata, encrypted, preview) = self.upload_attachment(path).await?;
+            pointers.push(pointer);
+            files.push((metadata, encrypted, preview));
+        }
+        let timestamp_ms = now_ms();
+        let caption = caption.trim().to_owned();
         let data_message = DataMessage {
+            body: (!caption.is_empty()).then(|| caption.clone()),
             timestamp: Some(timestamp_ms),
-            attachments: vec![pointer],
+            attachments: pointers,
+            profile: profile_for(profile_name, timestamp_ms),
             ..Default::default()
         };
         self.send_content(
@@ -1789,40 +2042,49 @@ impl SessionClient {
             timestamp_ms,
         )
         .await?;
-        let sync_copy_sent = if recipient_id.starts_with("03") {
-            // Every linked account device polls the shared group inbox.
-            true
-        } else {
-            self.send_content(
-                &self.identity.session_id,
-                Content {
-                    data_message: Some(DataMessage {
-                        sync_target: Some(recipient_id.to_owned()),
-                        ..data_message
-                    }),
-                    sig_timestamp: Some(timestamp_ms),
-                    ..Default::default()
-                },
-                timestamp_ms,
-            )
-            .await
-            .is_ok()
-        };
+        let sync_copy_sent = self.send_sync_copy(recipient_id, data_message, timestamp_ms).await;
         debug_log(
             "attachment.sent",
-            &format!(
-                "bytes={} image={} sync_copy_sent={sync_copy_sent}",
-                plaintext.len(),
-                content_type.starts_with("image/")
-            ),
+            &format!("files={} sync_copy_sent={sync_copy_sent}", files.len()),
         );
-        Ok(SentAttachment {
+        Ok(SentAttachments {
             timestamp_ms,
-            metadata,
-            encrypted,
-            preview: session_tui_media::image_preview(&plaintext),
+            caption,
+            files,
             sync_copy_sent,
         })
+    }
+
+    /// Mirror an outgoing 1:1 DataMessage to this account's own swarm with
+    /// syncTarget set, so linked devices file it in the right chat. Group
+    /// messages need no copy: every linked device polls the group swarm.
+    async fn send_sync_copy(
+        &self,
+        recipient_id: &str,
+        data_message: DataMessage,
+        timestamp_ms: u64,
+    ) -> bool {
+        if recipient_id.starts_with("03") || recipient_id == self.identity.session_id {
+            return true;
+        }
+        let sync_content = Content {
+            data_message: Some(DataMessage {
+                sync_target: Some(recipient_id.to_owned()),
+                ..data_message
+            }),
+            sig_timestamp: Some(timestamp_ms),
+            ..Default::default()
+        };
+        match self
+            .send_content(&self.identity.session_id, sync_content, timestamp_ms)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                debug_log("send.sync_copy", &format!("sent=false error={error}"));
+                false
+            }
+        }
     }
 
     async fn download_attachment(
@@ -1968,7 +2230,17 @@ impl SessionClient {
             sig_timestamp: Some(now_ms()),
             ..Default::default()
         };
-        self.send_content(recipient_id, content, now_ms()).await
+        self.send_content(recipient_id, content.clone(), now_ms()).await?;
+        // Like Session, also tell this account's other devices.
+        if !recipient_id.starts_with("03") && recipient_id != self.identity.session_id {
+            if let Err(error) = self
+                .send_content(&self.identity.session_id, content, now_ms())
+                .await
+            {
+                debug_log("unsend.sync_copy", &format!("sent=false error={error}"));
+            }
+        }
+        Ok(())
     }
 
     async fn send_content(
@@ -2095,53 +2367,71 @@ impl SessionClient {
         Ok(())
     }
 
-    async fn retrieve_messages(&self, last_hash: Option<&str>) -> Result<RetrieveResult, String> {
+    async fn retrieve_messages(
+        &self,
+        last_hash: Option<&str>,
+        group_cursors: HashMap<String, String>,
+    ) -> Result<RetrieveResult, String> {
         debug_log(
             "retrieve.begin",
             &format!("cursor_present={}", last_hash.is_some()),
         );
         let pubkey_ed25519 = hex::encode(self.identity.ed_public);
-        let response = self
-            .network
-            .send_retrieve(&RetrieveParams {
-                pubkey: &self.identity.session_id,
-                pubkey_ed25519: &pubkey_ed25519,
-                namespace: 0,
-                timestamp_ms: now_ms(),
-                last_hash,
-                max_size: Some(1_000_000),
-                signing_key: &self.identity.ed_secret,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        debug_log(
-            "retrieve.response",
-            &format!(
-                "http_status={} body_bytes={}",
-                response.status_code,
-                response.body.as_ref().map_or(0, String::len)
-            ),
-        );
-        if response.status_code != 200 {
-            return Err(format!(
-                "Session retrieve returned HTTP {}",
-                response.status_code
-            ));
+        let mut items: Vec<Value> = Vec::new();
+        let mut cursor = last_hash.map(str::to_owned);
+        for _ in 0..MAX_RETRIEVE_PAGES {
+            let response = self
+                .network
+                .send_retrieve(&RetrieveParams {
+                    pubkey: &self.identity.session_id,
+                    pubkey_ed25519: &pubkey_ed25519,
+                    namespace: 0,
+                    timestamp_ms: now_ms(),
+                    last_hash: cursor.as_deref(),
+                    max_size: Some(1_000_000),
+                    signing_key: &self.identity.ed_secret,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            debug_log(
+                "retrieve.response",
+                &format!(
+                    "http_status={} body_bytes={}",
+                    response.status_code,
+                    response.body.as_ref().map_or(0, String::len)
+                ),
+            );
+            if response.status_code != 200 {
+                return Err(format!(
+                    "Session retrieve returned HTTP {}",
+                    response.status_code
+                ));
+            }
+            let body = response
+                .body
+                .ok_or_else(|| "Empty retrieve response".to_string())?;
+            let mut value: Value = serde_json::from_str(&body)
+                .map_err(|e| format!("Invalid retrieve response: {e}"))?;
+            let more = value.get("more").and_then(Value::as_bool).unwrap_or(false);
+            let page = match value.get_mut("messages").map(Value::take) {
+                Some(Value::Array(page)) => page,
+                _ => return Err("Retrieve response has no messages array".to_string()),
+            };
+            if let Some(hash) = page
+                .last()
+                .and_then(|item| item.get("hash"))
+                .and_then(Value::as_str)
+            {
+                cursor = Some(hash.to_owned());
+            }
+            let empty = page.is_empty();
+            items.extend(page);
+            if !more || empty {
+                break;
+            }
         }
-        let body = response
-            .body
-            .ok_or_else(|| "Empty retrieve response".to_string())?;
-        let value: Value =
-            serde_json::from_str(&body).map_err(|e| format!("Invalid retrieve response: {e}"))?;
-        let messages = value
-            .get("messages")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "Retrieve response has no messages array".to_string())?;
-        let last_hash = messages
-            .last()
-            .and_then(|item| item.get("hash"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let messages = &items;
+        let last_hash = cursor.filter(|hash| Some(hash.as_str()) != last_hash);
         let mut incoming = Vec::new();
         let mut undecryptable = 0;
         let mut bad_envelope = 0;
@@ -2209,37 +2499,25 @@ impl SessionClient {
                 .unwrap_or(data)
                 .to_owned();
             if let Some(unsend) = content.unsend_request {
-                incoming.push(IncomingMessage {
+                let mut message = IncomingMessage::control(
                     hash,
-                    contact_id: sender_id.clone(),
+                    sender_id.clone(),
                     sender_id,
-                    outgoing: false,
-                    sender_name: None,
-                    body: None,
-                    timestamp_ms: unsend.timestamp,
-                    unsend: Some((unsend.timestamp, unsend.author)),
-                    receipt: None,
-                    attachment: None,
-                    encrypted_attachment: None,
-                    image_preview: None,
-                });
+                    unsend.timestamp,
+                );
+                message.unsend = Some((unsend.timestamp, unsend.author));
+                incoming.push(message);
                 continue;
             }
             if let Some(receipt) = content.receipt_message {
-                incoming.push(IncomingMessage {
+                let mut message = IncomingMessage::control(
                     hash,
-                    contact_id: sender_id.clone(),
+                    sender_id.clone(),
                     sender_id,
-                    outgoing: false,
-                    sender_name: None,
-                    body: None,
-                    timestamp_ms: envelope.timestamp,
-                    unsend: None,
-                    receipt: Some((receipt.r#type, receipt.timestamp)),
-                    attachment: None,
-                    encrypted_attachment: None,
-                    image_preview: None,
-                });
+                    envelope.timestamp,
+                );
+                message.receipt = Some((receipt.r#type, receipt.timestamp));
+                incoming.push(message);
                 continue;
             }
             let Some(data_message) = content.data_message else {
@@ -2265,32 +2543,25 @@ impl SessionClient {
                     .filter(|name| !name.is_empty())
             };
             let timestamp_ms = data_message.timestamp.unwrap_or(envelope.timestamp);
-            let attachment_pointer = data_message.attachments.into_iter().next();
+            let attachments: Vec<AttachmentMeta> = data_message
+                .attachments
+                .iter()
+                .map(attachment_meta_from_pointer)
+                .collect();
             let text = data_message.body.unwrap_or_default();
-            if text.is_empty() && attachment_pointer.is_none() {
+            if text.is_empty() && attachments.is_empty() {
                 continue;
             }
-            let (attachment, encrypted_attachment, image_preview) =
-                if let Some(pointer) = attachment_pointer.as_ref() {
-                    match self.download_attachment(pointer).await {
-                        Ok((meta, encrypted, preview)) => (Some(meta), Some(encrypted), preview),
-                        Err(error) => {
-                            debug_log("attachment.download.failed", &format!("error={error}"));
-                            (Some(attachment_meta_from_pointer(pointer)), None, None)
-                        }
-                    }
-                } else {
-                    (None, None, None)
-                };
             debug_log(
                 "message.route",
                 &format!(
-                    "sender_prefix={} contact_prefix={} self_sync_copy={outgoing_sync}",
+                    "sender_prefix={} contact_prefix={} self_sync_copy={outgoing_sync} attachments={}",
                     &sender_id[..sender_id.len().min(8)],
                     &contact_id[..contact_id.len().min(8)],
+                    attachments.len(),
                 ),
             );
-            if !outgoing_sync {
+            if !outgoing_sync && sender_id != self.identity.session_id {
                 delivery_receipts
                     .entry(sender_id.clone())
                     .or_default()
@@ -2306,9 +2577,7 @@ impl SessionClient {
                 timestamp_ms,
                 unsend: None,
                 receipt: None,
-                attachment,
-                encrypted_attachment,
-                image_preview,
+                attachments,
             });
         }
         let groups = match self.discover_groups().await {
@@ -2323,9 +2592,18 @@ impl SessionClient {
             .lock()
             .map(|groups| groups.values().cloned().collect())
             .unwrap_or_default();
+        let mut new_group_cursors = HashMap::new();
         for group in &runtime_groups {
-            match self.retrieve_group_messages(group).await {
-                Ok(mut group_messages) => incoming.append(&mut group_messages),
+            let cursor = group_cursors.get(&group.id).map(String::as_str);
+            match self.retrieve_group_messages(group, cursor).await {
+                Ok((mut group_messages, last)) => {
+                    incoming.append(&mut group_messages);
+                    if let Some(last) = last
+                        && Some(last.as_str()) != cursor
+                    {
+                        new_group_cursors.insert(group.id.clone(), last);
+                    }
+                }
                 Err(error) => debug_log(
                     "group.retrieve.failed",
                     &format!("group_prefix={} error={error}", &group.id[..8]),
@@ -2359,6 +2637,7 @@ impl SessionClient {
             bad_content,
             last_hash,
             groups,
+            group_cursors: new_group_cursors,
         })
     }
 }
@@ -2372,6 +2651,13 @@ fn prompt_identity() -> Result<Identity, Box<dyn std::error::Error>> {
         "Session seed (64 hex) or 13-word recovery phrase (blank creates account): ",
     )?;
     let (seed, recovery_phrase) = if entered.trim().is_empty() {
+        print!("No seed entered. Create a NEW Session account? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+            return Err("cancelled; restart and enter your seed or recovery phrase".into());
+        }
         let mut seed = random::random(16);
         seed.resize(32, 0);
         println!("\nNew Session identity created.");
@@ -2599,8 +2885,32 @@ fn crc32_prefix_checksum(words: &[&str]) -> usize {
     (!crc) as usize
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Local UTC offset, captured before any thread starts: the `time` crate
+/// refuses to read it from a multi-threaded process on Unix.
+static LOCAL_OFFSET: OnceLock<time::UtcOffset> = OnceLock::new();
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = LOCAL_OFFSET.set(
+        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC),
+    );
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let debug = std::env::args().skip(1).any(|arg| arg == "--debug");
     init_debug_log(debug)?;
     let identity = prompt_identity()?;
@@ -2613,9 +2923,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let client = Arc::new(SessionClient::new(identity)?);
     let store = LocalStore::open(&client.identity)?;
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new(client.identity.session_id.clone());
@@ -2624,15 +2944,202 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.status = format!("LOCAL HISTORY ERROR · {error}");
     }
     let result = run(&mut terminal, &mut app, &client, &store).await;
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+    restore_terminal();
     result?;
     Ok(())
+}
+
+type SyncTask = tokio::task::JoinHandle<Result<RetrieveResult, String>>;
+type DownloadTask = tokio::task::JoinHandle<Result<DownloadedAttachment, (PendingDownload, String)>>;
+
+/// Run a !Send network future on its own current-thread runtime.
+fn spawn_network<T, F, Fut>(f: F) -> tokio::task::JoinHandle<Result<T, String>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "could not start network runtime".to_string())?;
+        runtime.block_on(f())
+    })
+}
+
+/// Split command arguments on whitespace, honouring double quotes.
+fn split_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut has_token = false;
+    for c in input.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has_token = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if has_token {
+                    args.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+/// `path`, or `name (1).ext`, `name (2).ext`… if it already exists.
+fn unique_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_owned();
+    let extension = path.extension().and_then(|s| s.to_str()).map(str::to_owned);
+    let parent = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    for n in 1.. {
+        let name = match &extension {
+            Some(extension) => format!("{stem} ({n}).{extension}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn attachment_file_name(meta: &AttachmentMeta) -> String {
+    let mut name = std::path::Path::new(&meta.file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .unwrap_or("attachment")
+        .to_owned();
+    if std::path::Path::new(&name).extension().is_none()
+        && let Some(extension) = default_attachment_extension(&meta.content_type)
+    {
+        name.push('.');
+        name.push_str(extension);
+    }
+    name
+}
+
+/// Queue every attachment that is not in the local cache yet.
+fn enqueue_missing_downloads(
+    app: &App,
+    queue: &mut std::collections::VecDeque<PendingDownload>,
+) {
+    let Ok(root) = session_data_dir() else {
+        return;
+    };
+    for conversation in &app.conversations {
+        for message in &conversation.messages {
+            for (index, meta) in message.attachments.iter().enumerate() {
+                if meta.url.is_empty() {
+                    continue;
+                }
+                let path = session_tui_media::attachment_blob_path(
+                    &root,
+                    &conversation.id,
+                    message.timestamp_ms,
+                    index,
+                );
+                if !path.exists() {
+                    queue.push_back(PendingDownload {
+                        peer: conversation.id.clone(),
+                        timestamp_ms: message.timestamp_ms,
+                        outgoing: message.outgoing,
+                        index,
+                        meta: meta.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn start_download(client: &Arc<SessionClient>, job: PendingDownload) -> DownloadTask {
+    let client = Arc::clone(client);
+    tokio::task::spawn_blocking(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => return Err((job, "could not start download runtime".into())),
+        };
+        let pointer = attachment_pointer_from_meta(&job.meta);
+        match runtime.block_on(tokio::time::timeout(
+            Duration::from_secs(120),
+            client.download_attachment(&pointer),
+        )) {
+            Ok(Ok((_, encrypted, preview))) => Ok(DownloadedAttachment {
+                job,
+                encrypted,
+                preview,
+            }),
+            Ok(Err(error)) => Err((job, error)),
+            Err(_) => Err((job, "download timed out".into())),
+        }
+    })
+}
+
+fn finish_download(
+    app: &mut App,
+    store: &LocalStore,
+    result: Result<DownloadedAttachment, (PendingDownload, String)>,
+) {
+    let downloaded = match result {
+        Ok(downloaded) => downloaded,
+        Err((job, error)) => {
+            debug_log(
+                "attachment.download.failed",
+                &format!("index={} error={error}", job.index),
+            );
+            return;
+        }
+    };
+    let job = &downloaded.job;
+    if let Err(error) =
+        store.save_attachment_blob(&job.peer, job.timestamp_ms, job.index, &downloaded.encrypted)
+    {
+        debug_log("attachment.cache.failed", &format!("error={error}"));
+        return;
+    }
+    let Some(conversation) = app.conversations.iter_mut().find(|c| c.id == job.peer) else {
+        return;
+    };
+    let Some(message) = conversation
+        .messages
+        .iter_mut()
+        .find(|m| m.timestamp_ms == job.timestamp_ms && m.outgoing == job.outgoing)
+    else {
+        return;
+    };
+    if message.image_previews.len() < message.attachments.len() {
+        message.image_previews.resize(message.attachments.len(), None);
+    }
+    if let Some(slot) = message.image_previews.get_mut(job.index)
+        && downloaded.preview.is_some()
+    {
+        *slot = downloaded.preview;
+        let _ = store.update_message(&job.peer, message);
+    }
 }
 
 async fn run(
@@ -2642,109 +3149,123 @@ async fn run(
     store: &LocalStore,
 ) -> io::Result<()> {
     let mut last_sync = Instant::now() - Duration::from_secs(30);
-    let mut sync_task: Option<tokio::task::JoinHandle<Result<RetrieveResult, String>>> = None;
+    let mut sync_task: Option<SyncTask> = None;
     let mut read_receipt_task: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
     let mut attachment_task: Option<(
-        tokio::task::JoinHandle<Result<SentAttachment, String>>,
+        tokio::task::JoinHandle<Result<SentAttachments, String>>,
         String,
         u64,
-        String,
     )> = None;
-    let mut pending_read_receipts: Vec<(String, Vec<u64>)> = Vec::new();
+    let mut download_task: Option<DownloadTask> = None;
+    let mut download_queue = std::collections::VecDeque::new();
+    enqueue_missing_downloads(app, &mut download_queue);
+    let mut pending_read_receipts: std::collections::VecDeque<(String, Vec<u64>)> =
+        std::collections::VecDeque::new();
     loop {
         if read_receipt_task
             .as_ref()
             .is_some_and(|task| task.is_finished())
+            && let Some(task) = read_receipt_task.take()
         {
-            if let Some(task) = read_receipt_task.take() {
-                match task.await {
-                    Ok(Ok(())) => debug_log("receipt.read.sent", "sent=true"),
-                    _ => {
-                        debug_log("receipt.read.failed", "send_failed=true");
-                        app.status = "READ RECEIPT FAILED · WILL RETRY ON NEXT NEW MESSAGE".into();
-                    }
-                }
+            match task.await {
+                Ok(Ok(())) => debug_log("receipt.read.sent", "sent=true"),
+                _ => debug_log("receipt.read.failed", "send_failed=true"),
             }
+        }
+        if download_task.as_ref().is_some_and(|task| task.is_finished())
+            && let Some(task) = download_task.take()
+        {
+            match task.await {
+                Ok(result) => finish_download(app, store, result),
+                Err(error) => debug_log("attachment.download.panic", &error.to_string()),
+            }
+        }
+        if download_task.is_none()
+            && let Some(job) = download_queue.pop_front()
+        {
+            download_task = Some(start_download(client, job));
         }
         if attachment_task
             .as_ref()
-            .is_some_and(|(task, _, _, _)| task.is_finished())
+            .is_some_and(|(task, _, _)| task.is_finished())
+            && let Some((task, peer, pending_timestamp)) = attachment_task.take()
         {
-            if let Some((task, peer, pending_timestamp, file_name)) = attachment_task.take() {
-                let result = match task.await {
-                    Ok(result) => result,
-                    Err(error) => Err(format!("upload task failed: {error}")),
-                };
-                if let Some(index) = app.conversations.iter().position(|c| c.id == peer) {
-                    let convo = &mut app.conversations[index];
-                    let pending = convo
-                        .messages
-                        .iter()
-                        .position(|m| m.timestamp_ms == pending_timestamp && m.outgoing);
-                    match result {
-                        Ok(sent) => {
-                            if let Some(pending_index) = pending {
-                                convo.messages.remove(pending_index);
-                            }
-                            let message = Message {
-                                body: String::new(),
-                                time: format_time(sent.timestamp_ms),
-                                timestamp_ms: sent.timestamp_ms,
-                                outgoing: true,
-                                receipt_status: 0,
-                                is_read: true,
-                                attachment: Some(sent.metadata.clone()),
-                                image_preview: sent.preview,
-                            };
+            let result = match task.await {
+                Ok(result) => result,
+                Err(error) => Err(format!("upload task failed: {error}")),
+            };
+            if let Some(index) = app.conversations.iter().position(|c| c.id == peer) {
+                let convo = &mut app.conversations[index];
+                let pending = convo
+                    .messages
+                    .iter()
+                    .position(|m| m.timestamp_ms == pending_timestamp && m.outgoing);
+                match result {
+                    Ok(sent) => {
+                        if let Some(pending_index) = pending {
+                            convo.messages.remove(pending_index);
+                        }
+                        let mut message = Message::new(sent.caption, sent.timestamp_ms, true);
+                        for (index, (meta, encrypted, preview)) in
+                            sent.files.into_iter().enumerate()
+                        {
                             let _ = store.save_attachment_blob(
                                 &peer,
                                 sent.timestamp_ms,
-                                &sent.encrypted,
+                                index,
+                                &encrypted,
                             );
-                            let _ = store.save_message(&peer, &message);
-                            let _ = store.save_contact(&peer);
-                            convo.preview = message_preview_text("", message.attachment.as_ref());
-                            convo.messages.push(message);
-                            convo.selected_message = convo.messages.len().saturating_sub(1);
-                            app.status = if sent.sync_copy_sent {
-                                "ATTACHMENT SENT · SYNCED TO YOUR OTHER DEVICES".into()
-                            } else {
-                                "ATTACHMENT SENT · DEVICE SYNC COPY FAILED".into()
-                            };
+                            message.attachments.push(meta);
+                            message.image_previews.push(preview);
                         }
-                        Err(error) => {
-                            debug_log("attachment.task.failed", &format!("error={error}"));
-                            if let Some(pending_index) = pending {
-                                let message = &mut convo.messages[pending_index];
-                                message.body = format!("Upload failed · {file_name}");
-                                convo.preview = message.body.clone();
-                            }
-                            app.status = format!("ATTACHMENT FAILED · {error}");
+                        let _ = store.save_message(&peer, &message);
+                        convo.messages.push(message);
+                        convo.selected_message = convo.messages.len() - 1;
+                        convo.refresh_preview();
+                        app.status = if sent.sync_copy_sent {
+                            "ATTACHMENT SENT · SYNCED TO YOUR OTHER DEVICES".into()
+                        } else {
+                            "ATTACHMENT SENT · DEVICE SYNC COPY FAILED".into()
+                        };
+                        app.sort_conversations();
+                    }
+                    Err(error) => {
+                        debug_log("attachment.task.failed", &format!("error={error}"));
+                        if let Some(pending_index) = pending {
+                            convo.messages[pending_index].body = format!("Upload failed · {error}");
+                            convo.refresh_preview();
                         }
+                        app.status = format!("ATTACHMENT FAILED · {error}");
                     }
                 }
             }
         }
-        if app.recovery_seed.is_none() && !app.show_help {
-            if let Some(receipt) = mark_current_conversation_read(app, store) {
-                if !receipt.0.starts_with("03") {
-                    pending_read_receipts.push(receipt);
-                }
-            }
+        if app.recovery_seed.is_none()
+            && !app.show_help
+            && let Some(receipt) = mark_current_conversation_read(app, store)
+            && !receipt.0.starts_with("03")
+        {
+            pending_read_receipts.push_back(receipt);
         }
-        if read_receipt_task.is_none() {
-            if let Some((peer, timestamps)) = pending_read_receipts.pop() {
-                read_receipt_task = Some(start_read_receipt(Arc::clone(client), peer, timestamps));
-            }
+        if read_receipt_task.is_none()
+            && let Some((peer, timestamps)) = pending_read_receipts.pop_front()
+        {
+            read_receipt_task = Some(start_read_receipt(Arc::clone(client), peer, timestamps));
         }
-        if sync_task.as_ref().is_some_and(|task| task.is_finished()) {
-            if let Some(task) = sync_task.take() {
-                let result = match task.await {
-                    Ok(result) => result,
-                    Err(_) => Err("sync task failed".into()),
-                };
-                finish_sync(app, store, &client.identity.session_id, result);
-            }
+        if sync_task.as_ref().is_some_and(|task| task.is_finished())
+            && let Some(task) = sync_task.take()
+        {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(_) => Err("sync task failed".into()),
+            };
+            finish_sync(
+                app,
+                store,
+                &client.identity.session_id,
+                result,
+                &mut download_queue,
+            );
         }
         let waiting_for_receipt = app.conversations.iter().flat_map(|c| &c.messages).any(|m| {
             m.outgoing
@@ -2764,397 +3285,422 @@ async fn run(
             start_sync(app, client, store, &mut sync_task);
         }
         terminal.draw(|frame| draw(frame, app))?;
-        if event::poll(Duration::from_millis(150))? {
-            match event::read()? {
-                Event::Mouse(mouse) => handle_mouse(app, mouse),
-                Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
+        if !event::poll(Duration::from_millis(150))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Mouse(mouse) => {
+                handle_mouse(app, mouse);
+                continue;
+            }
+            Event::Paste(text) if app.image_viewer.is_none() && app.recovery_seed.is_none() => {
+                // The composer is single-line: fold pasted line breaks.
+                let text = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");
+                app.input.push_str(&text);
+                app.focus = FocusArea::Composer;
+                continue;
+            }
+            Event::Key(key) => key,
+            _ => continue,
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if app.image_viewer.is_some() {
+            if key.code == KeyCode::Esc {
+                app.image_viewer = None;
+            }
+            continue;
+        }
+        if app.recovery_seed.is_some() {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                app.recovery_seed = None;
+            }
+            continue;
+        }
+        match key.code {
+            KeyCode::Tab => {
+                app.focus = match app.focus {
+                    FocusArea::Contacts => FocusArea::Messages,
+                    FocusArea::Messages => FocusArea::Composer,
+                    FocusArea::Composer => FocusArea::Contacts,
+                };
+            }
+            KeyCode::BackTab => {
+                app.focus = match app.focus {
+                    FocusArea::Contacts => FocusArea::Composer,
+                    FocusArea::Messages => FocusArea::Contacts,
+                    FocusArea::Composer => FocusArea::Messages,
+                };
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(());
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.input.clear();
+            }
+            KeyCode::Esc if app.show_help => app.show_help = false,
+            KeyCode::Esc if app.input_mode == InputMode::ContactId => {
+                app.input.clear();
+                app.input_mode = InputMode::Message;
+                app.status = "ADD CONTACT CANCELLED".into();
+            }
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.input.is_empty()
+                    && app.input_mode == InputMode::Message =>
+            {
+                app.input_mode = InputMode::ContactId;
+                app.focus = FocusArea::Composer;
+                app.status = "ENTER CONTACT SESSION ID (05…)".into();
+            }
+            KeyCode::Left if app.input.is_empty() && !app.conversations.is_empty() => {
+                app.selected = app.selected.saturating_sub(1);
+            }
+            KeyCode::Right if app.input.is_empty() && !app.conversations.is_empty() => {
+                app.selected = (app.selected + 1).min(app.conversations.len() - 1);
+            }
+            KeyCode::Up if app.input.is_empty() && app.focus == FocusArea::Contacts => {
+                app.selected = app.selected.saturating_sub(1);
+            }
+            KeyCode::Down if app.input.is_empty() && app.focus == FocusArea::Contacts => {
+                if !app.conversations.is_empty() {
+                    app.selected = (app.selected + 1).min(app.conversations.len() - 1);
+                }
+            }
+            KeyCode::Up if app.input.is_empty() && app.focus == FocusArea::Messages => {
+                if let Some(conversation) = app.conversations.get_mut(app.selected) {
+                    conversation.selected_message = conversation.selected_message.saturating_sub(1);
+                }
+            }
+            KeyCode::Down if app.input.is_empty() && app.focus == FocusArea::Messages => {
+                if let Some(conversation) = app.conversations.get_mut(app.selected)
+                    && !conversation.messages.is_empty()
+                {
+                    conversation.selected_message =
+                        (conversation.selected_message + 1).min(conversation.messages.len() - 1);
+                }
+            }
+            KeyCode::Delete if app.input.is_empty() => {
+                let Some((timestamp, outgoing)) = app
+                    .selected_message()
+                    .map(|message| (message.timestamp_ms, message.outgoing))
+                else {
+                    app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+                    continue;
+                };
+                let peer = app.conversations[app.selected].id.clone();
+                if outgoing {
+                    app.status = "SENDING UNSEND REQUEST…".into();
+                    terminal.draw(|frame| draw(frame, app))?;
+                    if let Err(error) = client.unsend_message(&peer, timestamp).await {
+                        app.status = format!("UNSEND FAILED · {error}");
                         continue;
-                    }
-                    if app.image_viewer.is_some() {
-                        if key.code == KeyCode::Esc {
-                            app.image_viewer = None;
-                        }
-                        continue;
-                    }
-                    if app.recovery_seed.is_some() {
-                        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                            app.recovery_seed = None;
-                        }
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Tab => {
-                            app.focus = match app.focus {
-                                FocusArea::Contacts => FocusArea::Messages,
-                                FocusArea::Messages => FocusArea::Composer,
-                                FocusArea::Composer => FocusArea::Contacts,
-                            };
-                        }
-                        KeyCode::BackTab => {
-                            app.focus = match app.focus {
-                                FocusArea::Contacts => FocusArea::Composer,
-                                FocusArea::Messages => FocusArea::Contacts,
-                                FocusArea::Composer => FocusArea::Messages,
-                            };
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
-                        }
-                        KeyCode::Esc if app.show_help => app.show_help = false,
-                        KeyCode::Esc if app.input_mode == InputMode::ContactId => {
-                            app.input.clear();
-                            app.input_mode = InputMode::Message;
-                            app.status = "ADD CONTACT CANCELLED".into();
-                        }
-                        KeyCode::Char('n')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && app.input.is_empty()
-                                && app.input_mode == InputMode::Message =>
-                        {
-                            app.input_mode = InputMode::ContactId;
-                            app.focus = FocusArea::Composer;
-                            app.status = "ENTER CONTACT SESSION ID (05…)".into();
-                        }
-                        KeyCode::Left if app.input.is_empty() && !app.conversations.is_empty() => {
-                            app.selected = app.selected.saturating_sub(1);
-                        }
-                        KeyCode::Right if app.input.is_empty() && !app.conversations.is_empty() => {
-                            app.selected = (app.selected + 1).min(app.conversations.len() - 1);
-                        }
-                        KeyCode::Up if app.input.is_empty() && app.focus == FocusArea::Contacts => {
-                            app.selected = app.selected.saturating_sub(1);
-                        }
-                        KeyCode::Down
-                            if app.input.is_empty() && app.focus == FocusArea::Contacts =>
-                        {
-                            if !app.conversations.is_empty() {
-                                app.selected = (app.selected + 1).min(app.conversations.len() - 1);
-                            }
-                        }
-                        KeyCode::Up if app.input.is_empty() && app.focus == FocusArea::Messages => {
-                            if let Some(conversation) = app.conversations.get_mut(app.selected) {
-                                conversation.selected_message =
-                                    conversation.selected_message.saturating_sub(1);
-                            }
-                        }
-                        KeyCode::Down
-                            if app.input.is_empty() && app.focus == FocusArea::Messages =>
-                        {
-                            if let Some(conversation) = app.conversations.get_mut(app.selected) {
-                                if !conversation.messages.is_empty() {
-                                    conversation.selected_message = (conversation.selected_message
-                                        + 1)
-                                    .min(conversation.messages.len() - 1);
-                                }
-                            }
-                        }
-                        KeyCode::Delete if app.input.is_empty() => {
-                            if let Some((timestamp, outgoing)) = app.selected_message() {
-                                if outgoing {
-                                    let recipient = app.conversations[app.selected].id.clone();
-                                    app.status = "SENDING UNSEND REQUEST…".into();
-                                    terminal.draw(|frame| draw(frame, app))?;
-                                    if let Err(error) =
-                                        client.unsend_message(&recipient, timestamp).await
-                                    {
-                                        app.status = format!("UNSEND FAILED · {error}");
-                                        continue;
-                                    }
-                                    app.remove_selected_message();
-                                    if let Err(error) = store.delete_message(&recipient, timestamp)
-                                    {
-                                        app.status = format!("LOCAL DELETE ERROR · {error}");
-                                        continue;
-                                    }
-                                    app.status = "MESSAGE UNSENT · REMOTE REMOVAL PENDING".into();
-                                } else {
-                                    let peer = app.conversations[app.selected].id.clone();
-                                    let timestamp =
-                                        app.selected_message().map(|m| m.0).unwrap_or(0);
-                                    app.remove_selected_message();
-                                    if let Err(error) = store.delete_message(&peer, timestamp) {
-                                        app.status = format!("LOCAL DELETE ERROR · {error}");
-                                        continue;
-                                    }
-                                    app.status = "MESSAGE DELETED LOCALLY".into();
-                                }
-                            } else {
-                                app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
-                            }
-                        }
-                        KeyCode::Enter
-                            if app.input_mode == InputMode::ContactId
-                                && !matches!(
-                                    app.input.as_str(),
-                                    "/exit" | "/rsync" | "/?" | "/view"
-                                )
-                                && !app.input.starts_with("/name") =>
-                        {
-                            app.submit_contact_id();
-                            if let Some(contact) = app.conversations.get(app.selected) {
-                                if let Err(error) = store.save_contact(&contact.id) {
-                                    app.status = format!("LOCAL CONTACT ERROR · {error}");
-                                }
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if let Some(raw_path) = app
-                                .input
-                                .strip_prefix("/attach ")
-                                .map(str::trim)
-                                .map(|path| path.trim_matches('"').to_owned())
-                            {
-                                if raw_path.is_empty() {
-                                    app.status = "USAGE · /attach PATH".into();
-                                    app.input.clear();
-                                    continue;
-                                }
-                                let Some(recipient) = app
-                                    .conversations
-                                    .get(app.selected)
-                                    .map(|conversation| conversation.id.clone())
-                                else {
-                                    app.status = "ADD A CONTACT FIRST WITH CTRL+N".into();
-                                    app.input.clear();
-                                    continue;
-                                };
-                                if attachment_task.is_some() {
-                                    app.status = "AN ATTACHMENT IS ALREADY UPLOADING".into();
-                                    continue;
-                                }
-                                let file_name = std::path::Path::new(&raw_path)
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .filter(|name| !name.is_empty())
-                                    .unwrap_or("attachment")
-                                    .to_owned();
-                                let pending_timestamp = now_ms();
-                                if let Some(conversation) = app.conversations.get_mut(app.selected)
-                                {
-                                    conversation.messages.push(Message {
-                                        body: format!("Uploading · {file_name}"),
-                                        time: format_time(pending_timestamp),
-                                        timestamp_ms: pending_timestamp,
-                                        outgoing: true,
-                                        receipt_status: 0,
-                                        is_read: true,
-                                        attachment: None,
-                                        image_preview: None,
-                                    });
-                                    conversation.selected_message =
-                                        conversation.messages.len().saturating_sub(1);
-                                    conversation.preview = format!("Uploading · {file_name}");
-                                }
-                                app.status = format!("UPLOADING ATTACHMENT · {file_name}");
-                                app.input.clear();
-                                let client = Arc::clone(client);
-                                let path = std::path::PathBuf::from(raw_path);
-                                let peer = recipient;
-                                let task_peer = peer.clone();
-                                attachment_task = Some((
-                                    tokio::task::spawn_blocking(move || {
-                                        let runtime = tokio::runtime::Builder::new_current_thread()
-                                            .enable_all()
-                                            .build()
-                                            .map_err(|_| {
-                                                "could not start attachment runtime".to_string()
-                                            })?;
-                                        runtime.block_on(client.send_attachment(&task_peer, &path))
-                                    }),
-                                    peer,
-                                    pending_timestamp,
-                                    file_name,
-                                ));
-                                app.input.clear();
-                                continue;
-                            }
-                            if app.input == "/save" || app.input.starts_with("/save ") {
-                                let raw_path =
-                                    app.input.strip_prefix("/save").unwrap_or_default().trim();
-                                let Some(conversation) = app.conversations.get(app.selected) else {
-                                    app.status = "SELECT AN ATTACHMENT FIRST".into();
-                                    app.input.clear();
-                                    continue;
-                                };
-                                let Some(message) =
-                                    conversation.messages.get(conversation.selected_message)
-                                else {
-                                    app.status = "SELECT AN ATTACHMENT WITH ↑/↓ FIRST".into();
-                                    app.input.clear();
-                                    continue;
-                                };
-                                let Some(metadata) = message.attachment.clone() else {
-                                    app.status = "SELECT AN ATTACHMENT WITH ↑/↓ FIRST".into();
-                                    app.input.clear();
-                                    continue;
-                                };
-                                let destination = if raw_path.is_empty() {
-                                    let path = std::path::Path::new(&metadata.file_name);
-                                    let mut name = path
-                                        .file_name()
-                                        .and_then(|name| name.to_str())
-                                        .filter(|name| !name.is_empty())
-                                        .unwrap_or("attachment")
-                                        .to_owned();
-                                    if std::path::Path::new(&name).extension().is_none()
-                                        && let Some(extension) =
-                                            default_attachment_extension(&metadata.content_type)
-                                    {
-                                        name.push('.');
-                                        name.push_str(extension);
-                                    }
-                                    std::env::current_dir().unwrap_or_default().join(name)
-                                } else {
-                                    std::path::PathBuf::from(raw_path.trim_matches('"'))
-                                };
-                                let peer = conversation.id.clone();
-                                let timestamp = message.timestamp_ms;
-                                app.status = "SAVING ATTACHMENT…".into();
-                                terminal.draw(|frame| draw(frame, app))?;
-                                let result = async {
-                                    let cache_path = session_tui_media::attachment_blob_path(
-                                        &session_data_dir()?,
-                                        &peer,
-                                        timestamp,
-                                    );
-                                    let encrypted = match std::fs::read(&cache_path) {
-                                        Ok(bytes) => bytes,
-                                        Err(_) => {
-                                            let pointer = attachment_pointer_from_meta(&metadata);
-                                            let (_, bytes, _) =
-                                                client.download_attachment(&pointer).await?;
-                                            store.save_attachment_blob(&peer, timestamp, &bytes)?;
-                                            bytes
-                                        }
-                                    };
-                                    let plaintext = session_tui_media::decrypt_attachment(
-                                        &encrypted,
-                                        &metadata.key,
-                                        &metadata.digest,
-                                        metadata.deterministic,
-                                    )?;
-                                    std::fs::write(&destination, plaintext)
-                                        .map_err(|e| e.to_string())?;
-                                    Ok::<(), String>(())
-                                }
-                                .await;
-                                app.status = match result {
-                                    Ok(()) => format!("SAVED FILE · {}", destination.display()),
-                                    Err(error) => format!("SAVE FAILED · {error}"),
-                                };
-                                app.input.clear();
-                                continue;
-                            }
-                            if app.input == "/name" {
-                                app.input.clear();
-                                app.status = if app.profile_name.is_empty() {
-                                    "PROFILE NAME NOT SET · USE /name YOUR NAME".into()
-                                } else {
-                                    format!("PROFILE NAME · {}", app.profile_name)
-                                };
-                                continue;
-                            }
-                            if let Some(name) = app
-                                .input
-                                .strip_prefix("/name ")
-                                .map(str::trim)
-                                .filter(|name| !name.is_empty())
-                            {
-                                if name.len() > 100 {
-                                    app.status = "NAME TOO LONG · MAXIMUM 100 UTF-8 BYTES".into();
-                                } else {
-                                    app.profile_name = name.to_owned();
-                                    match store.save_profile_name(&app.profile_name) {
-                                    Ok(()) => app.status =
-                                        "PROFILE NAME SAVED · IT WILL SYNC WITH YOUR NEXT MESSAGE"
-                                            .into(),
-                                    Err(error) => {
-                                        app.status = format!("PROFILE SAVE FAILED · {error}")
-                                    }
-                                }
-                                }
-                                app.input.clear();
-                                continue;
-                            }
-                            if app.input == "/exit" {
-                                return Ok(());
-                            }
-                            if app.input == "/rsync" {
-                                app.input.clear();
-                                last_sync = Instant::now();
-                                start_sync(app, client, store, &mut sync_task);
-                                continue;
-                            }
-                            if app.input == "/view" {
-                                app.input.clear();
-                                app.status = match open_selected_image(app) {
-                                    Ok(()) => "IMAGE PREVIEW · PRESS ESC TO CLOSE".into(),
-                                    Err(error) => format!("IMAGE PREVIEW FAILED · {error}"),
-                                };
-                                continue;
-                            }
-                            if app.input == "/?" {
-                                app.input.clear();
-                                app.show_help = true;
-                                continue;
-                            }
-                            let body = app.input.trim().to_owned();
-                            if body.is_empty() {
-                                if app.focus != FocusArea::Composer {
-                                    app.focus = FocusArea::Composer;
-                                }
-                                continue;
-                            }
-                            let recipient =
-                                app.conversations.get(app.selected).map(|c| c.id.clone());
-                            let Some(recipient) = recipient else {
-                                app.status = "ADD A CONTACT FIRST WITH CTRL+N".into();
-                                continue;
-                            };
-                            app.status = "SENDING THROUGH SESSION ONION ROUTING…".into();
-                            terminal.draw(|frame| draw(frame, app))?;
-                            match client
-                                .send_message(&recipient, &body, &app.profile_name)
-                                .await
-                            {
-                                Ok((timestamp_ms, sync_copy_sent)) => {
-                                    app.append_message(body, timestamp_ms, true);
-                                    if let Some(convo) = app.conversations.get(app.selected) {
-                                        if let Some(message) = convo.messages.last() {
-                                            if let Err(error) =
-                                                store.save_message(&recipient, message)
-                                            {
-                                                app.status =
-                                                    format!("SENT · LOCAL SAVE ERROR · {error}");
-                                                app.input.clear();
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    let _ = store.save_contact(&recipient);
-                                    app.input.clear();
-                                    app.status = if sync_copy_sent {
-                                        "SENT · SYNCED TO YOUR OTHER DEVICES".into()
-                                    } else {
-                                        "SENT · OTHER DEVICE SYNC COPY FAILED".into()
-                                    };
-                                }
-                                Err(error) => app.status = format!("SEND FAILED · {error}"),
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            app.input.pop();
-                        }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.focus = FocusArea::Composer;
-                            app.input.push(c)
-                        }
-                        _ => {}
                     }
                 }
-                _ => {}
+                if let Some(removed) = app.remove_selected_message()
+                    && let Err(error) = store.delete_message(&peer, &removed)
+                {
+                    app.status = format!("LOCAL DELETE ERROR · {error}");
+                    continue;
+                }
+                app.status = if outgoing {
+                    "MESSAGE UNSENT".into()
+                } else {
+                    "MESSAGE DELETED LOCALLY".into()
+                };
             }
+            KeyCode::Enter
+                if app.input_mode == InputMode::ContactId && !app.input.starts_with('/') =>
+            {
+                app.submit_contact_id();
+                if let Some(contact) = app.conversations.get(app.selected)
+                    && let Err(error) = store.save_contact(&contact.id)
+                {
+                    app.status = format!("LOCAL CONTACT ERROR · {error}");
+                }
+            }
+            KeyCode::Enter => {
+                let input = app.input.clone();
+                let (command, rest) = input
+                    .split_once(char::is_whitespace)
+                    .map_or((input.as_str(), ""), |(c, r)| (c, r.trim()));
+                match command {
+                    "/attach" => {
+                        app.input.clear();
+                        let (paths, caption) = match rest.split_once(" -- ") {
+                            Some((paths, caption)) => (split_args(paths), caption.trim().to_owned()),
+                            None => (split_args(rest), String::new()),
+                        };
+                        if paths.is_empty() {
+                            app.status = "USAGE · /attach PATH [PATH…] [-- CAPTION]".into();
+                            continue;
+                        }
+                        if paths.len() > MAX_ATTACHMENTS {
+                            app.status =
+                                format!("TOO MANY FILES · SESSION ALLOWS {MAX_ATTACHMENTS} PER MESSAGE");
+                            continue;
+                        }
+                        let Some(recipient) = app.conversations.get(app.selected).map(|c| c.id.clone())
+                        else {
+                            app.status = "ADD A CONTACT FIRST WITH CTRL+N".into();
+                            continue;
+                        };
+                        if attachment_task.is_some() {
+                            app.status = "AN ATTACHMENT IS ALREADY UPLOADING".into();
+                            app.input = input;
+                            continue;
+                        }
+                        if let Some(missing) =
+                            paths.iter().find(|p| !std::path::Path::new(p).is_file())
+                        {
+                            app.status = format!("FILE NOT FOUND · {missing}");
+                            app.input = input;
+                            continue;
+                        }
+                        let label = if paths.len() == 1 {
+                            std::path::Path::new(&paths[0])
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("attachment")
+                                .to_owned()
+                        } else {
+                            format!("{} files", paths.len())
+                        };
+                        let pending_timestamp = now_ms();
+                        if let Some(conversation) = app.conversations.get_mut(app.selected) {
+                            conversation.messages.push(Message::new(
+                                format!("Uploading · {label}"),
+                                pending_timestamp,
+                                true,
+                            ));
+                            conversation.selected_message = conversation.messages.len() - 1;
+                            conversation.refresh_preview();
+                        }
+                        app.status = format!("UPLOADING ATTACHMENT · {label}");
+                        let task_client = Arc::clone(client);
+                        let task_peer = recipient.clone();
+                        let profile_name = app.profile_name.clone();
+                        let paths: Vec<std::path::PathBuf> =
+                            paths.into_iter().map(std::path::PathBuf::from).collect();
+                        attachment_task = Some((
+                            spawn_network(move || async move {
+                                task_client
+                                    .send_attachments(&task_peer, &paths, &caption, &profile_name)
+                                    .await
+                            }),
+                            recipient,
+                            pending_timestamp,
+                        ));
+                    }
+                    "/save" => {
+                        app.input.clear();
+                        let mut args = split_args(rest);
+                        let index = args
+                            .first()
+                            .and_then(|a| a.parse::<usize>().ok())
+                            .filter(|n| *n >= 1);
+                        if index.is_some() {
+                            args.remove(0);
+                        }
+                        let target = args.join(" ");
+                        let Some((peer, timestamp, attachments)) =
+                            app.conversations.get(app.selected).and_then(|c| {
+                                let m = c.messages.get(c.selected_message)?;
+                                Some((c.id.clone(), m.timestamp_ms, m.attachments.clone()))
+                            })
+                        else {
+                            app.status = "SELECT AN ATTACHMENT WITH ↑/↓ FIRST".into();
+                            continue;
+                        };
+                        if attachments.is_empty() {
+                            app.status = "SELECTED MESSAGE HAS NO ATTACHMENT".into();
+                            continue;
+                        }
+                        let selected: Vec<usize> = match index {
+                            Some(n) if n <= attachments.len() => vec![n - 1],
+                            Some(_) => {
+                                app.status = format!(
+                                    "MESSAGE HAS {} ATTACHMENT(S) · USE /save 1-{}",
+                                    attachments.len(),
+                                    attachments.len()
+                                );
+                                continue;
+                            }
+                            None => (0..attachments.len()).collect(),
+                        };
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let target_path = (!target.is_empty()).then(|| std::path::PathBuf::from(&target));
+                        let into_dir = selected.len() > 1
+                            || target_path.as_ref().is_none_or(|p| p.is_dir());
+                        if selected.len() > 1
+                            && let Some(dir) = target_path.as_ref()
+                            && !dir.is_dir()
+                        {
+                            app.status = format!("NOT A FOLDER · {}", dir.display());
+                            continue;
+                        }
+                        app.status = "SAVING ATTACHMENT…".into();
+                        terminal.draw(|frame| draw(frame, app))?;
+                        let mut saved = Vec::new();
+                        let mut failure = None;
+                        for index in selected {
+                            let metadata = &attachments[index];
+                            let destination = if into_dir {
+                                unique_path(
+                                    target_path
+                                        .clone()
+                                        .unwrap_or_else(|| cwd.clone())
+                                        .join(attachment_file_name(metadata)),
+                                )
+                            } else {
+                                target_path.clone().expect("single file target")
+                            };
+                            let result = async {
+                                let cache_path = session_tui_media::attachment_blob_path(
+                                    &session_data_dir()?,
+                                    &peer,
+                                    timestamp,
+                                    index,
+                                );
+                                let encrypted = match std::fs::read(&cache_path) {
+                                    Ok(bytes) => bytes,
+                                    Err(_) => {
+                                        let pointer = attachment_pointer_from_meta(metadata);
+                                        let (_, bytes, _) =
+                                            client.download_attachment(&pointer).await?;
+                                        store.save_attachment_blob(&peer, timestamp, index, &bytes)?;
+                                        bytes
+                                    }
+                                };
+                                let plaintext = session_tui_media::decrypt_attachment(
+                                    &encrypted,
+                                    &metadata.key,
+                                    &metadata.digest,
+                                    metadata.deterministic,
+                                )?;
+                                std::fs::write(&destination, plaintext).map_err(|e| e.to_string())?;
+                                Ok::<(), String>(())
+                            }
+                            .await;
+                            match result {
+                                Ok(()) => saved.push(destination),
+                                Err(error) => {
+                                    failure = Some(format!("{} · {error}", metadata.file_name));
+                                    break;
+                                }
+                            }
+                        }
+                        app.status = match (failure, saved.as_slice()) {
+                            (Some(error), _) => format!("SAVE FAILED · {error}"),
+                            (None, [one]) => format!("SAVED FILE · {}", one.display()),
+                            (None, many) => format!(
+                                "SAVED {} FILES · {}",
+                                many.len(),
+                                target_path.unwrap_or(cwd).display()
+                            ),
+                        };
+                    }
+                    "/name" if rest.is_empty() => {
+                        app.input.clear();
+                        app.status = if app.profile_name.is_empty() {
+                            "PROFILE NAME NOT SET · USE /name YOUR NAME".into()
+                        } else {
+                            format!("PROFILE NAME · {}", app.profile_name)
+                        };
+                    }
+                    "/name" => {
+                        app.input.clear();
+                        if rest.len() > 100 {
+                            app.status = "NAME TOO LONG · MAXIMUM 100 UTF-8 BYTES".into();
+                        } else {
+                            app.profile_name = rest.to_owned();
+                            app.status = match store.save_profile_name(&app.profile_name) {
+                                Ok(()) => {
+                                    "PROFILE NAME SAVED · IT WILL SYNC WITH YOUR NEXT MESSAGE".into()
+                                }
+                                Err(error) => format!("PROFILE SAVE FAILED · {error}"),
+                            };
+                        }
+                    }
+                    "/exit" if rest.is_empty() => return Ok(()),
+                    "/rsync" if rest.is_empty() => {
+                        app.input.clear();
+                        last_sync = Instant::now();
+                        start_sync(app, client, store, &mut sync_task);
+                    }
+                    "/view" => {
+                        app.input.clear();
+                        let index = match rest {
+                            "" => None,
+                            n => match n.parse::<usize>() {
+                                Ok(n) if n >= 1 => Some(n - 1),
+                                _ => {
+                                    app.status = "USAGE · /view [N]".into();
+                                    continue;
+                                }
+                            },
+                        };
+                        app.status = match open_selected_image(app, index) {
+                            Ok(()) => "IMAGE PREVIEW · PRESS ESC TO CLOSE".into(),
+                            Err(error) => format!("IMAGE PREVIEW FAILED · {error}"),
+                        };
+                    }
+                    "/?" if rest.is_empty() => {
+                        app.input.clear();
+                        app.show_help = true;
+                    }
+                    _ if app.input_mode == InputMode::ContactId => {
+                        app.status = "UNKNOWN COMMAND · ESC TO CANCEL ADDING A CONTACT".into();
+                    }
+                    _ => {
+                        let body = app.input.trim().to_owned();
+                        if body.is_empty() {
+                            app.focus = FocusArea::Composer;
+                            continue;
+                        }
+                        let Some(recipient) = app.conversations.get(app.selected).map(|c| c.id.clone())
+                        else {
+                            app.status = "ADD A CONTACT FIRST WITH CTRL+N".into();
+                            continue;
+                        };
+                        app.status = "SENDING THROUGH SESSION ONION ROUTING…".into();
+                        terminal.draw(|frame| draw(frame, app))?;
+                        match client
+                            .send_message(&recipient, &body, &app.profile_name)
+                            .await
+                        {
+                            Ok((timestamp_ms, sync_copy_sent)) => {
+                                app.input.clear();
+                                let message = Message::new(body, timestamp_ms, true);
+                                let save = store.save_message(&recipient, &message);
+                                if let Some(convo) = app.conversations.get_mut(app.selected) {
+                                    convo.messages.push(message);
+                                    convo.selected_message = convo.messages.len() - 1;
+                                    convo.refresh_preview();
+                                }
+                                app.sort_conversations();
+                                app.status = match save {
+                                    Err(error) => format!("SENT · LOCAL SAVE ERROR · {error}"),
+                                    Ok(()) if sync_copy_sent => {
+                                        "SENT · SYNCED TO YOUR OTHER DEVICES".into()
+                                    }
+                                    Ok(()) => "SENT · OTHER DEVICE SYNC COPY FAILED".into(),
+                                };
+                            }
+                            Err(error) => app.status = format!("SEND FAILED · {error}"),
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                app.input.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.focus = FocusArea::Composer;
+                app.input.push(c)
+            }
+            _ => {}
         }
     }
 }
@@ -3163,15 +3709,15 @@ fn start_sync(
     app: &mut App,
     client: &Arc<SessionClient>,
     store: &LocalStore,
-    task: &mut Option<tokio::task::JoinHandle<Result<RetrieveResult, String>>>,
+    task: &mut Option<SyncTask>,
 ) {
     if task.is_some() {
         app.status = "SYNC ALREADY RUNNING".into();
         return;
     }
-    let cursor = match store.get_last_hash() {
-        Ok(hash) => hash,
-        Err(error) => {
+    let (cursor, group_cursors) = match (store.get_last_hash(), store.get_group_cursors()) {
+        (Ok(hash), Ok(groups)) => (hash, groups),
+        (Err(error), _) | (_, Err(error)) => {
             app.status = format!("SYNC CURSOR ERROR · {error}");
             return;
         }
@@ -3182,27 +3728,21 @@ fn start_sync(
         &format!("cursor_present={}", cursor.is_some()),
     );
     let client = Arc::clone(client);
-    *task = Some(tokio::task::spawn_blocking(move || {
-        // Network bootstrap currently keeps ThreadRng across an await, making
-        // the future !Send. Run it on a dedicated thread-local runtime.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| "could not start sync runtime".to_string())?;
-        runtime.block_on(async move {
-            match tokio::time::timeout(
-                Duration::from_secs(90),
-                client.retrieve_messages(cursor.as_deref()),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    debug_log("sync.timeout", "deadline_seconds=90");
-                    Err("sync timed out after 90 seconds".into())
-                }
+    // Network bootstrap keeps ThreadRng across an await, making the future
+    // !Send, so it runs on a dedicated current-thread runtime.
+    *task = Some(spawn_network(move || async move {
+        match tokio::time::timeout(
+            Duration::from_secs(90),
+            client.retrieve_messages(cursor.as_deref(), group_cursors),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                debug_log("sync.timeout", "deadline_seconds=90");
+                Err("sync timed out after 90 seconds".into())
             }
-        })
+        }
     }));
 }
 
@@ -3227,13 +3767,55 @@ fn start_read_receipt(
     peer: String,
     timestamps: Vec<u64>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
-    tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| "could not start receipt runtime".to_string())?;
-        runtime.block_on(client.send_receipt(&peer, 1, timestamps))
-    })
+    spawn_network(move || async move { client.send_receipt(&peer, 1, timestamps).await })
+}
+
+/// Apply an UnsendRequest the way Session does: only the author may unsend,
+/// and only that author's message with the given timestamp is removed.
+fn apply_unsend(
+    app: &mut App,
+    store: &LocalStore,
+    local_id: &str,
+    sender_id: &str,
+    contact_id: &str,
+    timestamp: u64,
+    author: &str,
+) -> bool {
+    if author != sender_id {
+        debug_log("unsend.rejected", "reason=author_mismatch");
+        return false;
+    }
+    let author_is_me = author == local_id;
+    let mut removed_any = false;
+    for conversation in &mut app.conversations {
+        // Our own unsend arriving from a linked device names no chat, so
+        // search every chat; otherwise only the chat it arrived in.
+        if !(conversation.id == contact_id || (author_is_me && contact_id == local_id)) {
+            continue;
+        }
+        let peer = conversation.id.clone();
+        let mut index = 0;
+        while index < conversation.messages.len() {
+            let message = &conversation.messages[index];
+            let matches = message.timestamp_ms == timestamp
+                && if author_is_me {
+                    message.outgoing
+                } else {
+                    !message.outgoing
+                        && message.sender.as_deref().is_none_or(|sender| sender == author)
+                };
+            if matches {
+                let removed = conversation.messages.remove(index);
+                let _ = store.delete_message(&peer, &removed);
+                removed_any = true;
+            } else {
+                index += 1;
+            }
+        }
+        conversation.clamp_selection();
+        conversation.refresh_preview();
+    }
+    removed_any
 }
 
 fn finish_sync(
@@ -3241,201 +3823,198 @@ fn finish_sync(
     store: &LocalStore,
     local_id: &str,
     result: Result<RetrieveResult, String>,
+    download_queue: &mut std::collections::VecDeque<PendingDownload>,
 ) {
-    match result {
-        Ok(result) => {
-            let groups_found = result.groups.len();
-            for group in result.groups.iter() {
-                let index = app.ensure_contact(&group.id);
-                app.conversations[index].name = group.name.clone();
-                let _ = store.save_contact_name(&group.id, &group.name);
-            }
-            debug_log(
-                "sync.complete",
-                &format!(
-                    "queued={} groups={} decrypt_failed={} bad_envelope={} bad_content={}",
-                    result.queued,
-                    groups_found,
-                    result.undecryptable,
-                    result.bad_envelope,
-                    result.bad_content
-                ),
-            );
-            if let Some(last_hash) = result.last_hash.as_deref() {
-                if let Err(error) = store.set_last_hash(last_hash) {
-                    app.status = format!("SYNC CURSOR SAVE ERROR · {error}");
-                    return;
-                }
-            }
-            let mut added = 0;
-            for message in result.messages {
-                let is_new = store.mark_seen(&message.hash).unwrap_or(false);
-                if !is_new || !app.seen_hashes.insert(message.hash) {
-                    continue;
-                }
-                if let Some((receipt_type, timestamps)) = message.receipt {
-                    let status = match receipt_type {
-                        0 => 1,
-                        1 => 2,
-                        _ => {
-                            debug_log("receipt.incoming", "kind=unknown ignored=true");
-                            continue;
-                        }
-                    };
-                    let mut matched = 0usize;
-                    if let Some(index) = app
-                        .conversations
-                        .iter()
-                        .position(|c| c.id == message.sender_id)
-                    {
-                        for timestamp in &timestamps {
-                            if let Some(outgoing) = app.conversations[index]
-                                .messages
-                                .iter_mut()
-                                .find(|m| m.outgoing && m.timestamp_ms == *timestamp)
-                            {
-                                outgoing.receipt_status = outgoing.receipt_status.max(status);
-                                let _ = store.update_receipt_status(
-                                    &message.sender_id,
-                                    *timestamp,
-                                    status,
-                                );
-                                matched += 1;
-                            }
-                        }
-                    }
-                    debug_log(
-                        "receipt.incoming",
-                        &format!(
-                            "peer_prefix={} kind={} timestamps={} first={} last={} matched={matched}",
-                            &message.sender_id[..message.sender_id.len().min(8)],
-                            if status == 2 { "read" } else { "delivery" },
-                            timestamps.len(),
-                            timestamps.first().copied().unwrap_or_default(),
-                            timestamps.last().copied().unwrap_or_default()
-                        ),
-                    );
-                    continue;
-                }
-                if let Some((timestamp, author)) = message.unsend {
-                    if author == message.sender_id {
-                        if let Some(index) = app
-                            .conversations
-                            .iter()
-                            .position(|c| c.id == message.contact_id)
-                        {
-                            let convo = &mut app.conversations[index];
-                            convo
-                                .messages
-                                .retain(|m| m.timestamp_ms != timestamp || m.outgoing);
-                            convo.selected_message = convo
-                                .selected_message
-                                .min(convo.messages.len().saturating_sub(1));
-                            convo.preview = convo
-                                .messages
-                                .last()
-                                .map(|m| m.body.clone())
-                                .unwrap_or_else(|| "Message removed".into());
-                        }
-                    }
-                    let _ = store.delete_message(&message.contact_id, timestamp);
-                    added += 1;
-                    continue;
-                }
-                let index = app.ensure_contact(&message.contact_id);
-                if !message.outgoing {
-                    if let Some(name) = message.sender_name.as_deref() {
-                        app.conversations[index].name = name.to_owned();
-                        let _ = store.save_contact_name(&message.contact_id, name);
-                    }
-                }
-                let body = message.body.unwrap_or_default();
-                if body.is_empty() && message.attachment.is_none() {
-                    continue;
-                }
-                if message.outgoing {
-                    let self_index = app.conversations.iter().position(|c| c.id == local_id);
-                    if let Some(self_index) = self_index {
-                        if let Some(old_index) =
-                            app.conversations[self_index].messages.iter().position(|m| {
-                                !m.outgoing
-                                    && m.timestamp_ms == message.timestamp_ms
-                                    && m.body == body
-                            })
-                        {
-                            app.conversations[self_index].messages.remove(old_index);
-                            app.conversations[self_index].selected_message =
-                                app.conversations[self_index].selected_message.min(
-                                    app.conversations[self_index]
-                                        .messages
-                                        .len()
-                                        .saturating_sub(1),
-                                );
-                            app.conversations[self_index].preview = app.conversations[self_index]
-                                .messages
-                                .last()
-                                .map(|m| m.body.clone())
-                                .unwrap_or_else(|| "Start a conversation".into());
-                            let _ = store.delete_incoming_message(
-                                &app.conversations[self_index].id,
-                                message.timestamp_ms,
-                            );
-                        }
-                    }
-                }
-                let convo = &mut app.conversations[index];
-                let is_read = message.outgoing || index == app.selected;
-                if convo.messages.iter().any(|m| {
-                    m.timestamp_ms == message.timestamp_ms && m.outgoing == message.outgoing
-                }) {
-                    continue;
-                }
-                if let Some(encrypted) = message.encrypted_attachment.as_deref()
-                    && let Err(error) = store.save_attachment_blob(
-                        &message.contact_id,
-                        message.timestamp_ms,
-                        encrypted,
-                    )
-                {
-                    debug_log("attachment.cache.failed", &format!("error={error}"));
-                }
-                convo.preview = message_preview_text(&body, message.attachment.as_ref());
-                let local_message = Message {
-                    body,
-                    time: format_time(message.timestamp_ms),
-                    timestamp_ms: message.timestamp_ms,
-                    outgoing: message.outgoing,
-                    receipt_status: 0,
-                    is_read,
-                    attachment: message.attachment,
-                    image_preview: message.image_preview,
-                };
-                let _ = store.save_message(&message.contact_id, &local_message);
-                convo.messages.push(local_message);
-                convo.selected_message = convo.messages.len() - 1;
-                added += 1;
-            }
-            if let Some(index) = app
-                .conversations
-                .iter()
-                .position(|c| c.id == local_id && c.messages.is_empty())
-            {
-                let _ = store.delete_empty_contact(local_id);
-                app.conversations.remove(index);
-                if app.selected >= app.conversations.len() {
-                    app.selected = app.conversations.len().saturating_sub(1);
-                }
-            }
-            app.status = format!(
-                "SYNC · {added} NEW · {groups_found} GROUPS · {} QUEUED · {} DECRYPT FAIL · {} BAD ENVELOPE · {} BAD CONTENT",
-                result.queued, result.undecryptable, result.bad_envelope, result.bad_content
-            );
-        }
+    let result = match result {
+        Ok(result) => result,
         Err(error) => {
             debug_log("sync.failed", "request_failed=true");
             app.status = format!("SYNC FAILED · {error}");
+            return;
         }
+    };
+    let groups_found = result.groups.len();
+    for group in result.groups.iter() {
+        let index = app.ensure_contact(&group.id);
+        app.conversations[index].name = group.name.clone();
+        let _ = store.save_contact_name(&group.id, &group.name);
     }
+    debug_log(
+        "sync.complete",
+        &format!(
+            "queued={} groups={} decrypt_failed={} bad_envelope={} bad_content={}",
+            result.queued,
+            groups_found,
+            result.undecryptable,
+            result.bad_envelope,
+            result.bad_content
+        ),
+    );
+    if let Some(last_hash) = result.last_hash.as_deref()
+        && let Err(error) = store.set_last_hash(last_hash)
+    {
+        app.status = format!("SYNC CURSOR SAVE ERROR · {error}");
+        return;
+    }
+    for (group, hash) in &result.group_cursors {
+        let _ = store.set_group_cursor(group, hash);
+    }
+    let mut added = 0;
+    for message in result.messages {
+        let is_new = store.mark_seen(&message.hash).unwrap_or(false);
+        if !is_new || !app.seen_hashes.insert(message.hash) {
+            continue;
+        }
+        if let Some((receipt_type, timestamps)) = message.receipt {
+            let status = match receipt_type {
+                0 => 1,
+                1 => 2,
+                _ => {
+                    debug_log("receipt.incoming", "kind=unknown ignored=true");
+                    continue;
+                }
+            };
+            let mut matched = 0usize;
+            if let Some(index) = app
+                .conversations
+                .iter()
+                .position(|c| c.id == message.sender_id)
+            {
+                for timestamp in &timestamps {
+                    if let Some(outgoing) = app.conversations[index]
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.outgoing && m.timestamp_ms == *timestamp)
+                    {
+                        outgoing.receipt_status = outgoing.receipt_status.max(status);
+                        let _ = store.update_receipt_status(&message.sender_id, *timestamp, status);
+                        matched += 1;
+                    }
+                }
+            }
+            debug_log(
+                "receipt.incoming",
+                &format!(
+                    "peer_prefix={} kind={} timestamps={} matched={matched}",
+                    &message.sender_id[..message.sender_id.len().min(8)],
+                    if status == 2 { "read" } else { "delivery" },
+                    timestamps.len(),
+                ),
+            );
+            continue;
+        }
+        if let Some((timestamp, author)) = message.unsend {
+            if apply_unsend(
+                app,
+                store,
+                local_id,
+                &message.sender_id,
+                &message.contact_id,
+                timestamp,
+                &author,
+            ) {
+                added += 1;
+            }
+            continue;
+        }
+        let is_group = message.contact_id.starts_with("03");
+        if let Some(name) = message.sender_name.as_deref()
+            && !message.outgoing
+        {
+            if app.display_names.get(&message.sender_id).map(String::as_str) != Some(name) {
+                app.display_names
+                    .insert(message.sender_id.clone(), name.to_owned());
+                let _ = store.save_display_name(&message.sender_id, name);
+            }
+            // A group's title comes from its config, never from a member.
+            if !is_group
+                && let Some(conversation) =
+                    app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+                && conversation.name != name
+            {
+                conversation.name = name.to_owned();
+                let _ = store.save_contact_name(&message.contact_id, name);
+            }
+        }
+        let body = message.body.unwrap_or_default();
+        if body.is_empty() && message.attachments.is_empty() {
+            continue;
+        }
+        if message.outgoing
+            && let Some(self_convo) = app.conversations.iter_mut().find(|c| c.id == local_id)
+            && let Some(old_index) = self_convo.messages.iter().position(|m| {
+                !m.outgoing && m.timestamp_ms == message.timestamp_ms && m.body == body
+            })
+        {
+            // An older build filed this sync copy under "Note to Self".
+            let removed = self_convo.messages.remove(old_index);
+            self_convo.clamp_selection();
+            self_convo.refresh_preview();
+            let _ = store.delete_message(local_id, &removed);
+        }
+        let index = app.ensure_contact(&message.contact_id);
+        let convo = &mut app.conversations[index];
+        let sender = (is_group && !message.outgoing).then(|| message.sender_id.clone());
+        if convo.messages.iter().any(|m| {
+            m.timestamp_ms == message.timestamp_ms
+                && m.outgoing == message.outgoing
+                && (m.sender.is_none() || m.sender == sender)
+        }) {
+            continue;
+        }
+        let mut local_message = Message::new(body, message.timestamp_ms, message.outgoing);
+        // Incoming messages stay unread until the chat is on screen; the
+        // main loop then marks them read and sends the read receipt.
+        local_message.is_read = message.outgoing;
+        local_message.sender = sender;
+        local_message.image_previews = vec![None; message.attachments.len()];
+        for (attachment_index, meta) in message.attachments.iter().enumerate() {
+            download_queue.push_back(PendingDownload {
+                peer: message.contact_id.clone(),
+                timestamp_ms: message.timestamp_ms,
+                outgoing: message.outgoing,
+                index: attachment_index,
+                meta: meta.clone(),
+            });
+        }
+        local_message.attachments = message.attachments;
+        let _ = store.save_message(&message.contact_id, &local_message);
+        let position = convo
+            .messages
+            .iter()
+            .position(|m| m.timestamp_ms > local_message.timestamp_ms)
+            .unwrap_or(convo.messages.len());
+        let at_end = position == convo.messages.len();
+        let was_at_bottom = convo.selected_message + 1 >= convo.messages.len();
+        convo.messages.insert(position, local_message);
+        if at_end && was_at_bottom {
+            convo.selected_message = convo.messages.len() - 1;
+        } else if position <= convo.selected_message && !convo.messages.is_empty() {
+            convo.selected_message += 1;
+        }
+        convo.clamp_selection();
+        convo.refresh_preview();
+        added += 1;
+    }
+    if let Some(index) = app
+        .conversations
+        .iter()
+        .position(|c| c.id == local_id && c.messages.is_empty())
+    {
+        let _ = store.delete_empty_contact(local_id);
+        let selected_id = app.conversations.get(app.selected).map(|c| c.id.clone());
+        app.conversations.remove(index);
+        app.selected = selected_id
+            .and_then(|id| app.conversations.iter().position(|c| c.id == id))
+            .unwrap_or(0);
+    }
+    if added > 0 {
+        app.sort_conversations();
+    }
+    app.status = format!(
+        "SYNC · {added} NEW · {groups_found} GROUPS · {} QUEUED · {} DECRYPT FAIL · {} BAD ENVELOPE · {} BAD CONTENT",
+        result.queued, result.undecryptable, result.bad_envelope, result.bad_content
+    );
 }
 
 fn now_ms() -> u64 {
@@ -3457,15 +4036,35 @@ fn strip_session_padding(plaintext: &[u8]) -> &[u8] {
     plaintext
 }
 
+/// Session-style timestamp: time only for today, date + time otherwise.
 fn format_time(timestamp_ms: u64) -> String {
     use time::{OffsetDateTime, UtcOffset};
-    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    OffsetDateTime::from_unix_timestamp((timestamp_ms / 1000) as i64)
-        .map(|time| {
-            let local = time.to_offset(offset);
-            format!("{:02}:{:02}", local.hour(), local.minute())
-        })
-        .unwrap_or_else(|_| "--:--".into())
+    let offset = LOCAL_OFFSET.get().copied().unwrap_or(UtcOffset::UTC);
+    let Ok(time) = OffsetDateTime::from_unix_timestamp((timestamp_ms / 1000) as i64) else {
+        return "--:--".into();
+    };
+    let local = time.to_offset(offset);
+    let today = OffsetDateTime::now_utc().to_offset(offset);
+    if local.date() == today.date() {
+        format!("{:02}:{:02}", local.hour(), local.minute())
+    } else if local.year() == today.year() {
+        format!(
+            "{:02}-{:02} {:02}:{:02}",
+            local.month() as u8,
+            local.day(),
+            local.hour(),
+            local.minute()
+        )
+    } else {
+        format!(
+            "{}-{:02}-{:02} {:02}:{:02}",
+            local.year(),
+            local.month() as u8,
+            local.day(),
+            local.hour(),
+            local.minute()
+        )
+    }
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -3647,8 +4246,9 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
             } else {
                 MUTED
             };
-            let unread = if c.unread > 0 {
-                format!("  {}", c.unread)
+            let unread_count = c.unread();
+            let unread = if unread_count > 0 {
+                format!("  ●{unread_count}")
             } else {
                 String::new()
             };
@@ -3687,6 +4287,7 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
     let mut state = ListState::default();
     state.select(Some(app.selected));
     frame.render_stateful_widget(list, inner[1], &mut state);
+    app.contact_list_offset = state.offset();
 }
 
 fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -3724,6 +4325,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let message_active = app.focus == FocusArea::Messages;
     let mut lines = vec![Line::from(" ")];
     let mut message_ranges = Vec::new();
+    let mut attachment_ranges = Vec::new();
     if let Some(c) = selected {
         for (message_index, message) in c.messages.iter().enumerate() {
             let message_start = lines.len();
@@ -3735,6 +4337,8 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             };
             let (tag, color) = if message.outgoing {
                 ("YOU".to_owned(), TEAL)
+            } else if let Some(sender) = message.sender.as_deref() {
+                (app.sender_label(sender), BLUE)
             } else {
                 (c.name.clone(), BLUE)
             };
@@ -3749,7 +4353,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         })
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(message.time.as_str(), Style::default().fg(MUTED)),
+                Span::styled(format_time(message.timestamp_ms), Style::default().fg(MUTED)),
             ];
             if message.outgoing {
                 let (ticks, tick_color) = match message.receipt_status {
@@ -3763,28 +4367,53 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 ));
             }
             lines.push(Line::from(metadata));
-            let body = message_preview_text(&message.body, message.attachment.as_ref());
-            if !body.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {body}"),
-                    Style::default().fg(TEXT),
-                )));
-            }
-            if let Some(preview) = message.image_preview.as_ref() {
-                for pixels in &preview.rows {
-                    let spans = pixels
-                        .iter()
-                        .map(|(top, bottom)| {
+            let total = message.attachments.len();
+            for (attachment_index, attachment) in message.attachments.iter().enumerate() {
+                let attachment_start = lines.len();
+                let numbering = if total > 1 {
+                    format!("{}/{total} ", attachment_index + 1)
+                } else {
+                    String::new()
+                };
+                let pending = message
+                    .image_previews
+                    .get(attachment_index)
+                    .is_none_or(Option::is_none)
+                    && attachment.content_type.starts_with("image/");
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {numbering}"), Style::default().fg(MUTED)),
+                    Span::styled(attachment_label(attachment), Style::default().fg(TEXT)),
+                    Span::styled(
+                        if pending { "  (loading…)" } else { "" },
+                        Style::default().fg(MUTED),
+                    ),
+                ]));
+                if let Some(Some(preview)) = message.image_previews.get(attachment_index) {
+                    for pixels in &preview.rows {
+                        let mut spans = vec![Span::raw("    ")];
+                        spans.extend(pixels.iter().map(|(top, bottom)| {
                             Span::styled(
                                 "▀",
                                 Style::default()
                                     .fg(Color::Rgb(top[0], top[1], top[2]))
                                     .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
                             )
-                        })
-                        .collect::<Vec<_>>();
-                    lines.push(Line::from(spans));
+                        }));
+                        lines.push(Line::from(spans));
+                    }
                 }
+                attachment_ranges.push((
+                    attachment_start,
+                    lines.len(),
+                    message_index,
+                    attachment_index,
+                ));
+            }
+            for text_line in message.body.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("    {text_line}"),
+                    Style::default().fg(TEXT),
+                )));
             }
             lines.push(Line::from(" "));
             message_ranges.push((message_start, lines.len(), message_index));
@@ -3855,9 +4484,17 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     };
     app.message_hitboxes.clear();
     let visible_end = scroll.saturating_add(visible_height);
-    for (start, end, message_index) in &message_ranges {
-        let start_row = wrapped(&lines[..(*start).min(lines.len())]);
-        let end_row = wrapped(&lines[..(*end).min(lines.len())]);
+    let ranges = message_ranges
+        .iter()
+        .map(|&(start, end, message)| (start, end, message, None))
+        .chain(
+            attachment_ranges
+                .iter()
+                .map(|&(start, end, message, attachment)| (start, end, message, Some(attachment))),
+        );
+    for (start, end, message_index, attachment_index) in ranges {
+        let start_row = wrapped(&lines[..start.min(lines.len())]);
+        let end_row = wrapped(&lines[..end.min(lines.len())]);
         if end_row <= scroll || start_row >= visible_end {
             continue;
         }
@@ -3872,7 +4509,8 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 .saturating_sub(scroll)
                 .saturating_sub(1)
                 .min(u16::MAX as usize) as u16;
-        app.message_hitboxes.push((y_start, y_end, *message_index));
+        app.message_hitboxes
+            .push((y_start, y_end, message_index, attachment_index));
     }
     let transcript = Paragraph::new(lines)
         .scroll((scroll.min(u16::MAX as usize) as u16, 0))
@@ -3939,11 +4577,11 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         Line::from("✓ / ✓✓     Delivered / read receipt for your messages"),
         Line::from("Delete      Delete selected message; outgoing messages send unsend"),
         Line::from("Ctrl+N      Add a contact by Session ID"),
-        Line::from("/attach PATH Send an encrypted photo or file (quote paths with spaces)"),
-        Line::from("/save        Save selected attachment in the current folder"),
-        Line::from("/save PATH   Save selected attachment to PATH (quote paths with spaces)"),
+        Line::from("/attach P1 [P2…] [-- caption]  Send files as one message (max 32)"),
+        Line::from("/save [N] [PATH]  Save attachment N (default: all) to PATH or ./"),
         Line::from("            Focus Messages, select it with ↑/↓, then run /save"),
-        Line::from("/view       Open a large preview of the selected image"),
+        Line::from("/view [N]   Open image N of the selected message (or click it)"),
+        Line::from("Ctrl+U      Clear the composer"),
         Line::from("/name NAME Set the display name sent with your messages"),
         Line::from("/rsync     Retrieve your inbox and sync groups from this account"),
         Line::from("Enter       Send an end-to-end encrypted message"),
@@ -3984,4 +4622,67 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - width) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(name: &str, content_type: &str) -> AttachmentMeta {
+        AttachmentMeta {
+            file_name: name.into(),
+            content_type: content_type.into(),
+            url: String::new(),
+            key: Vec::new(),
+            digest: Vec::new(),
+            size: 0,
+            deterministic: false,
+            width: None,
+            height: None,
+        }
+    }
+
+    #[test]
+    fn split_args_honours_quotes() {
+        assert_eq!(
+            split_args(r#"a.png "my photo.jpg"  c"#),
+            vec!["a.png", "my photo.jpg", "c"]
+        );
+        assert_eq!(split_args(r#""""#), vec![""]);
+        assert!(split_args("   ").is_empty());
+    }
+
+    #[test]
+    fn preview_text_summarises_albums() {
+        let photos = [meta("a.jpg", "image/jpeg"), meta("b.jpg", "image/jpeg")];
+        assert_eq!(message_preview_text("", &photos), "[2 Photos]");
+        let mixed = [meta("a.jpg", "image/jpeg"), meta("b.pdf", "application/pdf")];
+        assert_eq!(message_preview_text("", &mixed), "[Photo] a.jpg +1");
+        assert_eq!(message_preview_text("caption\nmore", &photos), "caption");
+        assert_eq!(message_preview_text("", &[]), "");
+    }
+
+    #[test]
+    fn legacy_stored_message_still_loads() {
+        let legacy = r#"{"body":"hi","attachment":{"file_name":"a.png","content_type":"image/png","url":"u","key":[],"digest":[],"size":1,"deterministic":false,"width":null,"height":null},"image_preview":null}"#;
+        let stored: StoredMessage = serde_json::from_str(legacy).unwrap();
+        assert!(stored.attachment.is_some());
+        assert!(stored.attachments.is_empty());
+        assert!(stored.sender.is_none());
+    }
+
+    #[test]
+    fn attachment_file_name_is_sanitised() {
+        assert_eq!(attachment_file_name(&meta("../../etc/x", "text/plain")), "x.txt");
+        assert_eq!(attachment_file_name(&meta("voice", "audio/aac")), "voice.aac");
+        assert_eq!(attachment_file_name(&meta("", "image/png")), "attachment.png");
+    }
+
+    #[test]
+    fn blob_path_index_zero_is_backwards_compatible() {
+        let root = std::path::Path::new("/r");
+        let a = session_tui_media::attachment_blob_path(root, "05ab", 7, 0);
+        let b = session_tui_media::attachment_blob_path(root, "05ab", 7, 1);
+        assert_ne!(a, b);
+    }
 }
