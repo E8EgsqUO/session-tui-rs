@@ -39,7 +39,7 @@ pub struct AttachmentMeta {
     pub height: Option<u32>,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ImagePreview {
     /// Each terminal cell is the top and bottom pixel of a half-block glyph.
     pub rows: Vec<Vec<([u8; 3], [u8; 3])>>,
@@ -108,9 +108,65 @@ pub fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
         .ok()
 }
 
+/// Inline thumbnail size in terminal cells (each cell shows two pixel rows).
+pub const PREVIEW_MAX_WIDTH: u32 = 20;
+pub const PREVIEW_MAX_ROWS: u32 = 6;
+
+/// Shrink an older, larger stored preview to the current thumbnail size
+/// (nearest-neighbour on the stored pixels; no need to decrypt the image).
+pub fn shrink_preview(preview: ImagePreview) -> ImagePreview {
+    let rows = preview.rows.len();
+    let width = preview.rows.first().map_or(0, Vec::len);
+    let max_rows = PREVIEW_MAX_ROWS as usize;
+    let max_width = PREVIEW_MAX_WIDTH as usize;
+    if rows <= max_rows && width <= max_width {
+        return preview;
+    }
+    // Work on pixel rows (2 per cell) so the aspect ratio is kept.
+    let pixel_rows: Vec<Vec<[u8; 3]>> = preview
+        .rows
+        .iter()
+        .flat_map(|row| {
+            [
+                row.iter().map(|(top, _)| *top).collect::<Vec<_>>(),
+                row.iter().map(|(_, bottom)| *bottom).collect::<Vec<_>>(),
+            ]
+        })
+        .collect();
+    let scale = (pixel_rows.len() as f64 / (max_rows * 2) as f64)
+        .max(width as f64 / max_width as f64)
+        .max(1.0);
+    let new_width = ((width as f64 / scale).floor() as usize).max(1);
+    let new_pixel_rows = ((pixel_rows.len() as f64 / scale).floor() as usize).max(1);
+    let sample = |x: usize, y: usize| {
+        let sy = ((y as f64 * scale) as usize).min(pixel_rows.len() - 1);
+        let sx = ((x as f64 * scale) as usize).min(width - 1);
+        pixel_rows[sy][sx]
+    };
+    let background = [10, 17, 23];
+    let rows = (0..new_pixel_rows)
+        .step_by(2)
+        .map(|y| {
+            (0..new_width)
+                .map(|x| {
+                    let bottom = if y + 1 < new_pixel_rows {
+                        sample(x, y + 1)
+                    } else {
+                        background
+                    };
+                    (sample(x, y), bottom)
+                })
+                .collect()
+        })
+        .collect();
+    ImagePreview { rows }
+}
+
 pub fn image_preview(data: &[u8]) -> Option<ImagePreview> {
     let image = image::load_from_memory(data).ok()?;
-    let image = image.thumbnail(28, 24).to_rgb8();
+    let image = image
+        .thumbnail(PREVIEW_MAX_WIDTH, PREVIEW_MAX_ROWS * 2)
+        .to_rgb8();
     let width = image.width() as usize;
     let height = image.height() as usize;
     let background = [10, 17, 23];
@@ -129,4 +185,27 @@ pub fn image_preview(data: &[u8]) -> Option<ImagePreview> {
         rows.push(row);
     }
     Some(ImagePreview { rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_previews_shrink_to_thumbnail_size() {
+        let old = ImagePreview {
+            rows: vec![vec![([1, 2, 3], [4, 5, 6]); 28]; 12],
+        };
+        let small = shrink_preview(old);
+        assert!(small.rows.len() <= PREVIEW_MAX_ROWS as usize);
+        assert!(small.rows[0].len() <= PREVIEW_MAX_WIDTH as usize);
+        // Downscaled pixels come from the source image.
+        let (top, bottom) = small.rows[0][0];
+        assert!([[1, 2, 3], [4, 5, 6]].contains(&top));
+        assert!([[1, 2, 3], [4, 5, 6]].contains(&bottom));
+        let tiny = ImagePreview {
+            rows: vec![vec![([0; 3], [0; 3]); 5]; 3],
+        };
+        assert_eq!(shrink_preview(tiny.clone()), tiny);
+    }
 }

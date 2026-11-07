@@ -361,6 +361,9 @@ fn expand_shortcodes(text: &str) -> String {
     out
 }
 
+/// Transcript rows scrolled per mouse-wheel notch.
+const WHEEL_ROWS: usize = 3;
+
 const STORED_MESSAGE_PREFIX: &str = "\0session-tui-message-v1:";
 
 /// Session clients accept at most 32 attachments in one message.
@@ -381,6 +384,12 @@ struct Conversation {
     typing_until: Option<Instant>,
     /// Group membership is read-only (no write permission).
     read_only: bool,
+    /// Top row of the transcript when scrolled with the mouse wheel;
+    /// `None` follows the selection / newest messages.
+    scroll: Option<usize>,
+    /// Arrow keys moved the selection: keep it in view. Cleared by the
+    /// mouse wheel, after which the view sticks to the newest messages.
+    follow_selection: bool,
 }
 
 impl Conversation {
@@ -455,6 +464,9 @@ struct App {
     /// Emoji shortcode list is open.
     show_emoji: bool,
     help_scroll: u16,
+    /// (scroll, max scroll) of the transcript as last drawn.
+    transcript_scroll: (usize, usize),
+    transcript_conversation: usize,
     local_id: String,
 }
 
@@ -484,6 +496,8 @@ impl App {
             reaction_picker: false,
             show_emoji: false,
             help_scroll: 0,
+            transcript_scroll: (0, 0),
+            transcript_conversation: usize::MAX,
             local_id,
         }
     }
@@ -547,6 +561,8 @@ impl App {
             disappearing: None,
             typing_until: None,
             read_only: false,
+            scroll: None,
+            follow_selection: false,
         });
         self.conversations.len() - 1
     }
@@ -697,18 +713,20 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     }
     if app.message_viewport.is_some_and(in_rect) {
         app.focus = FocusArea::Messages;
+        let (current, max_scroll) = app.transcript_scroll;
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if let Some(conversation) = app.conversations.get_mut(app.selected) {
-                    conversation.selected_message = conversation.selected_message.saturating_sub(1);
+                    conversation.scroll = Some(current.saturating_sub(WHEEL_ROWS));
+                    conversation.follow_selection = false;
                 }
             }
             MouseEventKind::ScrollDown => {
                 if let Some(conversation) = app.conversations.get_mut(app.selected) {
-                    if !conversation.messages.is_empty() {
-                        conversation.selected_message = (conversation.selected_message + 1)
-                            .min(conversation.messages.len() - 1);
-                    }
+                    let next = current + WHEEL_ROWS;
+                    // Reaching the bottom resumes following new messages.
+                    conversation.scroll = (next < max_scroll).then_some(next);
+                    conversation.follow_selection = false;
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1447,6 +1465,7 @@ impl LocalStore {
             })
             .map_err(|e| e.to_string())?;
         let root = session_data_dir().ok();
+        let mut resave = Vec::new();
         for row in rows {
             let (peer, timestamp_ms, outgoing, encrypted, receipt_status, is_read) =
                 row.map_err(|e| e.to_string())?;
@@ -1478,6 +1497,16 @@ impl LocalStore {
             message
                 .image_previews
                 .resize(message.attachments.len(), None);
+            // Previews stored by older versions were larger; shrink them.
+            let mut shrunk = false;
+            for preview in message.image_previews.iter_mut().flatten() {
+                let before = preview.rows.len();
+                *preview = session_tui_media::shrink_preview(std::mem::take(preview));
+                shrunk |= preview.rows.len() != before;
+            }
+            if shrunk {
+                resave.push((peer.clone(), message.clone()));
+            }
             // Rebuild missing previews from cached image blobs.
             for (index, meta) in message.attachments.iter().enumerate() {
                 if message.image_previews[index].is_some()
@@ -1507,6 +1536,9 @@ impl LocalStore {
         }
         drop(statement);
 
+        for (peer, message) in &resave {
+            let _ = self.update_message(peer, message);
+        }
         let mut statement = self
             .connection
             .prepare("SELECT session_id, display_name FROM profiles")
@@ -3967,6 +3999,7 @@ async fn run(
     let mut last_typing: Option<(String, Instant)> = None;
     let mut last_expiry_sweep = Instant::now();
     let mut last_title_unread: Option<usize> = None;
+    let mut last_draw = Instant::now();
     loop {
         // Finished text sends.
         let mut index = 0;
@@ -4166,7 +4199,12 @@ async fn run(
             last_sync = Instant::now();
             start_sync(app, client, store, &mut sync_task);
         }
-        terminal.draw(|frame| draw(frame, app))?;
+        // Coalesce bursts of input (e.g. mouse-wheel spins): redraw once the
+        // queue is empty, but at least every 50 ms.
+        if !event::poll(Duration::ZERO)? || last_draw.elapsed() >= Duration::from_millis(50) {
+            terminal.draw(|frame| draw(frame, app))?;
+            last_draw = Instant::now();
+        }
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
@@ -4388,6 +4426,8 @@ async fn run(
             }
             KeyCode::Up if app.input.is_empty() && app.focus == FocusArea::Messages => {
                 if let Some(conversation) = app.conversations.get_mut(app.selected) {
+                    conversation.scroll = None;
+                    conversation.follow_selection = true;
                     conversation.selected_message = conversation.selected_message.saturating_sub(1);
                 }
             }
@@ -4395,6 +4435,8 @@ async fn run(
                 if let Some(conversation) = app.conversations.get_mut(app.selected)
                     && !conversation.messages.is_empty()
                 {
+                    conversation.scroll = None;
+                    conversation.follow_selection = true;
                     conversation.selected_message =
                         (conversation.selected_message + 1).min(conversation.messages.len() - 1);
                 }
@@ -5873,7 +5915,30 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(title, rows[0]);
 
     let message_active = app.focus == FocusArea::Messages;
-    let mut lines = vec![Line::from(" ")];
+    let transcript_block = Block::default()
+        .title(if message_active {
+            " Messages · FOCUS "
+        } else {
+            " Messages "
+        })
+        .borders(Borders::ALL)
+        .border_style(if message_active {
+            Style::default().fg(TEAL)
+        } else {
+            Style::default().fg(Color::Rgb(35, 55, 62))
+        })
+        .style(Style::default().bg(BG));
+    let transcript_area = transcript_block.inner(rows[1]);
+    let text_width = transcript_area.width.max(8) as usize;
+    // Every Line is exactly one screen row: text is wrapped here, so scroll
+    // positions and click targets are exact.
+    let push_wrapped = |lines: &mut Vec<Line<'static>>, indent: &str, text: &str, style: Style| {
+        let (rows, _) = session_tui_input::wrap(text, 0, text_width.saturating_sub(indent.len()).max(4));
+        for row in rows {
+            lines.push(Line::from(Span::styled(format!("{indent}{row}"), style)));
+        }
+    };
+    let mut lines: Vec<Line<'static>> = vec![Line::from(" ")];
     let mut message_ranges = Vec::new();
     let mut attachment_ranges = Vec::new();
     if let Some(c) = selected {
@@ -5886,14 +5951,16 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 " "
             };
             if message.system {
-                lines.push(Line::from(Span::styled(
-                    format!(
+                push_wrapped(
+                    &mut lines,
+                    "",
+                    &format!(
                         " {marker}  ── {} · {} ──",
                         format_time(message.timestamp_ms),
                         message.body
                     ),
                     Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-                )));
+                );
                 lines.push(Line::from(" "));
                 message_ranges.push((message_start, lines.len(), message_index));
                 continue;
@@ -5942,14 +6009,16 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             }
             lines.push(Line::from(metadata));
             if let Some(quote) = message.quote.as_ref() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "    ┃ ↪ {}: {}",
+                push_wrapped(
+                    &mut lines,
+                    "    ┃ ",
+                    &format!(
+                        "↪ {}: {}",
                         app.sender_label(&quote.author),
                         quote.text.lines().next().unwrap_or_default()
                     ),
                     Style::default().fg(MUTED),
-                )));
+                );
             }
             let total = message.attachments.len();
             for (attachment_index, attachment) in message.attachments.iter().enumerate() {
@@ -5964,14 +6033,16 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     .get(attachment_index)
                     .is_none_or(Option::is_none)
                     && attachment.content_type.starts_with("image/");
-                lines.push(Line::from(vec![
-                    Span::styled(format!("    {numbering}"), Style::default().fg(MUTED)),
-                    Span::styled(attachment_label(attachment), Style::default().fg(TEXT)),
-                    Span::styled(
-                        if pending { "  (loading…)" } else { "" },
-                        Style::default().fg(MUTED),
+                push_wrapped(
+                    &mut lines,
+                    "    ",
+                    &format!(
+                        "{numbering}{}{}",
+                        attachment_label(attachment),
+                        if pending { "  (loading…)" } else { "" }
                     ),
-                ]));
+                    Style::default().fg(TEXT),
+                );
                 if let Some(Some(preview)) = message.image_previews.get(attachment_index) {
                     for pixels in &preview.rows {
                         let mut spans = vec![Span::raw("    ")];
@@ -5994,19 +6065,14 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 ));
             }
             for text_line in message.body.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {text_line}"),
-                    Style::default().fg(TEXT),
-                )));
+                push_wrapped(&mut lines, "    ", text_line, Style::default().fg(TEXT));
             }
             for (url, title) in &message.links {
-                lines.push(Line::from(Span::styled(
-                    match title {
-                        Some(title) if !title.is_empty() => format!("    🔗 {title} · {url}"),
-                        _ => format!("    🔗 {url}"),
-                    },
-                    Style::default().fg(BLUE),
-                )));
+                let text = match title {
+                    Some(title) if !title.is_empty() => format!("🔗 {title} · {url}"),
+                    _ => format!("🔗 {url}"),
+                };
+                push_wrapped(&mut lines, "    ", &text, Style::default().fg(BLUE));
             }
             if !message.reactions.is_empty() {
                 let mut spans = vec![Span::raw("    ")];
@@ -6033,57 +6099,30 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             Style::default().fg(MUTED),
         )));
     }
-    let transcript_block = Block::default()
-        .title(if message_active {
-            " Messages · FOCUS "
-        } else {
-            " Messages "
-        })
-        .borders(Borders::ALL)
-        .border_style(if message_active {
-            Style::default().fg(TEAL)
-        } else {
-            Style::default().fg(Color::Rgb(35, 55, 62))
-        })
-        .style(Style::default().bg(BG));
-    let transcript_area = transcript_block.inner(rows[1]);
     app.message_viewport = Some(transcript_area);
     let visible_height = transcript_area.height as usize;
-    let wrapped = |part: &[Line<'_>]| {
-        let width = transcript_area.width.max(1) as usize;
-        part.iter()
-            .map(|line| line.width().div_ceil(width).max(1))
-            .sum::<usize>()
-    };
-    let total_visual_lines = wrapped(&lines);
-    let max_scroll = total_visual_lines.saturating_sub(visible_height);
-    let scroll = if message_active {
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let manual_scroll = selected.and_then(|c| c.scroll);
+    let scroll = if let Some(top) = manual_scroll {
+        // Mouse wheel scrolled the view freely.
+        top.min(max_scroll)
+    } else if message_active && selected.is_some_and(|c| c.follow_selection) {
+        // Keep the selected message visible with the smallest move from the
+        // previous position (no jumps while stepping through messages).
+        let previous = if app.transcript_conversation == app.selected {
+            app.transcript_scroll.0
+        } else {
+            max_scroll
+        };
         selected
-            .map(|c| {
-                let (selected_start, selected_end, _) =
-                    message_ranges.get(c.selected_message).copied().unwrap_or((
-                        lines.len().saturating_sub(1),
-                        lines.len(),
-                        c.selected_message,
-                    ));
-                let selected_visual_start = wrapped(&lines[..selected_start.min(lines.len())]);
-                let selected_visual_height =
-                    wrapped(&lines[selected_start.min(lines.len())..selected_end]);
-                // Keep the newest messages bottom-aligned when the selected
-                // message overlaps the bottom viewport.  In particular, a
-                // wrapped final message may start above max_scroll while its
-                // body still extends below the viewport; scrolling to its
-                // start would clip the newest text at the bottom.
-                if selected_visual_start < max_scroll
-                    && selected_visual_start + selected_visual_height <= max_scroll
-                {
-                    selected_visual_start
-                } else if selected_visual_start + selected_visual_height
-                    > max_scroll + visible_height
-                {
-                    selected_visual_start + selected_visual_height - visible_height
+            .and_then(|c| message_ranges.get(c.selected_message).copied())
+            .map(|(start, end, _)| {
+                if start < previous {
+                    start
+                } else if end > previous + visible_height {
+                    start.max(end.saturating_sub(visible_height))
                 } else {
-                    max_scroll
+                    previous
                 }
             })
             .unwrap_or(max_scroll)
@@ -6091,6 +6130,8 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     } else {
         max_scroll
     };
+    app.transcript_scroll = (scroll, max_scroll);
+    app.transcript_conversation = app.selected;
     app.message_hitboxes.clear();
     let visible_end = scroll.saturating_add(visible_height);
     let ranges = message_ranges
@@ -6102,28 +6143,17 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 .map(|&(start, end, message, attachment)| (start, end, message, Some(attachment))),
         );
     for (start, end, message_index, attachment_index) in ranges {
-        let start_row = wrapped(&lines[..start.min(lines.len())]);
-        let end_row = wrapped(&lines[..end.min(lines.len())]);
-        if end_row <= scroll || start_row >= visible_end {
+        if end <= scroll || start >= visible_end {
             continue;
         }
-        let y_start = transcript_area.y
-            + start_row
-                .max(scroll)
-                .saturating_sub(scroll)
-                .min(u16::MAX as usize) as u16;
+        let y_start = transcript_area.y + (start.max(scroll) - scroll).min(u16::MAX as usize) as u16;
         let y_end = transcript_area.y
-            + end_row
-                .min(visible_end)
-                .saturating_sub(scroll)
-                .saturating_sub(1)
-                .min(u16::MAX as usize) as u16;
+            + (end.min(visible_end) - scroll).saturating_sub(1).min(u16::MAX as usize) as u16;
         app.message_hitboxes
             .push((y_start, y_end, message_index, attachment_index));
     }
     let transcript = Paragraph::new(lines)
         .scroll((scroll.min(u16::MAX as usize) as u16, 0))
-        .wrap(Wrap { trim: true })
         .style(Style::default().bg(BG))
         .block(transcript_block);
     frame.render_widget(transcript, rows[1]);
@@ -6543,5 +6573,63 @@ mod emoji_tests {
         assert_eq!(find_message_hash(&flat).as_deref(), Some("abc"));
         assert_eq!(find_message_hash(&nested).as_deref(), Some("def"));
         assert_eq!(find_message_hash(&serde_json::json!({"ok": true})), None);
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEvent};
+    use ratatui::backend::TestBackend;
+
+    fn wheel(app: &mut App, kind: MouseEventKind) {
+        let area = app.message_viewport.expect("drawn");
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+
+    #[test]
+    fn wheel_scrolls_by_fixed_rows_and_resumes_following() {
+        let local = "05".to_owned() + &"11".repeat(32);
+        let peer = "05".to_owned() + &"22".repeat(32);
+        let mut app = App::new(local);
+        let index = app.ensure_contact(&peer);
+        for i in 0..200u64 {
+            let body = if i % 7 == 0 {
+                "a long message that has to wrap over several rows ".repeat(4)
+            } else {
+                format!("message {i}")
+            };
+            app.conversations[index].messages.push(Message::new(body, 1_000 + i, i % 2 == 0));
+        }
+        app.selected = index;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let (bottom, max_scroll) = app.transcript_scroll;
+        assert_eq!(bottom, max_scroll, "starts at the newest messages");
+        assert!(max_scroll > 100);
+
+        for step in 1..=5 {
+            wheel(&mut app, MouseEventKind::ScrollUp);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert_eq!(app.transcript_scroll.0, max_scroll - step * WHEEL_ROWS);
+        }
+        for _ in 0..5 {
+            wheel(&mut app, MouseEventKind::ScrollDown);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
+        assert_eq!(app.transcript_scroll.0, max_scroll);
+        assert_eq!(app.conversations[index].scroll, None, "follows new messages again");
+        // A new message keeps the view at the bottom.
+        app.conversations[index].messages.push(Message::new("new".into(), 9_999, false));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.transcript_scroll.0, app.transcript_scroll.1);
     }
 }
