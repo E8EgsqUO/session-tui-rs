@@ -769,6 +769,13 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     }
 }
 
+/// A 1:1 (`05…`) or group (`03…`) chat ID: prefix + 64 hex digits.
+fn is_chat_id(id: &str) -> bool {
+    id.len() == 66
+        && (id.starts_with("05") || id.starts_with("03"))
+        && id[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn short_id(id: &str) -> String {
     if id.len() < 12 {
         return id.to_owned();
@@ -1131,22 +1138,19 @@ fn parse_content(
         // EXPIRATION_TIMER_UPDATE
         message.event = Some(ChatEvent::TimerChanged(expiration));
         if message.outgoing
-            && let Some(target) = data_message
-                .sync_target
-                .filter(|target| libsession::util::types::session_id_is_valid(target))
+            && let Some(target) = data_message.sync_target.filter(|target| is_chat_id(target))
         {
             message.contact_id = target;
         }
         return Some(message);
     }
 
-    // Our own 1:1 messages mirrored from another device name the real chat.
+    // Our own messages mirrored from another device name the real chat
+    // (a contact `05…` or a group `03…`). Only our own messages may be
+    // re-routed; anything else stays in the sender's chat.
     if !is_group
         && message.outgoing
-        && let Some(target) = data_message
-            .sync_target
-            .clone()
-            .filter(|target| libsession::util::types::session_id_is_valid(target))
+        && let Some(target) = data_message.sync_target.clone().filter(|target| is_chat_id(target))
     {
         message.contact_id = target;
         message.sender_name = None;
@@ -6298,6 +6302,10 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let mut message_ranges = Vec::new();
     let mut attachment_ranges = Vec::new();
     if let Some(c) = selected {
+        let last_sent = c
+            .messages
+            .iter()
+            .rposition(|m| m.outgoing && !m.system && m.send_state == SendState::Sent);
         for (message_index, message) in c.messages.iter().enumerate() {
             let message_start = lines.len();
             let selected_message = message_index == c.selected_message;
@@ -6342,17 +6350,22 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 Span::styled(format_time(message.timestamp_ms), Style::default().fg(MUTED)),
             ];
             if message.outgoing {
-                let (ticks, tick_color) = match (message.send_state, message.receipt_status) {
-                    (SendState::Sending, _) => (" ⋯ sending", MUTED),
-                    (SendState::Failed, _) => (" ✗ failed · /retry", Color::Red),
-                    (_, 2) => (" ✓✓", TEAL),
-                    (_, 1) => (" ✓✓", MUTED),
-                    _ => (" ✓", MUTED),
+                // Like the official apps, delivery/read ticks are shown only on
+                // the latest sent message; sending/failed show everywhere.
+                let ticks = match (message.send_state, message.receipt_status) {
+                    (SendState::Sending, _) => Some((" ⋯ sending", MUTED)),
+                    (SendState::Failed, _) => Some((" ✗ failed · /retry", Color::Red)),
+                    _ if Some(message_index) != last_sent => None,
+                    (_, 2) => Some((" ✓✓", TEAL)),
+                    (_, 1) => Some((" ✓✓", MUTED)),
+                    _ => Some((" ✓", MUTED)),
                 };
-                metadata.push(Span::styled(
-                    ticks,
-                    Style::default().fg(tick_color).add_modifier(Modifier::BOLD),
-                ));
+                if let Some((ticks, tick_color)) = ticks {
+                    metadata.push(Span::styled(
+                        ticks,
+                        Style::default().fg(tick_color).add_modifier(Modifier::BOLD),
+                    ));
+                }
             }
             if let Some(expires_at) = message.expires_at {
                 let left = expires_at.saturating_sub(now_ms()) / 1000;
@@ -6988,5 +7001,36 @@ mod scroll_tests {
         app.conversations[index].messages.push(Message::new("new".into(), 9_999, false));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.transcript_scroll.0, app.transcript_scroll.1);
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn only_our_own_messages_follow_sync_target() {
+        let me = "05".to_owned() + &"11".repeat(32);
+        let peer = "05".to_owned() + &"22".repeat(32);
+        let group = "03".to_owned() + &"33".repeat(32);
+        let content = |target: &str| Content {
+            data_message: Some(DataMessage {
+                body: Some("hi".into()),
+                timestamp: Some(1),
+                sync_target: Some(target.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Our sync copy of a group message goes to the group.
+        let mine = parse_content(&me, "h".into(), me.clone(), me.clone(), 1, content(&group)).unwrap();
+        assert_eq!(mine.contact_id, group);
+        // Someone else cannot redirect their message into another chat.
+        let theirs = parse_content(&me, "h".into(), peer.clone(), peer.clone(), 1, content(&group)).unwrap();
+        assert_eq!(theirs.contact_id, peer);
+        // Malformed targets are ignored.
+        let bad = parse_content(&me, "h".into(), me.clone(), me.clone(), 1, content("03zz")).unwrap();
+        assert_eq!(bad.contact_id, me);
+        assert!(!is_chat_id("04".to_owned().as_str()));
     }
 }
