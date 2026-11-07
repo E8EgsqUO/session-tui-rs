@@ -130,6 +130,9 @@ struct Message {
     system: bool,
     /// Outgoing delivery state; not persisted (only sent messages are stored).
     send_state: SendState,
+    /// Hashes of our own copies of this message in this account's swarm
+    /// (1:1 sync copies), deleted from the swarm when the message is unsent.
+    swarm_hashes: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -236,6 +239,7 @@ impl Message {
             links: Vec::new(),
             system: false,
             send_state: SendState::Sent,
+            swarm_hashes: Vec::new(),
         }
     }
 
@@ -303,6 +307,57 @@ struct StoredMessage {
     links: Vec<(String, Option<String>)>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     system: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    swarm_hashes: Vec<String>,
+}
+
+/// Session's default quick reactions (the reaction bar in the apps).
+const QUICK_REACTIONS: [&str; 6] = ["😂", "🥰", "😢", "😡", "😮", "😈"];
+
+/// `:name:` shortcodes expanded in messages and `/react`.
+const EMOJI_SHORTCODES: &[(&str, &str)] = &[
+    ("+1", "👍"), ("thumbsup", "👍"), ("-1", "👎"), ("thumbsdown", "👎"),
+    ("joy", "😂"), ("rofl", "🤣"), ("smile", "😄"), ("grin", "😁"),
+    ("laughing", "😆"), ("sweat_smile", "😅"), ("wink", "😉"), ("blush", "😊"),
+    ("love", "🥰"), ("heart_eyes", "😍"), ("kiss", "😘"), ("thinking", "🤔"),
+    ("neutral", "😐"), ("cry", "😢"), ("sob", "😭"), ("angry", "😠"),
+    ("rage", "😡"), ("scream", "😱"), ("open_mouth", "😮"), ("sunglasses", "😎"),
+    ("sleepy", "😴"), ("party", "🥳"), ("hug", "🤗"), ("shrug", "🤷"),
+    ("facepalm", "🤦"), ("devil", "😈"), ("skull", "💀"), ("poop", "💩"),
+    ("ok", "👌"), ("clap", "👏"), ("pray", "🙏"), ("wave", "👋"),
+    ("muscle", "💪"), ("eyes", "👀"), ("heart", "❤️"), ("broken_heart", "💔"),
+    ("fire", "🔥"), ("star", "⭐"), ("sparkles", "✨"), ("tada", "🎉"),
+    ("100", "💯"), ("check", "✅"), ("x", "❌"), ("rocket", "🚀"),
+    ("coffee", "☕"), ("beer", "🍺"),
+];
+
+/// Replace known `:name:` shortcodes with emoji; unknown ones stay as typed.
+fn expand_shortcodes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(':') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let replaced = after.find(':').and_then(|end| {
+            let name = &after[..end];
+            EMOJI_SHORTCODES
+                .iter()
+                .find(|(code, _)| *code == name)
+                .map(|(_, emoji)| (*emoji, end))
+        });
+        match replaced {
+            Some((emoji, end)) => {
+                out.push_str(emoji);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push(':');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 const STORED_MESSAGE_PREFIX: &str = "\0session-tui-message-v1:";
@@ -388,6 +443,10 @@ struct App {
     display_names: HashMap<String, String>,
     /// Message the next text/attachment replies to.
     reply_to: Option<QuoteRef>,
+    /// Quick-reaction bar for the selected message is open.
+    reaction_picker: bool,
+    /// Emoji shortcode list is open.
+    show_emoji: bool,
     local_id: String,
 }
 
@@ -411,6 +470,8 @@ impl App {
             message_hitboxes: Vec::new(),
             display_names: HashMap::new(),
             reply_to: None,
+            reaction_picker: false,
+            show_emoji: false,
             local_id,
         }
     }
@@ -813,6 +874,20 @@ fn profile_for(profile_name: &str, timestamp_ms: u64) -> Option<LokiProfile> {
     })
 }
 
+/// The storage server reports the stored message hash either at the top
+/// level or per swarm node (`{"swarm": {"<node>": {"hash": …}}}`).
+fn find_message_hash(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| map.values().find_map(find_message_hash)),
+        Value::Array(items) => items.iter().find_map(find_message_hash),
+        _ => None,
+    }
+}
+
 fn split_host_port(host: &str) -> (&str, Option<u16>) {
     if let Some((name, port)) = host.rsplit_once(':')
         && let Ok(port) = port.parse::<u16>()
@@ -1175,12 +1250,19 @@ struct SessionClient {
     groups: Mutex<HashMap<String, GroupRuntime>>,
 }
 
+/// Result of mirroring an outgoing message to this account's own swarm.
+struct SyncCopy {
+    sent: bool,
+    /// Hash of the copy in our swarm (needed to delete it on unsend).
+    hash: Option<String>,
+}
+
 struct SentAttachments {
     timestamp_ms: u64,
     caption: String,
     /// (metadata, encrypted blob, preview) per attachment, in send order.
     files: Vec<(AttachmentMeta, Vec<u8>, Option<ImagePreview>)>,
-    sync_copy_sent: bool,
+    sync_copy: SyncCopy,
 }
 
 struct ImageViewer {
@@ -1371,6 +1453,7 @@ impl LocalStore {
                 message.expires_at = payload.expires_at;
                 message.links = payload.links;
                 message.system = payload.system;
+                message.swarm_hashes = payload.swarm_hashes;
                 message.attachments = payload.attachments;
                 message.image_previews = payload.image_previews;
                 if let Some(legacy) = payload.attachment {
@@ -1500,6 +1583,7 @@ impl LocalStore {
             expires_at: message.expires_at,
             links: message.links.clone(),
             system: message.system,
+            swarm_hashes: message.swarm_hashes.clone(),
         })
         .map_err(|e| e.to_string())?;
         self.encrypt_body(&format!("{STORED_MESSAGE_PREFIX}{payload}"))
@@ -2412,7 +2496,7 @@ impl SessionClient {
         recipient_id: &str,
         data_message: DataMessage,
         expiration: Option<Expiration>,
-    ) -> Result<bool, String> {
+    ) -> Result<SyncCopy, String> {
         let timestamp_ms = data_message.timestamp.ok_or("message has no timestamp")?;
         let content = Content {
             data_message: Some(data_message.clone()),
@@ -2439,7 +2523,9 @@ impl SessionClient {
             sig_timestamp: Some(timestamp_ms),
             ..Default::default()
         };
-        self.send_content(recipient_id, content, timestamp_ms).await
+        self.send_content(recipient_id, content, timestamp_ms)
+            .await
+            .map(|_| ())
     }
 
     /// Tell a group we accepted its invite (shows as "joined" for others).
@@ -2595,18 +2681,18 @@ impl SessionClient {
             quote,
             ..Default::default()
         };
-        let sync_copy_sent = self
+        let sync_copy = self
             .send_data_message(recipient_id, data_message, expiration)
             .await?;
         debug_log(
             "attachment.sent",
-            &format!("files={} sync_copy_sent={sync_copy_sent}", files.len()),
+            &format!("files={} sync_copy_sent={}", files.len(), sync_copy.sent),
         );
         Ok(SentAttachments {
             timestamp_ms,
             caption,
             files,
-            sync_copy_sent,
+            sync_copy,
         })
     }
 
@@ -2619,9 +2705,12 @@ impl SessionClient {
         data_message: DataMessage,
         timestamp_ms: u64,
         expiration: Option<Expiration>,
-    ) -> bool {
+    ) -> SyncCopy {
         if recipient_id.starts_with("03") || recipient_id == self.identity.session_id {
-            return true;
+            return SyncCopy {
+                sent: true,
+                hash: None,
+            };
         }
         let sync_content = Content {
             data_message: Some(DataMessage {
@@ -2637,10 +2726,13 @@ impl SessionClient {
             .send_content(&self.identity.session_id, sync_content, timestamp_ms)
             .await
         {
-            Ok(()) => true,
+            Ok(hash) => SyncCopy { sent: true, hash },
             Err(error) => {
                 debug_log("send.sync_copy", &format!("sent=false error={error}"));
-                false
+                SyncCopy {
+                    sent: false,
+                    hash: None,
+                }
             }
         }
     }
@@ -2776,37 +2868,50 @@ impl SessionClient {
             sig_timestamp: Some(now_ms()),
             ..Default::default()
         };
-        self.send_content(recipient_id, content, now_ms()).await
+        self.send_content(recipient_id, content, now_ms())
+            .await
+            .map(|_| ())
     }
 
-    async fn unsend_message(&self, recipient_id: &str, timestamp_ms: u64) -> Result<(), String> {
+    /// "Delete for everyone": tell the chat and this account's other
+    /// devices, then remove our own swarm copies (`own_hashes`).
+    async fn unsend_message(
+        &self,
+        recipient_id: &str,
+        timestamp_ms: u64,
+        own_hashes: Vec<String>,
+    ) -> Result<(), String> {
+        let sent_at = now_ms();
         let content = Content {
             unsend_request: Some(libsession::proto::session_protos::UnsendRequest {
                 timestamp: timestamp_ms,
                 author: self.identity.session_id.clone(),
             }),
-            sig_timestamp: Some(now_ms()),
             ..Default::default()
         };
-        self.send_content(recipient_id, content.clone(), now_ms()).await?;
-        // Like Session, also tell this account's other devices.
+        self.send_content(recipient_id, content.clone(), sent_at).await?;
         if !recipient_id.starts_with("03") && recipient_id != self.identity.session_id {
-            if let Err(error) = self
-                .send_content(&self.identity.session_id, content, now_ms())
+            self.send_content(&self.identity.session_id, content, sent_at)
                 .await
-            {
-                debug_log("unsend.sync_copy", &format!("sent=false error={error}"));
-            }
+                .map_err(|error| format!("other devices not notified: {error}"))?;
+        }
+        if let Err(error) = self.delete_own_messages(&own_hashes).await {
+            debug_log("unsend.swarm_delete", &format!("error={error}"));
         }
         Ok(())
     }
 
+    /// Store `content` in the recipient's (or group's) swarm. Returns the
+    /// swarm message hash for 1:1 stores when the node reports it.
     async fn send_content(
         &self,
         recipient_id: &str,
-        content: Content,
+        mut content: Content,
         timestamp_ms: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
+        // Session clients drop messages whose signed timestamp differs from
+        // the envelope timestamp, so always use the same value for both.
+        content.sig_timestamp = Some(timestamp_ms);
         debug_log(
             "send.begin",
             &format!(
@@ -2880,7 +2985,7 @@ impl SessionClient {
                 "group.send.response",
                 &format!("http_status={}", response.status_code),
             );
-            return Ok(());
+            return Ok(None);
         }
         let recipient_bytes = hex::decode(recipient_id).map_err(|e| e.to_string())?;
         let recipient_key: [u8; 33] = recipient_bytes
@@ -2922,6 +3027,44 @@ impl SessionClient {
                 "Session store returned HTTP {}",
                 response.status_code
             ));
+        }
+        Ok(response
+            .body
+            .as_deref()
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .as_ref()
+            .and_then(find_message_hash))
+    }
+
+    /// Delete our own messages from this account's swarm by hash, so that
+    /// linked or newly restored devices cannot fetch them again.
+    async fn delete_own_messages(&self, hashes: &[String]) -> Result<(), String> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let mut to_sign = b"delete".to_vec();
+        for hash in hashes {
+            to_sign.extend_from_slice(hash.as_bytes());
+        }
+        let signature = ed25519::sign(&self.identity.ed_secret, &to_sign)
+            .map_err(|error| error.to_string())?;
+        let params = serde_json::json!({
+            "pubkey": self.identity.session_id,
+            "pubkey_ed25519": hex::encode(self.identity.ed_public),
+            "messages": hashes,
+            "signature": STANDARD.encode(signature),
+        });
+        let response = self
+            .network
+            .send_rpc("delete", params, Some(&self.identity.session_id))
+            .await
+            .map_err(|error| error.to_string())?;
+        debug_log(
+            "swarm.delete",
+            &format!("hashes={} http_status={}", hashes.len(), response.status_code),
+        );
+        if response.status_code != 200 {
+            return Err(format!("swarm delete returned HTTP {}", response.status_code));
         }
         Ok(())
     }
@@ -3786,7 +3929,7 @@ async fn run(
     let mut pending_read_receipts: std::collections::VecDeque<(String, Vec<u64>)> =
         std::collections::VecDeque::new();
     // Outgoing text/reaction/timer sends: (task, chat, message timestamp).
-    let mut send_tasks: Vec<(tokio::task::JoinHandle<Result<bool, String>>, String, u64)> =
+    let mut send_tasks: Vec<(tokio::task::JoinHandle<Result<SyncCopy, String>>, String, u64)> =
         Vec::new();
     let mut background_tasks: Vec<(tokio::task::JoinHandle<Result<(), String>>, &'static str)> =
         Vec::new();
@@ -3815,8 +3958,10 @@ async fn run(
                 continue;
             };
             match result {
-                Ok(sync_copy_sent) => {
+                Ok(sync_copy) => {
                     message.send_state = SendState::Sent;
+                    message.swarm_hashes.extend(sync_copy.hash);
+                    let sync_copy_sent = sync_copy.sent;
                     let saved = store.save_message(&peer, message);
                     app.status = match saved {
                         Err(error) => format!("SENT · LOCAL SAVE ERROR · {error}"),
@@ -3893,6 +4038,7 @@ async fn run(
                             convo.messages.remove(pending_index);
                         }
                         let mut message = Message::new(sent.caption, sent.timestamp_ms, true);
+                        message.swarm_hashes.extend(sent.sync_copy.hash);
                         for (index, (meta, encrypted, preview)) in
                             sent.files.into_iter().enumerate()
                         {
@@ -3909,7 +4055,7 @@ async fn run(
                         convo.messages.push(message);
                         convo.selected_message = convo.messages.len() - 1;
                         convo.refresh_preview();
-                        app.status = if sent.sync_copy_sent {
+                        app.status = if sent.sync_copy.sent {
                             "ATTACHMENT SENT · SYNCED TO YOUR OTHER DEVICES".into()
                         } else {
                             "ATTACHMENT SENT · DEVICE SYNC COPY FAILED".into()
@@ -4028,7 +4174,30 @@ async fn run(
             }
             continue;
         }
+        if app.reaction_picker {
+            app.reaction_picker = false;
+            if let KeyCode::Char(c @ '1'..='6') = key.code {
+                let emoji = QUICK_REACTIONS[c as usize - '1' as usize];
+                react_to_selected(app, client, store, emoji, &mut background_tasks);
+            }
+            continue;
+        }
+        if app.show_emoji {
+            app.show_emoji = false;
+            continue;
+        }
         match key.code {
+            KeyCode::Char('e')
+                if app.focus == FocusArea::Messages
+                    && app.input.is_empty()
+                    && key.modifiers.is_empty() =>
+            {
+                if app.selected_message().is_some_and(|m| !m.system) {
+                    app.reaction_picker = true;
+                } else {
+                    app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+                }
+            }
             KeyCode::Tab => {
                 app.focus = match app.focus {
                     FocusArea::Contacts => FocusArea::Messages,
@@ -4136,9 +4305,15 @@ async fn run(
                     // the background.
                     let task_client = Arc::clone(client);
                     let task_peer = peer.clone();
+                    let own_hashes = app
+                        .selected_message()
+                        .map(|m| m.swarm_hashes.clone())
+                        .unwrap_or_default();
                     background_tasks.push((
                         spawn_network(move || async move {
-                            task_client.unsend_message(&task_peer, timestamp).await
+                            task_client
+                                .unsend_message(&task_peer, timestamp, own_hashes)
+                                .await
                         }),
                         "unsend",
                     ));
@@ -4174,7 +4349,9 @@ async fn run(
                     "/attach" => {
                         app.input.clear();
                         let (paths, caption) = match rest.split_once(" -- ") {
-                            Some((paths, caption)) => (split_args(paths), caption.trim().to_owned()),
+                            Some((paths, caption)) => {
+                                (split_args(paths), expand_shortcodes(caption.trim()))
+                            }
                             None => (split_args(rest), String::new()),
                         };
                         if paths.is_empty() {
@@ -4403,6 +4580,10 @@ async fn run(
                             Err(error) => format!("IMAGE PREVIEW FAILED · {error}"),
                         };
                     }
+                    "/emoji" if rest.is_empty() => {
+                        app.input.clear();
+                        app.show_emoji = true;
+                    }
                     "/?" if rest.is_empty() => {
                         app.input.clear();
                         app.show_help = true;
@@ -4432,7 +4613,8 @@ async fn run(
                         if rest.is_empty() {
                             app.status = "USAGE · /react EMOJI (again to remove)".into();
                         } else {
-                            react_to_selected(app, client, store, rest, &mut background_tasks);
+                            let emoji = expand_shortcodes(rest);
+                            react_to_selected(app, client, store, &emoji, &mut background_tasks);
                         }
                     }
                     "/disappear" => {
@@ -4532,7 +4714,7 @@ async fn run(
                             continue;
                         }
                         let peer = conversation.id.clone();
-                        let mut message = Message::new(body, now_ms(), true);
+                        let mut message = Message::new(expand_shortcodes(&body), now_ms(), true);
                         message.send_state = SendState::Sending;
                         message.quote = app.reply_to.take();
                         message.expiration = conversation.disappearing;
@@ -4594,7 +4776,7 @@ fn spawn_text_send(
     app: &App,
     peer: &str,
     message: &Message,
-) -> (tokio::task::JoinHandle<Result<bool, String>>, String, u64) {
+) -> (tokio::task::JoinHandle<Result<SyncCopy, String>>, String, u64) {
     let data_message = DataMessage {
         body: Some(message.body.clone()),
         timestamp: Some(message.timestamp_ms),
@@ -4892,7 +5074,7 @@ fn finish_sync(
     let mut added = 0;
     for mut message in result.messages {
         let is_new = store.mark_seen(&message.hash).unwrap_or(false);
-        if !is_new || !app.seen_hashes.insert(message.hash) {
+        if !is_new || !app.seen_hashes.insert(message.hash.clone()) {
             continue;
         }
         if let Some((receipt_type, timestamps)) = message.receipt {
@@ -5089,11 +5271,17 @@ fn finish_sync(
         let index = app.ensure_contact(&message.contact_id);
         let convo = &mut app.conversations[index];
         let sender = (is_group && !message.outgoing).then(|| message.sender_id.clone());
-        if convo.messages.iter().any(|m| {
+        if let Some(existing) = convo.messages.iter_mut().find(|m| {
             m.timestamp_ms == message.timestamp_ms
                 && m.outgoing == message.outgoing
                 && (m.sender.is_none() || m.sender == sender)
         }) {
+            // Our own sync copy coming back: remember its swarm hash so an
+            // unsend can delete it.
+            if message.outgoing && !is_group && !existing.swarm_hashes.contains(&message.hash) {
+                existing.swarm_hashes.push(message.hash.clone());
+                let _ = store.update_message(&message.contact_id, existing);
+            }
             continue;
         }
         let mut local_message = Message::new(body, message.timestamp_ms, message.outgoing);
@@ -5101,6 +5289,10 @@ fn finish_sync(
         // main loop then marks them read and sends the read receipt.
         local_message.is_read = message.outgoing;
         local_message.sender = sender;
+        if message.outgoing && !is_group {
+            // Sent from another of our devices: this is its copy in our swarm.
+            local_message.swarm_hashes.push(message.hash.clone());
+        }
         local_message.quote = message.quote.take();
         local_message.links = std::mem::take(&mut message.links);
         local_message.expiration = message.expiration;
@@ -5281,6 +5473,59 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     if app.show_help {
         draw_help(frame, area);
+    }
+    if app.reaction_picker {
+        let width = 46.min(area.width);
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(6),
+            width,
+            height: 3.min(area.height),
+        };
+        frame.render_widget(Clear, popup);
+        let mut spans = Vec::new();
+        for (index, emoji) in QUICK_REACTIONS.iter().enumerate() {
+            spans.push(Span::styled(format!(" {}", index + 1), Style::default().fg(TEAL)));
+            spans.push(Span::styled(format!(" {emoji} "), Style::default().fg(TEXT)));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).block(
+                Block::default()
+                    .title(" React · 1-6 · Esc ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(TEAL))
+                    .style(Style::default().bg(PANEL)),
+            ),
+            popup,
+        );
+    }
+    if app.show_emoji {
+        let popup = centered_rect(80, 60, area);
+        frame.render_widget(Clear, popup);
+        let entries: Vec<String> = EMOJI_SHORTCODES
+            .iter()
+            .map(|(code, emoji)| format!("{emoji} :{code}:"))
+            .collect();
+        let lines: Vec<Line<'_>> = entries
+            .chunks(4)
+            .map(|row| {
+                Line::from(
+                    row.iter()
+                        .map(|entry| format!("{entry:<20}"))
+                        .collect::<String>(),
+                )
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .title(" Emoji shortcodes · type :name: in a message or /react · any key closes ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(TEAL))
+                    .style(Style::default().bg(PANEL)),
+            ),
+            popup,
+        );
     }
     if let Some(seed) = app.recovery_seed.as_deref() {
         draw_recovery_seed(frame, area, seed);
@@ -5808,8 +6053,9 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         Line::from("Ctrl+U      Clear the composer"),
         Line::from("/name NAME Set the display name sent with your messages"),
         Line::from("/rsync     Retrieve your inbox and sync groups from this account"),
-        Line::from("r / +       (Messages focus) reply to / 👍 the selected message"),
-        Line::from("/react 😀   React to the selected message (again removes it)"),
+        Line::from("r / + / e   (Messages focus) reply / 👍 / reaction bar (1-6)"),
+        Line::from("/react :joy:  React with an emoji or shortcode (again removes it)"),
+        Line::from(":heart: …   Shortcodes in messages; /emoji lists them; Win+. on Windows"),
         Line::from("/retry      Resend the selected failed message"),
         Line::from("/disappear off | read 12h | send 1d   Disappearing messages (1:1)"),
         Line::from("/accept     Join the group you were invited to"),
@@ -6047,5 +6293,28 @@ mod seed_file_tests {
             timer.event,
             Some(ChatEvent::TimerChanged(Some(Expiration { kind: 1, seconds: 3600 })))
         ));
+    }
+}
+
+#[cfg(test)]
+mod emoji_tests {
+    use super::*;
+
+    #[test]
+    fn shortcodes_expand_only_known_names() {
+        assert_eq!(expand_shortcodes("ok :+1: :joy:"), "ok 👍 😂");
+        assert_eq!(expand_shortcodes("time 12:30 :nope: x"), "time 12:30 :nope: x");
+        assert_eq!(expand_shortcodes(":heart::fire:"), "❤️🔥");
+        assert_eq!(expand_shortcodes("a:"), "a:");
+    }
+
+    #[test]
+    fn store_response_hash_is_found() {
+        let flat: Value = serde_json::json!({"hash": "abc"});
+        let nested: Value =
+            serde_json::json!({"swarm": {"node1": {"hash": "def", "signature": "x"}}});
+        assert_eq!(find_message_hash(&flat).as_deref(), Some("abc"));
+        assert_eq!(find_message_hash(&nested).as_deref(), Some("def"));
+        assert_eq!(find_message_hash(&serde_json::json!({"ok": true})), None);
     }
 }
