@@ -1,5 +1,6 @@
 mod session_tui_media;
 mod session_tui_group;
+mod session_tui_input;
 
 use std::time::Instant;
 use std::{
@@ -443,10 +444,17 @@ struct App {
     display_names: HashMap<String, String>,
     /// Message the next text/attachment replies to.
     reply_to: Option<QuoteRef>,
+    /// Composer cursor (byte offset into `input`).
+    cursor: usize,
+    /// Ring the terminal bell for new messages (`/bell on|off`).
+    bell: bool,
+    /// The terminal window has focus (from focus events).
+    window_focused: bool,
     /// Quick-reaction bar for the selected message is open.
     reaction_picker: bool,
     /// Emoji shortcode list is open.
     show_emoji: bool,
+    help_scroll: u16,
     local_id: String,
 }
 
@@ -470,8 +478,12 @@ impl App {
             message_hitboxes: Vec::new(),
             display_names: HashMap::new(),
             reply_to: None,
+            cursor: 0,
+            bell: true,
+            window_focused: true,
             reaction_picker: false,
             show_emoji: false,
+            help_scroll: 0,
             local_id,
         }
     }
@@ -1527,6 +1539,7 @@ impl LocalStore {
             }
         }
         drop(statement);
+        app.bell = self.get_setting("bell").as_deref() != Some("off");
         app.sort_conversations();
         app.selected = 0;
 
@@ -1540,6 +1553,22 @@ impl LocalStore {
         for hash in hashes {
             app.seen_hashes.insert(hash.map_err(|e| e.to_string())?);
         }
+        Ok(())
+    }
+
+    fn get_setting(&self, key: &str) -> Option<String> {
+        self.connection
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        self.connection.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        ).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -3661,6 +3690,7 @@ fn restore_terminal() {
     let _ = execute!(
         io::stdout(),
         DisableBracketedPaste,
+        crossterm::event::DisableFocusChange,
         DisableMouseCapture,
         LeaveAlternateScreen,
         crossterm::cursor::Show
@@ -3701,7 +3731,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        crossterm::event::EnableFocusChange
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -3935,6 +3966,7 @@ async fn run(
         Vec::new();
     let mut last_typing: Option<(String, Instant)> = None;
     let mut last_expiry_sweep = Instant::now();
+    let mut last_title_unread: Option<usize> = None;
     loop {
         // Finished text sends.
         let mut index = 0;
@@ -4073,8 +4105,19 @@ async fn run(
                 }
             }
         }
+        let unread: usize = app.conversations.iter().map(Conversation::unread).sum();
+        if last_title_unread != Some(unread) {
+            last_title_unread = Some(unread);
+            let title = if unread > 0 {
+                format!("({unread}) Session")
+            } else {
+                "Session".to_owned()
+            };
+            let _ = execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(title));
+        }
         if app.recovery_seed.is_none()
             && !app.show_help
+            && app.window_focused
             && let Some(receipt) = mark_current_conversation_read(app, store)
             && !receipt.0.starts_with("03")
         {
@@ -4092,13 +4135,19 @@ async fn run(
                 Ok(result) => result,
                 Err(_) => Err("sync task failed".into()),
             };
-            finish_sync(
+            let new_messages = finish_sync(
                 app,
                 store,
                 &client.identity.session_id,
                 result,
                 &mut download_queue,
             );
+            if new_messages > 0 && app.bell {
+                // BEL: Windows Terminal beeps and/or flashes the taskbar,
+                // depending on its "bell notification style" setting.
+                let _ = terminal.backend_mut().write_all(b"\x07");
+                let _ = terminal.backend_mut().flush();
+            }
         }
         let waiting_for_receipt = app.conversations.iter().flat_map(|c| &c.messages).any(|m| {
             m.outgoing
@@ -4122,14 +4171,27 @@ async fn run(
             continue;
         }
         let key = match event::read()? {
+            Event::FocusGained => {
+                app.window_focused = true;
+                continue;
+            }
+            Event::FocusLost => {
+                app.window_focused = false;
+                continue;
+            }
             Event::Mouse(mouse) => {
                 handle_mouse(app, mouse);
                 continue;
             }
             Event::Paste(text) if app.image_viewer.is_none() && app.recovery_seed.is_none() => {
-                // The composer is single-line: fold pasted line breaks.
-                let text = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");
-                app.input.push_str(&text);
+                // Keep pasted line breaks: Enter is the only thing that sends.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                let text = if app.input_mode == InputMode::ContactId {
+                    text.trim().to_owned()
+                } else {
+                    text
+                };
+                session_tui_input::insert(&mut app.input, &mut app.cursor, &text);
                 app.focus = FocusArea::Composer;
                 continue;
             }
@@ -4186,7 +4248,56 @@ async fn run(
             app.show_emoji = false;
             continue;
         }
+        if app.show_help {
+            match key.code {
+                KeyCode::Up => app.help_scroll = app.help_scroll.saturating_sub(1),
+                KeyCode::Down => app.help_scroll = app.help_scroll.saturating_add(1).min(60),
+                KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+                KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(10).min(60),
+                _ => app.show_help = false,
+            }
+            continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let editing = !app.input.is_empty();
         match key.code {
+            // Line break: Shift+Enter / Alt+Enter / Ctrl+J (terminals differ
+            // in which of these they can report).
+            KeyCode::Enter
+                if app.input_mode == InputMode::Message
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                session_tui_input::insert(&mut app.input, &mut app.cursor, "\n");
+                app.focus = FocusArea::Composer;
+            }
+            KeyCode::Char('j') if ctrl && app.input_mode == InputMode::Message => {
+                session_tui_input::insert(&mut app.input, &mut app.cursor, "\n");
+                app.focus = FocusArea::Composer;
+            }
+            KeyCode::Char('w') if ctrl => {
+                session_tui_input::delete_word(&mut app.input, &mut app.cursor);
+            }
+            KeyCode::Char('a') if ctrl && editing => {
+                session_tui_input::home(&app.input, &mut app.cursor);
+            }
+            KeyCode::Char('e') if ctrl && editing => {
+                session_tui_input::end(&app.input, &mut app.cursor);
+            }
+            KeyCode::Left if editing => session_tui_input::left(&app.input, &mut app.cursor),
+            KeyCode::Right if editing => session_tui_input::right(&app.input, &mut app.cursor),
+            KeyCode::Home if editing => session_tui_input::home(&app.input, &mut app.cursor),
+            KeyCode::End if editing => session_tui_input::end(&app.input, &mut app.cursor),
+            KeyCode::Up if editing && app.focus == FocusArea::Composer => {
+                session_tui_input::vertical(&app.input, &mut app.cursor, true);
+            }
+            KeyCode::Down if editing && app.focus == FocusArea::Composer => {
+                session_tui_input::vertical(&app.input, &mut app.cursor, false);
+            }
+            KeyCode::Delete if editing => {
+                session_tui_input::delete(&mut app.input, &mut app.cursor);
+            }
             KeyCode::Char('e')
                 if app.focus == FocusArea::Messages
                     && app.input.is_empty()
@@ -4217,6 +4328,7 @@ async fn run(
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.input.clear();
+                app.cursor = 0;
             }
             KeyCode::Esc if app.show_help => app.show_help = false,
             KeyCode::Esc if app.reply_to.is_some() => {
@@ -4370,6 +4482,7 @@ async fn run(
                         };
                         if attachment_task.is_some() {
                             app.status = "AN ATTACHMENT IS ALREADY UPLOADING".into();
+                            app.cursor = input.len();
                             app.input = input;
                             continue;
                         }
@@ -4377,6 +4490,7 @@ async fn run(
                             paths.iter().find(|p| !std::path::Path::new(p).is_file())
                         {
                             app.status = format!("FILE NOT FOUND · {missing}");
+                            app.cursor = input.len();
                             app.input = input;
                             continue;
                         }
@@ -4580,12 +4694,31 @@ async fn run(
                             Err(error) => format!("IMAGE PREVIEW FAILED · {error}"),
                         };
                     }
+                    "/bell" => {
+                        app.input.clear();
+                        match rest {
+                            "on" | "off" => {
+                                app.bell = rest == "on";
+                                let _ = store.set_setting("bell", rest);
+                            }
+                            "" => {}
+                            _ => {
+                                app.status = "USAGE · /bell on|off".into();
+                                continue;
+                            }
+                        }
+                        app.status = format!(
+                            "NEW-MESSAGE BELL {}",
+                            if app.bell { "ON" } else { "OFF" }
+                        );
+                    }
                     "/emoji" if rest.is_empty() => {
                         app.input.clear();
                         app.show_emoji = true;
                     }
                     "/?" if rest.is_empty() => {
                         app.input.clear();
+                        app.help_scroll = 0;
                         app.show_help = true;
                     }
                     _ if app.input_mode == InputMode::ContactId => {
@@ -4731,11 +4864,12 @@ async fn run(
                 }
             }
             KeyCode::Backspace => {
-                app.input.pop();
+                session_tui_input::backspace(&mut app.input, &mut app.cursor);
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.focus = FocusArea::Composer;
-                app.input.push(c);
+                let mut buffer = [0u8; 4];
+                session_tui_input::insert(&mut app.input, &mut app.cursor, c.encode_utf8(&mut buffer));
                 // Session-style typing indicator for 1:1 chats, at most every 10 s.
                 if app.input_mode == InputMode::Message
                     && !app.input.starts_with('/')
@@ -5032,15 +5166,16 @@ fn finish_sync(
     local_id: &str,
     result: Result<RetrieveResult, String>,
     download_queue: &mut std::collections::VecDeque<PendingDownload>,
-) {
+) -> usize {
     let result = match result {
         Ok(result) => result,
         Err(error) => {
             debug_log("sync.failed", "request_failed=true");
             app.status = format!("SYNC FAILED · {error}");
-            return;
+            return 0;
         }
     };
+    let mut notify = 0usize;
     let groups_found = result.groups.len();
     for group in result.groups.iter() {
         let index = app.ensure_contact(&group.id);
@@ -5066,7 +5201,7 @@ fn finish_sync(
         && let Err(error) = store.set_last_hash(last_hash)
     {
         app.status = format!("SYNC CURSOR SAVE ERROR · {error}");
-        return;
+        return 0;
     }
     for (group, hash) in &result.group_cursors {
         let _ = store.set_group_cursor(group, hash);
@@ -5325,6 +5460,9 @@ fn finish_sync(
         convo.clamp_selection();
         convo.refresh_preview();
         added += 1;
+        if !message.outgoing && (index != app.selected || !app.window_focused) {
+            notify += 1;
+        }
     }
     if let Some(index) = app
         .conversations
@@ -5345,6 +5483,7 @@ fn finish_sync(
         "SYNC · {added} NEW · {groups_found} GROUPS · {} QUEUED · {} DECRYPT FAIL · {} BAD ENVELOPE · {} BAD CONTENT",
         result.queued, result.undecryptable, result.bad_envelope, result.bad_content
     );
+    notify
 }
 
 fn now_ms() -> u64 {
@@ -5456,6 +5595,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         Span::styled(" messages  ", Style::default().fg(MUTED)),
         Span::styled("Enter", Style::default().fg(TEAL)),
         Span::styled(" send  ", Style::default().fg(MUTED)),
+        Span::styled("⇧Enter", Style::default().fg(TEAL)),
+        Span::styled(" new line  ", Style::default().fg(MUTED)),
         Span::styled("/rsync", Style::default().fg(TEAL)),
         Span::styled(" sync  ", Style::default().fg(MUTED)),
         Span::styled("/?", Style::default().fg(TEAL)),
@@ -5472,7 +5613,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(footer, root[2]);
 
     if app.show_help {
-        draw_help(frame, area);
+        draw_help(frame, area, app.help_scroll);
     }
     if app.reaction_picker {
         let width = 46.min(area.width);
@@ -5674,12 +5815,17 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
 }
 
 fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    // The composer grows with its content (2–8 rows) and soft-wraps.
+    let composer_width = area.width.saturating_sub(4).max(2) as usize;
+    let (composer_rows, (cursor_row, cursor_column)) =
+        session_tui_input::wrap(&app.input, app.cursor, composer_width);
+    let visible_composer_rows = composer_rows.len().clamp(2, 8);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(4),
-            Constraint::Length(3),
+            Constraint::Length(visible_composer_rows as u16 + 1),
         ])
         .split(area);
     let selected = app.conversations.get(app.selected);
@@ -5982,30 +6128,57 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         .block(transcript_block);
     frame.render_widget(transcript, rows[1]);
 
-    let prompt = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "  › ",
-            Style::default()
-                .fg(if app.focus == FocusArea::Composer {
-                    TEAL
-                } else {
-                    MUTED
-                })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if app.input.is_empty() {
+    let composer_active = app.focus == FocusArea::Composer;
+    let first_row = (cursor_row + 1).saturating_sub(visible_composer_rows);
+    let prompt_lines: Vec<Line<'_>> = if app.input.is_empty() {
+        vec![Line::from(vec![
+            Span::styled(
+                "  › ",
+                Style::default()
+                    .fg(if composer_active { TEAL } else { MUTED })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
                 if app.input_mode == InputMode::ContactId {
                     "Paste a Session ID (05…)…"
                 } else {
-                    "Write a message…"
-                }
-            } else {
-                &app.input
-            },
-            Style::default().fg(if app.input.is_empty() { MUTED } else { TEXT }),
-        ),
-    ]))
+                    "Write a message… (Shift+Enter or Ctrl+J for a new line)"
+                },
+                Style::default().fg(MUTED),
+            ),
+        ])]
+    } else {
+        composer_rows
+            .iter()
+            .enumerate()
+            .skip(first_row)
+            .take(visible_composer_rows)
+            .map(|(index, row)| {
+                Line::from(vec![
+                    Span::styled(
+                        if index == 0 { "  › " } else { "    " },
+                        Style::default()
+                            .fg(if composer_active { TEAL } else { MUTED })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(row.clone(), Style::default().fg(TEXT)),
+                ])
+            })
+            .collect()
+    };
+    if composer_active
+        && app.image_viewer.is_none()
+        && !app.show_help
+        && !app.show_emoji
+        && !app.reaction_picker
+        && app.recovery_seed.is_none()
+    {
+        frame.set_cursor_position((
+            rows[2].x + 4 + cursor_column.min(u16::MAX as usize) as u16,
+            rows[2].y + 1 + (cursor_row - first_row) as u16,
+        ));
+    }
+    let prompt = Paragraph::new(prompt_lines)
     .block(
         Block::default()
             .title(match app.reply_to.as_ref() {
@@ -6030,54 +6203,108 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(prompt, rows[2]);
 }
 
-fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let popup = centered_rect(72, 62, area);
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Navigation",
+        &[
+            ("Tab / Shift+Tab", "Move focus: chats → messages → composer"),
+            ("← / →", "Previous / next chat (when the composer is empty)"),
+            ("↑ / ↓", "Move in the focused list"),
+            ("Mouse", "Click a chat, message or image; wheel moves the selection"),
+            ("/? · Esc", "Open / close this help (↑/↓ scroll)"),
+            ("/exit · Ctrl+C", "Quit"),
+        ],
+    ),
+    (
+        "Composer",
+        &[
+            ("Enter", "Send"),
+            ("Shift+Enter · Alt+Enter · Ctrl+J", "New line"),
+            ("← → ↑ ↓ Home End", "Move the cursor (Ctrl+A / Ctrl+E: line start / end)"),
+            ("Backspace · Delete", "Delete before / after the cursor"),
+            ("Ctrl+W · Ctrl+U", "Delete previous word · clear everything"),
+            ("Paste", "Inserted at the cursor, line breaks kept"),
+            (":joy: :heart: :+1:", "Emoji shortcodes (/emoji lists them; Win+. on Windows)"),
+        ],
+    ),
+    (
+        "Messages (focus the message list)",
+        &[
+            ("r", "Reply to the selected message (Esc cancels)"),
+            ("e  then 1-6", "Reaction bar: 😂 🥰 😢 😡 😮 😈"),
+            ("+", "React 👍"),
+            ("/react EMOJI", "React with any emoji or :shortcode: (again removes it)"),
+            ("Delete", "Delete; your own messages are unsent for everyone"),
+            ("/retry", "Resend the selected failed message"),
+            ("✓ / ✓✓ / teal ✓✓", "Sent / delivered / read"),
+        ],
+    ),
+    (
+        "Attachments",
+        &[
+            ("/attach P1 [P2…] [-- caption]", "Send files as one message (max 32; quote paths with spaces)"),
+            ("/view [N]", "Open image N of the selected message; ←/→ next/previous"),
+            ("/save [N] [PATH]", "Save attachment N, or all, to PATH or the current folder"),
+        ],
+    ),
+    (
+        "Chats and groups",
+        &[
+            ("Ctrl+N", "Start a chat with a Session ID"),
+            ("/disappear off | read 12h | send 1d", "Disappearing messages for this 1:1 chat"),
+            ("/accept", "Join the group you were invited to"),
+            ("/rsync", "Fetch messages now (also automatic)"),
+        ],
+    ),
+    (
+        "Settings",
+        &[
+            ("/name [NAME]", "Show / set the display name sent with your messages"),
+            ("/bell on|off", "Terminal bell for new messages (title shows unread count)"),
+            ("--debug", "Start with a debug log (session-tui-debug.log)"),
+            ("--forget-seed", "Start and delete the saved seed"),
+        ],
+    ),
+];
+
+fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, scroll: u16) {
+    let popup = centered_rect(90, 90, area);
     frame.render_widget(Clear, popup);
-    let help = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Keyboard shortcuts",
+    let key_width = HELP
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(10)
+        .min(36);
+    let mut lines = Vec::new();
+    for (section, entries) in HELP {
+        lines.push(Line::from(Span::styled(
+            *section,
             Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(" "),
-        Line::from("← / →       Select a conversation"),
-        Line::from("Tab         Move focus: contacts → messages → composer"),
-        Line::from("↑ / ↓       Move in focused list"),
-        Line::from("Mouse       Click chat/message; scroll to move selection"),
-        Line::from("✓ / ✓✓     Delivered / read receipt for your messages"),
-        Line::from("Delete      Delete selected message; outgoing messages send unsend"),
-        Line::from("Ctrl+N      Add a contact by Session ID"),
-        Line::from("/attach P1 [P2…] [-- caption]  Send files as one message (max 32)"),
-        Line::from("/save [N] [PATH]  Save attachment N (default: all) to PATH or ./"),
-        Line::from("            Focus Messages, select it with ↑/↓, then run /save"),
-        Line::from("/view [N]   Open image N of the selected message (or click it)"),
-        Line::from("Ctrl+U      Clear the composer"),
-        Line::from("/name NAME Set the display name sent with your messages"),
-        Line::from("/rsync     Retrieve your inbox and sync groups from this account"),
-        Line::from("r / + / e   (Messages focus) reply / 👍 / reaction bar (1-6)"),
-        Line::from("/react :joy:  React with an emoji or shortcode (again removes it)"),
-        Line::from(":heart: …   Shortcodes in messages; /emoji lists them; Win+. on Windows"),
-        Line::from("/retry      Resend the selected failed message"),
-        Line::from("/disappear off | read 12h | send 1d   Disappearing messages (1:1)"),
-        Line::from("/accept     Join the group you were invited to"),
-        Line::from("Image view  ←/→ previous/next image of the message, Esc closes"),
-        Line::from("Enter       Send an end-to-end encrypted message"),
-        Line::from("Backspace   Edit the message draft"),
-        Line::from("/? / Esc    Open / close this panel"),
-        Line::from("/exit      Quit the TUI"),
-        Line::from(" "),
-        Line::from(Span::styled(
-            "Text uses Session routing. Delete removes locally; outgoing also requests remote unsend.",
-            Style::default().fg(Color::Yellow),
-        )),
-    ])
-    .block(
-        Block::default()
-            .title(" Help ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(TEAL))
-            .style(Style::default().bg(PANEL)),
-    )
-    .wrap(Wrap { trim: true });
+        )));
+        for (key, description) in *entries {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<key_width$}  "), Style::default().fg(Color::Yellow)),
+                Span::styled(*description, Style::default().fg(TEXT)),
+            ]));
+        }
+        lines.push(Line::from(" "));
+    }
+    lines.push(Line::from(Span::styled(
+        "Voice and video calls are not supported.",
+        Style::default().fg(MUTED),
+    )));
+    let help = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Help · ↑/↓ scroll · Esc closes ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(TEAL))
+                .style(Style::default().bg(PANEL)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     frame.render_widget(help, popup);
 }
 
