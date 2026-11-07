@@ -394,6 +394,16 @@ struct Conversation {
 }
 
 impl Conversation {
+    /// Name shown for the chat; our own Session ID is "Note to Self", as in
+    /// the official apps.
+    fn title<'a>(&'a self, local_id: &str) -> &'a str {
+        if self.id == local_id {
+            "Note to Self"
+        } else {
+            &self.name
+        }
+    }
+
     fn unread(&self) -> usize {
         self.messages
             .iter()
@@ -5867,6 +5877,7 @@ fn finish_sync(
         .conversations
         .iter()
         .position(|c| c.id == local_id && c.messages.is_empty())
+        && index != app.selected
     {
         let _ = store.delete_empty_contact(local_id);
         let selected_id = app.conversations.get(app.selected).map(|c| c.id.clone());
@@ -6185,7 +6196,7 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
                         format!(
                             " {}{}",
                             if c.id.starts_with("03") { "# " } else { "" },
-                            c.name
+                            c.title(&app.local_id)
                         ),
                         Style::default()
                             .fg(entry_color)
@@ -6229,7 +6240,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         .split(area);
     let selected = app.conversations.get(app.selected);
     let title_name = selected
-        .map(|c| c.name.as_str())
+        .map(|c| c.title(&app.local_id))
         .unwrap_or("No conversation selected");
     let title_id = selected
         .map(|c| c.id.as_str())
@@ -6334,7 +6345,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             } else if let Some(sender) = message.sender.as_deref() {
                 (app.sender_label(sender), BLUE)
             } else {
-                (c.name.clone(), BLUE)
+                (c.title(&app.local_id).to_owned(), BLUE)
             };
             let mut metadata = vec![
                 Span::styled(
@@ -7032,5 +7043,21 @@ mod routing_tests {
         let bad = parse_content(&me, "h".into(), me.clone(), me.clone(), 1, content("03zz")).unwrap();
         assert_eq!(bad.contact_id, me);
         assert!(!is_chat_id("04".to_owned().as_str()));
+    }
+}
+
+#[cfg(test)]
+mod note_to_self_tests {
+    use super::*;
+
+    #[test]
+    fn own_chat_is_note_to_self() {
+        let me = "05".to_owned() + &"11".repeat(32);
+        let peer = "05".to_owned() + &"22".repeat(32);
+        let mut app = App::new(me.clone());
+        let own = app.ensure_contact(&me);
+        let other = app.ensure_contact(&peer);
+        assert_eq!(app.conversations[own].title(&me), "Note to Self");
+        assert_eq!(app.conversations[other].title(&me), short_id(&peer));
     }
 }
