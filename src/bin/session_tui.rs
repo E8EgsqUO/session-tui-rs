@@ -1,4 +1,5 @@
 mod session_tui_media;
+mod session_tui_group;
 
 use std::time::Instant;
 use std::{
@@ -13,6 +14,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use prost::Message as ProstMessage;
 use serde_json::Value;
+
+type DataQuote = libsession::proto::session_protos::data_message::Quote;
 
 use libsession::{
     config::{
@@ -113,6 +116,106 @@ struct Message {
     attachments: Vec<AttachmentMeta>,
     /// One preview slot per attachment.
     image_previews: Vec<Option<ImagePreview>>,
+    /// The message this one replies to.
+    quote: Option<QuoteRef>,
+    /// Emoji reactions with the Session IDs of who reacted.
+    reactions: Vec<ReactionEntry>,
+    /// Disappearing-message setting this message was sent with.
+    expiration: Option<Expiration>,
+    /// Unix ms when the message disappears (set once its timer starts).
+    expires_at: Option<u64>,
+    /// Link previews (url, title).
+    links: Vec<(String, Option<String>)>,
+    /// Control/notice line (call, screenshot, group change…) rather than chat text.
+    system: bool,
+    /// Outgoing delivery state; not persisted (only sent messages are stored).
+    send_state: SendState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SendState {
+    #[default]
+    Sent,
+    Sending,
+    Failed,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+struct QuoteRef {
+    id: u64,
+    author: String,
+    text: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ReactionEntry {
+    emoji: String,
+    authors: Vec<String>,
+}
+
+/// Session `Content.expirationType` + `expirationTimer`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+struct Expiration {
+    /// 1 = delete after read, 2 = delete after send.
+    kind: i32,
+    seconds: u32,
+}
+
+impl Expiration {
+    fn from_content(kind: Option<i32>, seconds: Option<u32>) -> Option<Self> {
+        match (kind, seconds) {
+            (Some(kind @ (1 | 2)), Some(seconds)) if seconds > 0 => Some(Self { kind, seconds }),
+            _ => None,
+        }
+    }
+
+    fn describe(setting: Option<Self>) -> String {
+        match setting {
+            None => "off".into(),
+            Some(e) => format!(
+                "{} after {}",
+                format_duration(e.seconds),
+                if e.kind == 1 { "read" } else { "send" }
+            ),
+        }
+    }
+
+    /// Parse `/disappear` arguments: `off`, or `read|send DURATION`.
+    fn parse(args: &str) -> Result<Option<Self>, String> {
+        let mut parts = args.split_whitespace();
+        let usage = || "USAGE · /disappear off | read 12h | send 1d".to_string();
+        let kind = match parts.next().ok_or_else(usage)? {
+            "off" => return Ok(None),
+            "read" => 1,
+            "send" => 2,
+            _ => return Err(usage()),
+        };
+        let seconds = parse_duration(parts.next().ok_or_else(usage)?).ok_or_else(usage)?;
+        Ok(Some(Self { kind, seconds }))
+    }
+}
+
+fn parse_duration(text: &str) -> Option<u32> {
+    let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    let number: u32 = number.parse().ok()?;
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => return None,
+    };
+    number.checked_mul(scale).filter(|seconds| *seconds > 0)
+}
+
+fn format_duration(seconds: u32) -> String {
+    for (unit, size) in [("w", 604_800), ("d", 86_400), ("h", 3600), ("m", 60)] {
+        if seconds >= size && seconds % size == 0 {
+            return format!("{}{unit}", seconds / size);
+        }
+    }
+    format!("{seconds}s")
 }
 
 impl Message {
@@ -126,6 +229,46 @@ impl Message {
             sender: None,
             attachments: Vec::new(),
             image_previews: Vec::new(),
+            quote: None,
+            reactions: Vec::new(),
+            expiration: None,
+            expires_at: None,
+            links: Vec::new(),
+            system: false,
+            send_state: SendState::Sent,
+        }
+    }
+
+    fn system(text: String, timestamp_ms: u64) -> Self {
+        let mut message = Self::new(text, timestamp_ms, false);
+        message.system = true;
+        message.is_read = true;
+        message
+    }
+
+    /// Session ID of whoever wrote this message.
+    fn author<'a>(&'a self, conversation_id: &'a str, local_id: &'a str) -> &'a str {
+        if self.outgoing {
+            local_id
+        } else {
+            self.sender.as_deref().unwrap_or(conversation_id)
+        }
+    }
+
+    /// Start the disappearing timer (Session starts "after send" timers at
+    /// send time and "after read" ones when the message is read; our own
+    /// messages count as read when sent).
+    fn start_expiry(&mut self, read_at: Option<u64>) {
+        if self.expires_at.is_some() {
+            return;
+        }
+        if let Some(expiration) = self.expiration {
+            let start = if expiration.kind == 2 || self.outgoing {
+                Some(self.timestamp_ms)
+            } else {
+                read_at
+            };
+            self.expires_at = start.map(|start| start + u64::from(expiration.seconds) * 1000);
         }
     }
 
@@ -148,6 +291,18 @@ struct StoredMessage {
     image_previews: Vec<Option<ImagePreview>>,
     #[serde(default)]
     sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quote: Option<QuoteRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reactions: Vec<ReactionEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expiration: Option<Expiration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    links: Vec<(String, Option<String>)>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    system: bool,
 }
 
 const STORED_MESSAGE_PREFIX: &str = "\0session-tui-message-v1:";
@@ -164,6 +319,12 @@ struct Conversation {
     preview: String,
     messages: Vec<Message>,
     selected_message: usize,
+    /// Disappearing-messages setting applied to messages we send here.
+    disappearing: Option<Expiration>,
+    /// Show "typing…" until this instant.
+    typing_until: Option<Instant>,
+    /// Group membership is read-only (no write permission).
+    read_only: bool,
 }
 
 impl Conversation {
@@ -225,6 +386,9 @@ struct App {
     message_hitboxes: Vec<(u16, u16, usize, Option<usize>)>,
     /// Display names of group members and other senders, by Session ID.
     display_names: HashMap<String, String>,
+    /// Message the next text/attachment replies to.
+    reply_to: Option<QuoteRef>,
+    local_id: String,
 }
 
 impl App {
@@ -235,7 +399,7 @@ impl App {
             input: String::new(),
             input_mode: InputMode::Message,
             seen_hashes: HashSet::new(),
-            status: format!("{}… · READY", &local_id[..10]),
+            status: format!("{}… · READY", &local_id[..10.min(local_id.len())]),
             show_help: false,
             recovery_seed: None,
             focus: FocusArea::Composer,
@@ -246,6 +410,8 @@ impl App {
             message_viewport: None,
             message_hitboxes: Vec::new(),
             display_names: HashMap::new(),
+            reply_to: None,
+            local_id,
         }
     }
 
@@ -263,6 +429,16 @@ impl App {
     }
 
     fn sender_label(&self, sender: &str) -> String {
+        if sender == self.local_id {
+            return "You".into();
+        }
+        if let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|c| c.id == sender && c.name != short_id(sender))
+        {
+            return conversation.name.clone();
+        }
         self.display_names
             .get(sender)
             .cloned()
@@ -295,6 +471,9 @@ impl App {
             preview: "Start a conversation".into(),
             messages: Vec::new(),
             selected_message: 0,
+            disappearing: None,
+            typing_until: None,
+            read_only: false,
         });
         self.conversations.len() - 1
     }
@@ -387,9 +566,21 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
     let count = app
         .selected_message()
         .map_or(1, |message| message.attachments.len());
+    let images = app.selected_message().map_or(0, |message| {
+        message
+            .attachments
+            .iter()
+            .filter(|a| a.content_type.starts_with("image/"))
+            .count()
+    });
     app.image_viewer = Some(ImageViewer {
-        title: if count > 1 {
-            format!("{} ({}/{count})", metadata.file_name, attachment_index + 1)
+        index: attachment_index,
+        title: if images > 1 {
+            format!(
+                "{} ({}/{count}) · ←/→ PREV/NEXT",
+                metadata.file_name,
+                attachment_index + 1
+            )
         } else {
             metadata.file_name
         },
@@ -652,6 +843,28 @@ struct IncomingMessage {
     /// Attachment pointers only; the files are fetched by a separate
     /// background download queue after the message is stored.
     attachments: Vec<AttachmentMeta>,
+    quote: Option<QuoteRef>,
+    expiration: Option<Expiration>,
+    links: Vec<(String, Option<String>)>,
+    /// (target message timestamp, target author, emoji, removed)
+    reaction: Option<(u64, String, String, bool)>,
+    /// Typing indicator: Some(true) started, Some(false) stopped.
+    typing: Option<bool>,
+    /// A notice to show in the chat instead of a chat message.
+    event: Option<ChatEvent>,
+}
+
+/// Non-chat events shown as notice lines.
+enum ChatEvent {
+    Notice(String),
+    /// Disappearing-messages setting changed (1:1 chats).
+    TimerChanged(Option<Expiration>),
+    /// Group membership changes; names are resolved when displayed.
+    Members { action: &'static str, ids: Vec<String> },
+    /// Group invite received in a 1:1 chat.
+    Invite(LocalGroup),
+    /// An admin removed everything these members posted.
+    DeleteMemberContent(Vec<String>),
 }
 
 impl IncomingMessage {
@@ -667,8 +880,206 @@ impl IncomingMessage {
             unsend: None,
             receipt: None,
             attachments: Vec::new(),
+            quote: None,
+            expiration: None,
+            links: Vec::new(),
+            reaction: None,
+            typing: None,
+            event: None,
         }
     }
+}
+
+/// Turn decrypted `Content` into an [`IncomingMessage`], following how the
+/// Session clients interpret each message type. `contact_id` is the chat the
+/// message belongs to (the sender for 1:1, the group for groups); a 1:1
+/// sync copy of our own message is re-routed via `syncTarget`.
+fn parse_content(
+    local_id: &str,
+    hash: String,
+    sender_id: String,
+    contact_id: String,
+    envelope_timestamp: u64,
+    content: Content,
+) -> Option<IncomingMessage> {
+    use libsession::proto::session_protos::{
+        call_message, data_extraction_notification, group_update_info_change_message,
+        group_update_member_change_message, typing_message,
+    };
+    let is_group = contact_id.starts_with("03");
+    let mut message =
+        IncomingMessage::control(hash, sender_id.clone(), contact_id, envelope_timestamp);
+    message.outgoing = sender_id == local_id;
+    if let Some(unsend) = content.unsend_request {
+        message.timestamp_ms = unsend.timestamp;
+        message.unsend = Some((unsend.timestamp, unsend.author));
+        return Some(message);
+    }
+    if let Some(receipt) = content.receipt_message {
+        message.receipt = Some((receipt.r#type, receipt.timestamp));
+        return Some(message);
+    }
+    if let Some(typing) = content.typing_message {
+        message.timestamp_ms = typing.timestamp;
+        message.typing = Some(typing.action == typing_message::Action::Started as i32);
+        return Some(message);
+    }
+    if let Some(notification) = content.data_extraction_notification {
+        message.timestamp_ms = notification.timestamp.unwrap_or(envelope_timestamp);
+        message.event = Some(ChatEvent::Notice(
+            if notification.r#type == data_extraction_notification::Type::Screenshot as i32 {
+                "took a screenshot"
+            } else {
+                "saved a media file"
+            }
+            .into(),
+        ));
+        return Some(message);
+    }
+    if let Some(call) = content.call_message {
+        // Only the first message of a call attempt creates a notice.
+        if call.r#type == call_message::Type::PreOffer as i32 && !message.outgoing {
+            message.event = Some(ChatEvent::Notice(
+                "called you (missed: calls are not supported in this client)".into(),
+            ));
+            return Some(message);
+        }
+        return None;
+    }
+    let expiration = Expiration::from_content(content.expiration_type, content.expiration_timer);
+    let data_message = content.data_message?;
+    message.timestamp_ms = data_message.timestamp.unwrap_or(envelope_timestamp);
+    message.expiration = expiration;
+    if !message.outgoing
+        && let Some(name) = data_message
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.display_name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    {
+        message.sender_name = Some(name.to_owned());
+    }
+
+    if let Some(update) = data_message.group_update_message {
+        message.event = if let Some(invite) = update.invite_message {
+            Some(ChatEvent::Invite(LocalGroup {
+                id: invite.group_session_id,
+                name: invite.name,
+                auth_data: invite.member_auth_data,
+                responded: false,
+            }))
+        } else if let Some(change) = update.info_change_message {
+            use group_update_info_change_message::Type;
+            Some(match Type::try_from(change.r#type) {
+                Ok(Type::Name) => ChatEvent::Notice(format!(
+                    "renamed the group to \"{}\"",
+                    change.updated_name.unwrap_or_default()
+                )),
+                Ok(Type::Avatar) => ChatEvent::Notice("changed the group picture".into()),
+                _ => ChatEvent::Notice(format!(
+                    "set disappearing messages to {}",
+                    Expiration::describe(change.updated_expiration.filter(|s| *s > 0).map(
+                        |seconds| Expiration { kind: 2, seconds }
+                    ))
+                )),
+            })
+        } else if let Some(change) = update.member_change_message {
+            use group_update_member_change_message::Type;
+            let action = match Type::try_from(change.r#type) {
+                Ok(Type::Added) => "added",
+                Ok(Type::Removed) => "removed",
+                _ => "promoted to admin",
+            };
+            Some(ChatEvent::Members {
+                action,
+                ids: change.member_session_ids,
+            })
+        } else if update.member_left_message.is_some()
+            || update.member_left_notification_message.is_some()
+        {
+            Some(ChatEvent::Notice("left the group".into()))
+        } else if let Some(response) = update.invite_response {
+            response
+                .is_approved
+                .then(|| ChatEvent::Notice("joined the group".into()))
+        } else if update.promote_message.is_some() {
+            Some(ChatEvent::Notice(
+                "promoted you to admin (manage the group from another Session client)".into(),
+            ))
+        } else {
+            update
+                .delete_member_content
+                .map(|delete| ChatEvent::DeleteMemberContent(delete.member_session_ids))
+        };
+        return message.event.is_some().then_some(message);
+    }
+
+    if data_message.flags.unwrap_or(0) & 2 != 0 {
+        // EXPIRATION_TIMER_UPDATE
+        message.event = Some(ChatEvent::TimerChanged(expiration));
+        if message.outgoing
+            && let Some(target) = data_message
+                .sync_target
+                .filter(|target| libsession::util::types::session_id_is_valid(target))
+        {
+            message.contact_id = target;
+        }
+        return Some(message);
+    }
+
+    // Our own 1:1 messages mirrored from another device name the real chat.
+    if !is_group
+        && message.outgoing
+        && let Some(target) = data_message
+            .sync_target
+            .clone()
+            .filter(|target| libsession::util::types::session_id_is_valid(target))
+    {
+        message.contact_id = target;
+        message.sender_name = None;
+    }
+
+    if let Some(reaction) = data_message.reaction {
+        message.reaction = Some((
+            reaction.id,
+            reaction.author,
+            reaction.emoji.unwrap_or_default(),
+            reaction.action == 1,
+        ));
+        return Some(message);
+    }
+
+    let mut body = data_message.body.unwrap_or_default();
+    if let Some(invitation) = data_message.open_group_invitation {
+        body = format!("[Community invite] {} · {}", invitation.name, invitation.url);
+    }
+    message.attachments = data_message
+        .attachments
+        .iter()
+        .map(attachment_meta_from_pointer)
+        .collect();
+    message.quote = data_message.quote.map(|quote| QuoteRef {
+        id: quote.id,
+        author: quote.author,
+        text: quote.text.unwrap_or_else(|| {
+            quote
+                .attachments
+                .first()
+                .map(|a| format!("[{}]", a.file_name.clone().unwrap_or_else(|| "attachment".into())))
+                .unwrap_or_default()
+        }),
+    });
+    message.links = data_message
+        .preview
+        .into_iter()
+        .map(|preview| (preview.url, preview.title))
+        .collect();
+    if body.is_empty() && message.attachments.is_empty() {
+        return None;
+    }
+    message.body = Some(body);
+    Some(message)
 }
 
 struct RetrieveResult {
@@ -681,6 +1092,8 @@ struct RetrieveResult {
     groups: Vec<DiscoveredGroup>,
     /// Updated per-group message cursors (group id → last hash).
     group_cursors: HashMap<String, String>,
+    /// Joined groups we have now sent the invite acceptance to.
+    invite_responses: Vec<String>,
 }
 
 /// One attachment waiting to be downloaded into the local cache.
@@ -703,14 +1116,57 @@ struct DownloadedAttachment {
 struct DiscoveredGroup {
     id: String,
     name: String,
+    can_write: bool,
 }
 
 #[derive(Clone)]
 struct GroupRuntime {
     id: String,
     public_key: [u8; 32],
-    secret_key: Vec<u8>,
-    encryption_key: [u8; 32],
+    auth: GroupAuth,
+    /// Group encryption keys, newest generation first.
+    keys: Vec<[u8; 32]>,
+}
+
+/// How this account authenticates to a group's swarm.
+#[derive(Clone)]
+enum GroupAuth {
+    /// We hold the group's Ed25519 key (admin).
+    Admin { seed: Vec<u8>, secret_key: Vec<u8> },
+    /// Ordinary member: subaccount auth data issued by an admin.
+    Member { auth_data: Vec<u8> },
+}
+
+impl GroupAuth {
+    fn admin_seed(&self) -> Option<&[u8]> {
+        match self {
+            GroupAuth::Admin { seed, .. } => Some(seed),
+            GroupAuth::Member { .. } => None,
+        }
+    }
+
+    fn can_write(&self) -> bool {
+        match self {
+            GroupAuth::Admin { .. } => true,
+            GroupAuth::Member { auth_data } => session_tui_group::subaccount_can_write(auth_data),
+        }
+    }
+}
+
+enum SwarmAuth<'a> {
+    /// This account's own swarm (05…), signed with our Ed25519 key.
+    User,
+    Group(&'a GroupAuth),
+}
+
+/// A group joined from an invite in this client (not yet in UserGroups).
+#[derive(Clone)]
+struct LocalGroup {
+    id: String,
+    name: String,
+    auth_data: Vec<u8>,
+    /// We already told the group we accepted the invite.
+    responded: bool,
 }
 
 struct SessionClient {
@@ -730,6 +1186,8 @@ struct SentAttachments {
 struct ImageViewer {
     title: String,
     protocol: StatefulProtocol,
+    /// Attachment index inside the selected message.
+    index: usize,
 }
 
 struct LocalStore {
@@ -772,7 +1230,15 @@ impl LocalStore {
                  );
                  CREATE TABLE IF NOT EXISTS seen_hashes (hash TEXT PRIMARY KEY);
                  CREATE TABLE IF NOT EXISTS sync_state (id INTEGER PRIMARY KEY CHECK(id = 1), last_hash TEXT NOT NULL);
-                 CREATE TABLE IF NOT EXISTS profiles (session_id TEXT PRIMARY KEY, display_name TEXT NOT NULL);",
+                 CREATE TABLE IF NOT EXISTS profiles (session_id TEXT PRIMARY KEY, display_name TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS group_invites (
+                    group_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    auth_data BLOB NOT NULL,
+                    inviter TEXT NOT NULL,
+                    joined INTEGER NOT NULL DEFAULT 0,
+                    responded INTEGER NOT NULL DEFAULT 0
+                 );",
             )
             .map_err(|e| e.to_string())?;
         let _ = connection.execute(
@@ -899,6 +1365,12 @@ impl LocalStore {
                     serde_json::from_str(json).map_err(|e| e.to_string())?;
                 message.body = payload.body;
                 message.sender = payload.sender;
+                message.quote = payload.quote;
+                message.reactions = payload.reactions;
+                message.expiration = payload.expiration;
+                message.expires_at = payload.expires_at;
+                message.links = payload.links;
+                message.system = payload.system;
                 message.attachments = payload.attachments;
                 message.image_previews = payload.image_previews;
                 if let Some(legacy) = payload.attachment {
@@ -954,6 +1426,24 @@ impl LocalStore {
             app.display_names.insert(id, name);
         }
         drop(statement);
+        let mut statement = self
+            .connection
+            .prepare("SELECT key, value FROM settings WHERE key LIKE 'disappearing:%'")
+            .map_err(|e| e.to_string())?;
+        let settings = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        for setting in settings {
+            let (key, value) = setting.map_err(|e| e.to_string())?;
+            if let (Some(peer), Ok(expiration)) = (
+                key.strip_prefix("disappearing:"),
+                serde_json::from_str::<Expiration>(&value),
+            ) && let Some(conversation) = app.conversations.iter_mut().find(|c| c.id == peer)
+            {
+                conversation.disappearing = Some(expiration);
+            }
+        }
+        drop(statement);
         app.sort_conversations();
         app.selected = 0;
 
@@ -1004,6 +1494,12 @@ impl LocalStore {
             attachments: message.attachments.clone(),
             image_previews: message.image_previews.clone(),
             sender: message.sender.clone(),
+            quote: message.quote.clone(),
+            reactions: message.reactions.clone(),
+            expiration: message.expiration,
+            expires_at: message.expires_at,
+            links: message.links.clone(),
+            system: message.system,
         })
         .map_err(|e| e.to_string())?;
         self.encrypt_body(&format!("{STORED_MESSAGE_PREFIX}{payload}"))
@@ -1048,6 +1544,72 @@ impl LocalStore {
         let parent = path.parent().ok_or("invalid attachment cache path")?;
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         std::fs::write(path, bytes).map_err(|e| e.to_string())
+    }
+
+    fn save_invite(&self, group: &LocalGroup, inviter: &str) -> Result<(), String> {
+        self.connection.execute(
+            "INSERT INTO group_invites(group_id, name, auth_data, inviter) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(group_id) DO UPDATE SET name=excluded.name, auth_data=excluded.auth_data, inviter=excluded.inviter",
+            params![group.id, group.name, group.auth_data, inviter],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Invites (`joined = false`) or joined groups (`joined = true`), with
+    /// the inviter's Session ID.
+    fn local_groups(&self, joined: bool) -> Result<Vec<(LocalGroup, String)>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT group_id, name, auth_data, responded, inviter FROM group_invites WHERE joined = ?1 ORDER BY rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([joined], |row| {
+                Ok((
+                    LocalGroup {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        auth_data: row.get(2)?,
+                        responded: row.get(3)?,
+                    },
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
+    fn set_group_joined(&self, group_id: &str) -> Result<(), String> {
+        self.connection
+            .execute("UPDATE group_invites SET joined = 1 WHERE group_id = ?1", [group_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn set_group_responded(&self, group_id: &str) -> Result<(), String> {
+        self.connection
+            .execute("UPDATE group_invites SET responded = 1 WHERE group_id = ?1", [group_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn set_disappearing(&self, peer: &str, setting: Option<Expiration>) -> Result<(), String> {
+        let key = format!("disappearing:{peer}");
+        match setting {
+            None => self
+                .connection
+                .execute("DELETE FROM settings WHERE key = ?1", [key])
+                .map(|_| ()),
+            Some(setting) => self
+                .connection
+                .execute(
+                    "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![key, serde_json::to_string(&setting).unwrap_or_default()],
+                )
+                .map(|_| ()),
+        }
+        .map_err(|e| e.to_string())
     }
 
     fn get_group_cursors(&self) -> Result<HashMap<String, String>, String> {
@@ -1320,14 +1882,57 @@ impl SessionClient {
         })
     }
 
+    /// pubkey/namespace/timestamp/signature (+ subaccount fields for
+    /// members) for an authenticated request to a group swarm.
+    fn group_auth_params(
+        &self,
+        auth: &GroupAuth,
+        group_id: &str,
+        method: &str,
+        namespace: i32,
+        timestamp_ms: u64,
+    ) -> Result<serde_json::Map<String, Value>, String> {
+        let mut params = serde_json::Map::new();
+        params.insert("pubkey".to_owned(), Value::String(group_id.to_owned()));
+        params.insert("namespace".to_owned(), Value::from(namespace));
+        params.insert("timestamp".to_owned(), Value::from(timestamp_ms));
+        match auth {
+            GroupAuth::Admin { secret_key, .. } => {
+                let signature = libsession::network::auth::sign_request_b64(
+                    method,
+                    namespace,
+                    timestamp_ms,
+                    secret_key,
+                )
+                .map_err(|error| error.to_string())?;
+                params.insert("signature".to_owned(), Value::String(signature));
+            }
+            GroupAuth::Member { auth_data } => {
+                let message =
+                    libsession::network::auth::canonical_sign_string(method, namespace, timestamp_ms);
+                let signed = session_tui_group::subaccount_sign(
+                    &self.identity.ed_secret,
+                    auth_data,
+                    message.as_bytes(),
+                )?;
+                params.insert("subaccount".to_owned(), Value::String(signed.subaccount));
+                params.insert(
+                    "subaccount_sig".to_owned(),
+                    Value::String(signed.subaccount_sig),
+                );
+                params.insert("signature".to_owned(), Value::String(signed.signature));
+            }
+        }
+        Ok(params)
+    }
+
     async fn retrieve_namespace_raw(
         &self,
         pubkey: &str,
-        pubkey_ed25519: &str,
         namespace: i32,
-        signing_key: &[u8],
+        auth: &SwarmAuth<'_>,
     ) -> Result<Vec<(String, Vec<u8>)>, String> {
-        self.retrieve_namespace_since(pubkey, pubkey_ed25519, namespace, signing_key, None)
+        self.retrieve_namespace_since(pubkey, namespace, auth, None)
             .await
             .map(|(messages, _)| messages)
     }
@@ -1337,22 +1942,15 @@ impl SessionClient {
     async fn retrieve_namespace_since(
         &self,
         pubkey: &str,
-        pubkey_ed25519: &str,
         namespace: i32,
-        signing_key: &[u8],
+        auth: &SwarmAuth<'_>,
         cursor: Option<&str>,
     ) -> Result<(Vec<(String, Vec<u8>)>, Option<String>), String> {
         let mut all = Vec::new();
         let mut last_hash = cursor.map(str::to_owned);
         for _ in 0..MAX_RETRIEVE_PAGES {
             let (page, more) = self
-                .retrieve_namespace_page(
-                    pubkey,
-                    pubkey_ed25519,
-                    namespace,
-                    signing_key,
-                    last_hash.as_deref(),
-                )
+                .retrieve_namespace_page(pubkey, namespace, auth, last_hash.as_deref())
                 .await?;
             let empty = page.is_empty();
             if let Some((hash, _)) = page.last() {
@@ -1369,28 +1967,17 @@ impl SessionClient {
     async fn retrieve_namespace_page(
         &self,
         pubkey: &str,
-        pubkey_ed25519: &str,
         namespace: i32,
-        signing_key: &[u8],
+        auth: &SwarmAuth<'_>,
         last_hash: Option<&str>,
     ) -> Result<(Vec<(String, Vec<u8>)>, bool), String> {
-        let response = if pubkey.starts_with("03") {
-            // Group namespace requests use the group signature format: pubkey,
-            // namespace, timestamp and signature. They do not include the
+        let pubkey_ed25519 = hex::encode(self.identity.ed_public);
+        let response = if let SwarmAuth::Group(group_auth) = auth {
+            // Group namespace requests carry pubkey, namespace, timestamp and
+            // signature (plus subaccount fields for members), but not the
             // user-request-only pubkey_ed25519 field.
-            let timestamp_ms = now_ms();
-            let signature = libsession::network::auth::sign_request_b64(
-                "retrieve",
-                namespace,
-                timestamp_ms,
-                signing_key,
-            )
-            .map_err(|error| error.to_string())?;
-            let mut params = serde_json::Map::new();
-            params.insert("pubkey".to_owned(), Value::String(pubkey.to_owned()));
-            params.insert("namespace".to_owned(), Value::from(namespace));
-            params.insert("timestamp".to_owned(), Value::from(timestamp_ms));
-            params.insert("signature".to_owned(), Value::String(signature));
+            let mut params =
+                self.group_auth_params(group_auth, pubkey, "retrieve", namespace, now_ms())?;
             params.insert("max_size".to_owned(), Value::from(1_000_000u32));
             if let Some(last_hash) = last_hash {
                 params.insert("last_hash".to_owned(), Value::String(last_hash.to_owned()));
@@ -1403,12 +1990,12 @@ impl SessionClient {
             self.network
                 .send_retrieve(&RetrieveParams {
                     pubkey,
-                    pubkey_ed25519,
+                    pubkey_ed25519: &pubkey_ed25519,
                     namespace,
                     timestamp_ms: now_ms(),
                     last_hash,
                     max_size: Some(1_000_000),
-                    signing_key,
+                    signing_key: &self.identity.ed_secret,
                 })
                 .await
                 .map_err(|error| error.to_string())?
@@ -1483,15 +2070,12 @@ impl SessionClient {
         Ok((result, more))
     }
 
-    async fn discover_groups(&self) -> Result<Vec<DiscoveredGroup>, String> {
-        let account_pubkey = hex::encode(self.identity.ed_public);
+    async fn discover_groups(
+        &self,
+        local_groups: &[LocalGroup],
+    ) -> Result<Vec<DiscoveredGroup>, String> {
         let messages = self
-            .retrieve_namespace_raw(
-                &self.identity.session_id,
-                &account_pubkey,
-                5,
-                &self.identity.ed_secret,
-            )
+            .retrieve_namespace_raw(&self.identity.session_id, 5, &SwarmAuth::User)
             .await?;
         let mut unwrapped_messages = Vec::new();
         let mut unwrap_failures = 0usize;
@@ -1576,20 +2160,10 @@ impl SessionClient {
                 merged_hashes.len()
             ),
         );
-        let mut runtime_groups = HashMap::new();
-        let mut discovered_groups = Vec::new();
+        // Groups joined through an invite in this client are not in the
+        // account's UserGroups config, so they are added from local storage.
+        let mut candidates: Vec<(String, String, Vec<u8>, Vec<u8>)> = Vec::new();
         for group in user_groups {
-            debug_log(
-                "group.config.record",
-                &format!(
-                    "id_len={} id_prefix={} seed_bytes={} auth_bytes={} removed_status={}",
-                    group.id.len(),
-                    &group.id[..group.id.len().min(8)],
-                    group.secretkey.len(),
-                    group.auth_data.len(),
-                    group.removed_status
-                ),
-            );
             if group.removed_status != 0 {
                 debug_log(
                     "group.config.skipped",
@@ -1598,160 +2172,155 @@ impl SessionClient {
                 continue;
             }
             if group.id.len() != 66 || !group.id.starts_with("03") {
-                debug_log(
-                    "group.config.skipped",
-                    &format!(
-                        "reason=invalid_group_id id_len={} starts_with_03={}",
-                        group.id.len(),
-                        group.id.starts_with("03")
-                    ),
-                );
                 continue;
             }
-            let display_name = if group.base.name.is_empty() {
-                format!("Group {}", &group.id[2..10])
-            } else {
-                group.base.name.clone()
+            candidates.push((group.id, group.base.name, group.secretkey, group.auth_data));
+        }
+        for local in local_groups {
+            if !candidates.iter().any(|(id, ..)| id == &local.id) {
+                candidates.push((
+                    local.id.clone(),
+                    local.name.clone(),
+                    Vec::new(),
+                    local.auth_data.clone(),
+                ));
+            }
+        }
+        let mut runtime_groups = HashMap::new();
+        let mut discovered_groups = Vec::new();
+        for (id, config_name, admin_seed, auth_data) in candidates {
+            let Ok(public_key) = <[u8; 32]>::try_from(
+                hex::decode(&id[2..]).unwrap_or_default().as_slice(),
+            ) else {
+                continue;
             };
-            discovered_groups.push(DiscoveredGroup {
-                id: group.id.clone(),
-                name: display_name,
-            });
-            if group.secretkey.len() != 32 {
+            let mut discovered = DiscoveredGroup {
+                id: id.clone(),
+                name: if config_name.is_empty() {
+                    format!("Group {}", &id[2..10])
+                } else {
+                    config_name.clone()
+                },
+                can_write: false,
+            };
+            let auth = if admin_seed.len() == 32 {
+                let (derived_pk, secret_key) =
+                    ed25519::ed25519_key_pair_from_seed(&admin_seed).map_err(|e| e.to_string())?;
+                if derived_pk != public_key {
+                    debug_log("group.config.invalid", "admin_seed_does_not_match_group_id=true");
+                    discovered_groups.push(discovered);
+                    continue;
+                }
+                GroupAuth::Admin {
+                    seed: admin_seed.clone(),
+                    secret_key: secret_key.to_vec(),
+                }
+            } else if session_tui_group::verify_subaccount(
+                &public_key,
+                &self.identity.ed_secret,
+                &auth_data,
+                false,
+            ) {
+                GroupAuth::Member { auth_data }
+            } else {
                 debug_log(
-                    "group.config.no_admin_seed",
+                    "group.config.no_access",
                     &format!(
-                        "group_prefix={} seed_bytes={}",
-                        &group.id[..8],
-                        group.secretkey.len()
+                        "group_prefix={} seed_bytes={} auth_bytes={}",
+                        &id[..8],
+                        admin_seed.len(),
+                        auth_data.len()
                     ),
                 );
+                discovered_groups.push(discovered);
                 continue;
-            }
-            let (public_key, secret_key) =
-                ed25519::ed25519_key_pair_from_seed(&group.secretkey).map_err(|e| e.to_string())?;
-            if hex::encode(public_key) != group.id[2..] {
-                debug_log(
-                    "group.config.invalid",
-                    "admin_seed_does_not_match_group_id=true",
-                );
-                continue;
-            }
-            let group_pubkey = format!("03{}", hex::encode(public_key));
-            let key_messages = match self
-                .retrieve_namespace_raw(&group_pubkey, &hex::encode(public_key), 12, &secret_key)
-                .await
-            {
+            };
+            discovered.can_write = auth.can_write();
+            let swarm_auth = SwarmAuth::Group(&auth);
+            let key_messages = match self.retrieve_namespace_raw(&id, 12, &swarm_auth).await {
                 Ok(messages) => messages,
                 Err(error) => {
                     debug_log(
                         "group.keys.retrieve_failed",
-                        &format!("group_prefix={} error={error}", &group.id[..8]),
+                        &format!("group_prefix={} error={error}", &id[..8]),
                     );
+                    discovered_groups.push(discovered);
                     continue;
                 }
             };
-            let mut selected_key: Option<(i64, [u8; 32])> = None;
-            let mut decrypted_key_count = 0usize;
             let key_message_count = key_messages.len();
-            for (_, message) in key_messages {
-                let Ok(libsession::util::bencode::BtValue::Dict(dict)) =
-                    libsession::util::bencode::decode(&message)
-                else {
-                    continue;
-                };
-                let (
-                    Some(libsession::util::bencode::BtValue::String(nonce)),
-                    Some(libsession::util::bencode::BtValue::String(encrypted_key)),
-                    Some(libsession::util::bencode::BtValue::Integer(generation)),
-                ) = (
-                    dict.get(b"#".as_slice()),
-                    dict.get(b"K".as_slice()),
-                    dict.get(b"G".as_slice()),
-                )
-                else {
-                    continue;
-                };
-                let Ok(nonce) = <[u8; 24]>::try_from(nonce.as_slice()) else {
-                    continue;
-                };
-                if encrypted_key.len() != 48 {
-                    continue;
-                }
-                let admin_key = blake2b_simd::Params::new()
-                    .hash_length(32)
-                    .key(b"SessionGroupKeyAdminKey")
-                    .hash(&group.secretkey);
-                let cipher = XChaCha20Poly1305::new_from_slice(admin_key.as_bytes())
-                    .map_err(|error| error.to_string())?;
-                let nonce = XNonce::from(nonce);
-                let Ok(decrypted) = cipher.decrypt(&nonce, encrypted_key.as_slice()) else {
-                    continue;
-                };
-                let Ok(group_key) = <[u8; 32]>::try_from(decrypted.as_slice()) else {
-                    continue;
-                };
-                decrypted_key_count += 1;
-                if selected_key
-                    .as_ref()
-                    .is_none_or(|(old, _)| generation > old)
-                {
-                    selected_key = Some((*generation, group_key));
+            let mut keys: Vec<session_tui_group::GroupKey> = Vec::new();
+            for (_, message) in &key_messages {
+                for key in session_tui_group::decrypt_key_message(
+                    message,
+                    &public_key,
+                    &self.identity.ed_secret,
+                    auth.admin_seed(),
+                ) {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
                 }
             }
-            let Some((_, encryption_key)) = selected_key else {
+            // Newest generation first: it is used for sending, the rest only
+            // to decrypt older messages.
+            keys.sort_by_key(|key| std::cmp::Reverse(key.generation));
+            if keys.is_empty() {
                 debug_log(
                     "group.keys.unavailable",
                     &format!(
-                        "group_prefix={} key_messages={key_message_count} decrypted_keys={decrypted_key_count}",
-                        &group.id[..8]
+                        "group_prefix={} member={} key_messages={key_message_count}",
+                        &id[..8],
+                        matches!(auth, GroupAuth::Member { .. })
                     ),
                 );
+                discovered_groups.push(discovered);
                 continue;
-            };
+            }
 
-            let info_messages = match self
-                .retrieve_namespace_raw(&group_pubkey, &hex::encode(public_key), 13, &secret_key)
-                .await
-            {
+            let info_messages = match self.retrieve_namespace_raw(&id, 13, &swarm_auth).await {
                 Ok(messages) => messages,
                 Err(error) => {
                     debug_log(
                         "group.info.retrieve_failed",
-                        &format!("group_prefix={} error={error}", &group.id[..8]),
+                        &format!("group_prefix={} error={error}", &id[..8]),
                     );
                     Vec::new()
                 }
             };
-            let mut info =
-                ConfigBase::<SharedGroupInfo>::new_group(&public_key, Some(&secret_key), None)?;
-            info.add_key(encryption_key, true);
+            let admin_secret = match &auth {
+                GroupAuth::Admin { secret_key, .. } => Some(secret_key.as_slice()),
+                GroupAuth::Member { .. } => None,
+            };
+            let mut info = ConfigBase::<SharedGroupInfo>::new_group(&public_key, admin_secret, None)?;
+            for key in keys.iter().rev() {
+                info.add_key(key.key, true);
+            }
             let info_merge: Vec<(&str, &[u8])> = info_messages
                 .iter()
                 .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
                 .collect();
             let _ = info.merge(&info_merge);
-            let name = info
-                .config_type
-                .name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .or_else(|| (!group.base.name.is_empty()).then(|| group.base.name.clone()))
-                .unwrap_or_else(|| format!("Group {}", &group.id[2..10]));
-            if let Some(discovered) = discovered_groups.iter_mut().find(|item| item.id == group.id) {
-                discovered.name = name.clone();
+            if let Some(name) = info.config_type.name.clone().filter(|name| !name.is_empty()) {
+                discovered.name = name;
             }
             debug_log(
                 "group.config.runtime_ready",
-                &format!("group_prefix={} name_bytes={}", &group.id[..8], name.len()),
+                &format!(
+                    "group_prefix={} member={} keys={}",
+                    &id[..8],
+                    matches!(auth, GroupAuth::Member { .. }),
+                    keys.len()
+                ),
             );
+            discovered_groups.push(discovered);
             runtime_groups.insert(
-                group.id.clone(),
+                id.clone(),
                 GroupRuntime {
-                    id: group.id,
+                    id,
                     public_key,
-                    secret_key: secret_key.to_vec(),
-                    encryption_key,
+                    auth,
+                    keys: keys.into_iter().map(|key| key.key).collect(),
                 },
             );
         }
@@ -1800,17 +2369,10 @@ impl SessionClient {
         group: &GroupRuntime,
         cursor: Option<&str>,
     ) -> Result<(Vec<IncomingMessage>, Option<String>), String> {
-        let group_pubkey = format!("03{}", hex::encode(group.public_key));
         let (raw_messages, last_hash) = self
-            .retrieve_namespace_since(
-                &group_pubkey,
-                &hex::encode(group.public_key),
-                11,
-                &group.secret_key,
-                cursor,
-            )
+            .retrieve_namespace_since(&group.id, 11, &SwarmAuth::Group(&group.auth), cursor)
             .await?;
-        let key_refs: [&[u8]; 1] = [&group.encryption_key];
+        let key_refs: Vec<&[u8]> = group.keys.iter().map(|key| key.as_slice()).collect();
         let decode_keys = DecodeEnvelopeKey {
             group_ed25519_pubkey: Some(&group.public_key),
             decrypt_keys: &key_refs,
@@ -1828,77 +2390,75 @@ impl SessionClient {
                 continue;
             };
             let sender_id = format!("05{}", hex::encode(decoded.sender_x25519_pubkey));
-            let outgoing = sender_id == self.identity.session_id;
-            if let Some(unsend) = content.unsend_request {
-                let mut message = IncomingMessage::control(
-                    hash,
-                    sender_id,
-                    group.id.clone(),
-                    decoded.envelope.timestamp,
-                );
-                message.unsend = Some((unsend.timestamp, unsend.author));
-                incoming.push(message);
-                continue;
-            }
-            if content.receipt_message.is_some() {
-                continue;
-            }
-            let Some(data_message) = content.data_message else {
-                continue;
-            };
-            let timestamp_ms = data_message.timestamp.unwrap_or(decoded.envelope.timestamp);
-            let attachments: Vec<AttachmentMeta> = data_message
-                .attachments
-                .iter()
-                .map(attachment_meta_from_pointer)
-                .collect();
-            let text = data_message.body.unwrap_or_default();
-            if text.is_empty() && attachments.is_empty() {
-                continue;
-            }
-            let sender_name = data_message
-                .profile
-                .and_then(|profile| profile.display_name)
-                .map(|name| name.trim().to_owned())
-                .filter(|name| !name.is_empty());
-            incoming.push(IncomingMessage {
+            if let Some(message) = parse_content(
+                &self.identity.session_id,
                 hash,
                 sender_id,
-                contact_id: group.id.clone(),
-                outgoing,
-                sender_name,
-                body: Some(text),
-                timestamp_ms,
-                unsend: None,
-                receipt: None,
-                attachments,
-            });
+                group.id.clone(),
+                decoded.envelope.timestamp,
+                content,
+            ) {
+                incoming.push(message);
+            }
         }
         Ok((incoming, last_hash))
     }
 
-    async fn send_message(
+    /// Send a DataMessage (text, reply, reaction, timer update…) with the
+    /// chat's disappearing setting, plus the linked-device sync copy.
+    /// Returns whether the sync copy was stored.
+    async fn send_data_message(
         &self,
         recipient_id: &str,
-        body: &str,
-        profile_name: &str,
-    ) -> Result<(u64, bool), String> {
-        let timestamp_ms = now_ms();
-        let data_message = DataMessage {
-            body: Some(body.to_owned()),
-            timestamp: Some(timestamp_ms),
-            profile: profile_for(profile_name, timestamp_ms),
-            ..Default::default()
-        };
+        data_message: DataMessage,
+        expiration: Option<Expiration>,
+    ) -> Result<bool, String> {
+        let timestamp_ms = data_message.timestamp.ok_or("message has no timestamp")?;
         let content = Content {
             data_message: Some(data_message.clone()),
             sig_timestamp: Some(timestamp_ms),
+            expiration_type: expiration.map(|e| e.kind),
+            expiration_timer: expiration.map(|e| e.seconds),
             ..Default::default()
         };
-        self.send_content(recipient_id, content, timestamp_ms)
-            .await?;
-        let sync_copy_sent = self.send_sync_copy(recipient_id, data_message, timestamp_ms).await;
-        Ok((timestamp_ms, sync_copy_sent))
+        self.send_content(recipient_id, content, timestamp_ms).await?;
+        Ok(self
+            .send_sync_copy(recipient_id, data_message, timestamp_ms, expiration)
+            .await)
+    }
+
+    /// Typing indicator for a 1:1 chat (Session does not send them to groups).
+    async fn send_typing(&self, recipient_id: &str, started: bool) -> Result<(), String> {
+        use libsession::proto::session_protos::{TypingMessage, typing_message::Action};
+        let timestamp_ms = now_ms();
+        let content = Content {
+            typing_message: Some(TypingMessage {
+                timestamp: timestamp_ms,
+                action: if started { Action::Started } else { Action::Stopped } as i32,
+            }),
+            sig_timestamp: Some(timestamp_ms),
+            ..Default::default()
+        };
+        self.send_content(recipient_id, content, timestamp_ms).await
+    }
+
+    /// Tell a group we accepted its invite (shows as "joined" for others).
+    async fn send_invite_response(&self, group_id: &str) -> Result<(), String> {
+        use libsession::proto::session_protos::{
+            GroupUpdateInviteResponseMessage, GroupUpdateMessage,
+        };
+        let timestamp_ms = now_ms();
+        let data_message = DataMessage {
+            timestamp: Some(timestamp_ms),
+            group_update_message: Some(GroupUpdateMessage {
+                invite_response: Some(GroupUpdateInviteResponseMessage { is_approved: true }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.send_data_message(group_id, data_message, None)
+            .await
+            .map(|_| ())
     }
 
     /// Encrypt and upload one file to the Session file server.
@@ -2009,6 +2569,8 @@ impl SessionClient {
         paths: &[std::path::PathBuf],
         caption: &str,
         profile_name: &str,
+        quote: Option<DataQuote>,
+        expiration: Option<Expiration>,
     ) -> Result<SentAttachments, String> {
         if paths.is_empty() {
             return Err("no files given".into());
@@ -2030,19 +2592,12 @@ impl SessionClient {
             timestamp: Some(timestamp_ms),
             attachments: pointers,
             profile: profile_for(profile_name, timestamp_ms),
+            quote,
             ..Default::default()
         };
-        self.send_content(
-            recipient_id,
-            Content {
-                data_message: Some(data_message.clone()),
-                sig_timestamp: Some(timestamp_ms),
-                ..Default::default()
-            },
-            timestamp_ms,
-        )
-        .await?;
-        let sync_copy_sent = self.send_sync_copy(recipient_id, data_message, timestamp_ms).await;
+        let sync_copy_sent = self
+            .send_data_message(recipient_id, data_message, expiration)
+            .await?;
         debug_log(
             "attachment.sent",
             &format!("files={} sync_copy_sent={sync_copy_sent}", files.len()),
@@ -2063,6 +2618,7 @@ impl SessionClient {
         recipient_id: &str,
         data_message: DataMessage,
         timestamp_ms: u64,
+        expiration: Option<Expiration>,
     ) -> bool {
         if recipient_id.starts_with("03") || recipient_id == self.identity.session_id {
             return true;
@@ -2073,6 +2629,8 @@ impl SessionClient {
                 ..data_message
             }),
             sig_timestamp: Some(timestamp_ms),
+            expiration_type: expiration.map(|e| e.kind),
+            expiration_timer: expiration.map(|e| e.seconds),
             ..Default::default()
         };
         match self
@@ -2258,6 +2816,15 @@ impl SessionClient {
                 content.encoded_len()
             ),
         );
+        // Disappear-after-send messages only live on the swarm for their timer.
+        let ttl_ms = match (content.expiration_type, content.expiration_timer) {
+            (Some(2), Some(seconds)) if seconds > 0 => {
+                (u64::from(seconds) * 1000).min(rpc::DEFAULT_MESSAGE_TTL_MS)
+            }
+            // Typing indicators are only useful for a few seconds.
+            _ if content.typing_message.is_some() => 20_000,
+            _ => rpc::DEFAULT_MESSAGE_TTL_MS,
+        };
         if recipient_id.starts_with("03") {
             let group = self
                 .groups
@@ -2274,27 +2841,19 @@ impl SessionClient {
                 &self.identity.ed_secret,
                 timestamp_ms,
                 &group_pubkey,
-                &group.encryption_key,
+                group.keys.first().ok_or("no group encryption key")?,
                 None,
             )
             .map_err(|error| format!("could not encode group message: {error}"))?;
+            if !group.auth.can_write() {
+                return Err("your membership in this group is read-only".into());
+            }
             let encoded = STANDARD.encode(wire);
-            let store_timestamp = now_ms();
-            let signature = libsession::network::auth::sign_request_b64(
-                "store",
-                11,
-                store_timestamp,
-                &group.secret_key,
-            )
-            .map_err(|error| error.to_string())?;
-            let mut params = serde_json::Map::new();
-            params.insert("pubkey".to_owned(), Value::String(group.id.clone()));
-            params.insert("namespace".to_owned(), Value::from(11));
-            params.insert("timestamp".to_owned(), Value::from(store_timestamp));
-            params.insert("signature".to_owned(), Value::String(signature));
+            let mut params =
+                self.group_auth_params(&group.auth, &group.id, "store", 11, now_ms())?;
             params.insert(
                 "ttl".to_owned(),
-                Value::from(rpc::DEFAULT_MESSAGE_TTL_MS),
+                Value::from(ttl_ms),
             );
             params.insert("data".to_owned(), Value::String(encoded));
             let response = self
@@ -2348,7 +2907,7 @@ impl SessionClient {
                 pubkey_ed25519: None,
                 namespace: 0,
                 timestamp_ms,
-                ttl_ms: rpc::DEFAULT_MESSAGE_TTL_MS,
+                ttl_ms,
                 data_base64: &encoded,
                 signing_key: None,
             })
@@ -2371,6 +2930,7 @@ impl SessionClient {
         &self,
         last_hash: Option<&str>,
         group_cursors: HashMap<String, String>,
+        local_groups: Vec<LocalGroup>,
     ) -> Result<RetrieveResult, String> {
         debug_log(
             "retrieve.begin",
@@ -2498,89 +3058,36 @@ impl SessionClient {
                 .and_then(Value::as_str)
                 .unwrap_or(data)
                 .to_owned();
-            if let Some(unsend) = content.unsend_request {
-                let mut message = IncomingMessage::control(
-                    hash,
-                    sender_id.clone(),
-                    sender_id,
-                    unsend.timestamp,
-                );
-                message.unsend = Some((unsend.timestamp, unsend.author));
-                incoming.push(message);
-                continue;
-            }
-            if let Some(receipt) = content.receipt_message {
-                let mut message = IncomingMessage::control(
-                    hash,
-                    sender_id.clone(),
-                    sender_id,
-                    envelope.timestamp,
-                );
-                message.receipt = Some((receipt.r#type, receipt.timestamp));
-                incoming.push(message);
-                continue;
-            }
-            let Some(data_message) = content.data_message else {
+            let Some(message) = parse_content(
+                &self.identity.session_id,
+                hash,
+                sender_id.clone(),
+                sender_id.clone(),
+                envelope.timestamp,
+                content,
+            ) else {
                 continue;
             };
-            let sync_target = data_message.sync_target.clone();
-            let outgoing_sync = sender_id == self.identity.session_id
-                && sync_target
-                    .as_deref()
-                    .is_some_and(libsession::util::types::session_id_is_valid);
-            let contact_id = if outgoing_sync {
-                sync_target.clone().expect("validated sync target")
-            } else {
-                sender_id.clone()
-            };
-            let sender_name = if outgoing_sync {
-                None
-            } else {
-                data_message
-                    .profile
-                    .and_then(|profile| profile.display_name)
-                    .map(|name| name.trim().to_owned())
-                    .filter(|name| !name.is_empty())
-            };
-            let timestamp_ms = data_message.timestamp.unwrap_or(envelope.timestamp);
-            let attachments: Vec<AttachmentMeta> = data_message
-                .attachments
-                .iter()
-                .map(attachment_meta_from_pointer)
-                .collect();
-            let text = data_message.body.unwrap_or_default();
-            if text.is_empty() && attachments.is_empty() {
-                continue;
-            }
             debug_log(
                 "message.route",
                 &format!(
-                    "sender_prefix={} contact_prefix={} self_sync_copy={outgoing_sync} attachments={}",
+                    "sender_prefix={} contact_prefix={} outgoing={} attachments={}",
                     &sender_id[..sender_id.len().min(8)],
-                    &contact_id[..contact_id.len().min(8)],
-                    attachments.len(),
+                    &message.contact_id[..message.contact_id.len().min(8)],
+                    message.outgoing,
+                    message.attachments.len(),
                 ),
             );
-            if !outgoing_sync && sender_id != self.identity.session_id {
+            // Session acknowledges visible messages with a delivery receipt.
+            if !message.outgoing && message.body.is_some() {
                 delivery_receipts
-                    .entry(sender_id.clone())
+                    .entry(sender_id)
                     .or_default()
-                    .push(timestamp_ms);
+                    .push(message.timestamp_ms);
             }
-            incoming.push(IncomingMessage {
-                hash,
-                sender_id,
-                contact_id,
-                outgoing: outgoing_sync,
-                sender_name,
-                body: Some(text),
-                timestamp_ms,
-                unsend: None,
-                receipt: None,
-                attachments,
-            });
+            incoming.push(message);
         }
-        let groups = match self.discover_groups().await {
+        let groups = match self.discover_groups(&local_groups).await {
             Ok(groups) => groups,
             Err(error) => {
                 debug_log("group.sync.failed", &format!("error={error}"));
@@ -2608,6 +3115,17 @@ impl SessionClient {
                     "group.retrieve.failed",
                     &format!("group_prefix={} error={error}", &group.id[..8]),
                 ),
+            }
+        }
+        let mut invite_responses = Vec::new();
+        for local in local_groups.iter().filter(|local| !local.responded) {
+            let ready = self
+                .groups
+                .lock()
+                .map(|groups| groups.contains_key(&local.id))
+                .unwrap_or(false);
+            if ready && self.send_invite_response(&local.id).await.is_ok() {
+                invite_responses.push(local.id.clone());
             }
         }
         for (sender, timestamps) in delivery_receipts {
@@ -2638,12 +3156,22 @@ impl SessionClient {
             last_hash,
             groups,
             group_cursors: new_group_cursors,
+            invite_responses,
         })
     }
 }
 
 fn prompt_identity() -> Result<Identity, Box<dyn std::error::Error>> {
-    let saved_seed_path = session_data_dir()?.join("identity.dpapi");
+    let saved_seed_path = session_data_dir()?.join(SAVED_SEED_FILE);
+    if std::env::args().skip(1).any(|arg| arg == "--forget-seed") {
+        match std::fs::remove_file(&saved_seed_path) {
+            Ok(()) => println!("Removed the saved seed."),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                println!("No saved seed.")
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     if let Some(seed) = load_protected_seed(&saved_seed_path)? {
         return identity_from_seed(seed, None);
     }
@@ -2776,19 +3304,115 @@ fn load_protected_seed(
     Ok(Some(seed))
 }
 
+/// File name of the saved seed: DPAPI-protected on Windows, passphrase
+/// encrypted elsewhere.
+const SAVED_SEED_FILE: &str = if cfg!(windows) {
+    "identity.dpapi"
+} else {
+    "identity.seed"
+};
+
+#[cfg_attr(windows, allow(dead_code))]
+const SEED_FILE_MAGIC: &[u8; 8] = b"STUISED1";
+
+#[cfg_attr(windows, allow(dead_code))]
+/// Argon2id (64 MiB, 3 passes) key for the saved-seed file.
+fn seed_file_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    let params = argon2::Params::new(64 * 1024, 3, 1, Some(32)).map_err(|e| e.to_string())?;
+    let mut key = [0u8; 32];
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| e.to_string())?;
+    Ok(key)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+/// `magic || salt(16) || nonce(24) || XChaCha20-Poly1305(seed)`
+fn encrypt_seed_file(seed: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
+    let salt = random::random(16);
+    let nonce = random::random(24);
+    let key = seed_file_key(passphrase, &salt)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let encrypted = cipher
+        .encrypt(XNonce::from_slice(&nonce), seed)
+        .map_err(|_| "could not encrypt the seed".to_string())?;
+    Ok([SEED_FILE_MAGIC.as_slice(), &salt, &nonce, &encrypted].concat())
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn decrypt_seed_file(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
+    if data.len() < 8 + 16 + 24 + 16 || &data[..8] != SEED_FILE_MAGIC {
+        return Err("the saved seed file is not recognised".into());
+    }
+    let (salt, rest) = data[8..].split_at(16);
+    let (nonce, encrypted) = rest.split_at(24);
+    let key = seed_file_key(passphrase, salt)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|e| e.to_string())?;
+    cipher
+        .decrypt(XNonce::from_slice(nonce), encrypted)
+        .map_err(|_| "wrong passphrase".to_string())
+}
+
+/// Linux/macOS: offer to keep the seed on disk, encrypted with a passphrase
+/// (there is no per-user secret store we can rely on everywhere, and an
+/// unencrypted seed file would hand over the account to anyone reading it).
 #[cfg(not(windows))]
 fn save_protected_seed(
-    _path: &std::path::Path,
-    _seed: &[u8],
+    path: &std::path::Path,
+    seed: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    println!(
+        "\nSave the seed on this computer so you don't have to enter it again?\n\
+         It is encrypted with a passphrase you choose; leave blank to not save it."
+    );
+    let passphrase = loop {
+        let first = rpassword::prompt_password("New passphrase (blank = don't save): ")?;
+        if first.is_empty() {
+            return Ok(());
+        }
+        if first.chars().count() < 6 {
+            println!("Use at least 6 characters.");
+            continue;
+        }
+        if rpassword::prompt_password("Repeat passphrase: ")? == first {
+            break first;
+        }
+        println!("Passphrases differ, try again.");
+    };
+    let data = encrypt_seed_file(seed, &passphrase)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(&data)?;
+    println!("Seed saved to {} (use --forget-seed to remove it).", path.display());
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn load_protected_seed(
-    _path: &std::path::Path,
+    path: &std::path::Path,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    Ok(None)
+    let Ok(data) = std::fs::read(path) else {
+        return Ok(None);
+    };
+    for _ in 0..3 {
+        let passphrase = rpassword::prompt_password(
+            "Passphrase for the saved seed (blank = enter seed instead): ",
+        )?;
+        if passphrase.is_empty() {
+            return Ok(None);
+        }
+        match decrypt_seed_file(&data, &passphrase) {
+            Ok(seed) if seed.len() == 32 => return Ok(Some(seed)),
+            Ok(_) => return Err("The saved Session seed file is invalid".into()),
+            Err(error) => println!("{error}"),
+        }
+    }
+    Err("too many wrong passphrases".into())
 }
 
 fn session_word_list() -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -3161,7 +3785,70 @@ async fn run(
     enqueue_missing_downloads(app, &mut download_queue);
     let mut pending_read_receipts: std::collections::VecDeque<(String, Vec<u64>)> =
         std::collections::VecDeque::new();
+    // Outgoing text/reaction/timer sends: (task, chat, message timestamp).
+    let mut send_tasks: Vec<(tokio::task::JoinHandle<Result<bool, String>>, String, u64)> =
+        Vec::new();
+    let mut background_tasks: Vec<(tokio::task::JoinHandle<Result<(), String>>, &'static str)> =
+        Vec::new();
+    let mut last_typing: Option<(String, Instant)> = None;
+    let mut last_expiry_sweep = Instant::now();
     loop {
+        // Finished text sends.
+        let mut index = 0;
+        while index < send_tasks.len() {
+            if !send_tasks[index].0.is_finished() {
+                index += 1;
+                continue;
+            }
+            let (task, peer, timestamp) = send_tasks.swap_remove(index);
+            let result = task
+                .await
+                .unwrap_or_else(|error| Err(format!("send task failed: {error}")));
+            let Some(conversation) = app.conversations.iter_mut().find(|c| c.id == peer) else {
+                continue;
+            };
+            let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|m| m.outgoing && m.timestamp_ms == timestamp)
+            else {
+                continue;
+            };
+            match result {
+                Ok(sync_copy_sent) => {
+                    message.send_state = SendState::Sent;
+                    let saved = store.save_message(&peer, message);
+                    app.status = match saved {
+                        Err(error) => format!("SENT · LOCAL SAVE ERROR · {error}"),
+                        Ok(()) if sync_copy_sent => "SENT".into(),
+                        Ok(()) => "SENT · OTHER DEVICE SYNC COPY FAILED".into(),
+                    };
+                }
+                Err(error) => {
+                    message.send_state = SendState::Failed;
+                    app.status = format!("SEND FAILED · {error} · SELECT IT AND /retry");
+                }
+            }
+        }
+        // Fire-and-forget network work (unsend, typing, reactions…).
+        let mut index = 0;
+        while index < background_tasks.len() {
+            if !background_tasks[index].0.is_finished() {
+                index += 1;
+                continue;
+            }
+            let (task, what) = background_tasks.swap_remove(index);
+            if let Ok(Err(error)) | Err(error) = task.await.map_err(|e| e.to_string()) {
+                debug_log("background.failed", &format!("task={what} error={error}"));
+                if what != "typing" {
+                    app.status = format!("{} FAILED · {error}", what.to_uppercase());
+                }
+            }
+        }
+        if last_expiry_sweep.elapsed() >= Duration::from_secs(1) {
+            last_expiry_sweep = Instant::now();
+            remove_expired_messages(app, store);
+        }
         if read_receipt_task
             .as_ref()
             .is_some_and(|task| task.is_finished())
@@ -3306,9 +3993,32 @@ async fn run(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if app.image_viewer.is_some() {
-            if key.code == KeyCode::Esc {
-                app.image_viewer = None;
+        if let Some(viewer) = app.image_viewer.as_ref() {
+            let step: isize = match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.image_viewer = None;
+                    continue;
+                }
+                KeyCode::Right | KeyCode::Char('n') | KeyCode::Char(' ') => 1,
+                KeyCode::Left | KeyCode::Char('p') | KeyCode::Backspace => -1,
+                _ => continue,
+            };
+            let current = viewer.index;
+            let images: Vec<usize> = app.selected_message().map_or(Vec::new(), |message| {
+                message
+                    .attachments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.content_type.starts_with("image/"))
+                    .map(|(index, _)| index)
+                    .collect()
+            });
+            if images.len() > 1 {
+                let position = images.iter().position(|i| *i == current).unwrap_or(0) as isize;
+                let next = images[(position + step).rem_euclid(images.len() as isize) as usize];
+                if let Err(error) = open_selected_image(app, Some(next)) {
+                    app.status = format!("IMAGE PREVIEW FAILED · {error}");
+                }
             }
             continue;
         }
@@ -3340,6 +4050,33 @@ async fn run(
                 app.input.clear();
             }
             KeyCode::Esc if app.show_help => app.show_help = false,
+            KeyCode::Esc if app.reply_to.is_some() => {
+                app.reply_to = None;
+                app.status = "REPLY CANCELLED".into();
+            }
+            KeyCode::Char('r')
+                if app.focus == FocusArea::Messages
+                    && app.input.is_empty()
+                    && key.modifiers.is_empty() =>
+            {
+                let local_id = client.identity.session_id.clone();
+                if let Some(conversation) = app.conversations.get(app.selected)
+                    && let Some(message) = conversation.messages.get(conversation.selected_message)
+                    && !message.system
+                    && message.send_state == SendState::Sent
+                {
+                    app.reply_to = Some(QuoteRef {
+                        id: message.timestamp_ms,
+                        author: message.author(&conversation.id, &local_id).to_owned(),
+                        text: message.preview_text(),
+                    });
+                    app.focus = FocusArea::Composer;
+                    app.status = "REPLYING · ESC TO CANCEL".into();
+                }
+            }
+            KeyCode::Char('+') if app.focus == FocusArea::Messages && app.input.is_empty() => {
+                react_to_selected(app, client, store, "👍", &mut background_tasks);
+            }
             KeyCode::Esc if app.input_mode == InputMode::ContactId => {
                 app.input.clear();
                 app.input_mode = InputMode::Message;
@@ -3390,13 +4127,21 @@ async fn run(
                     continue;
                 };
                 let peer = app.conversations[app.selected].id.clone();
-                if outgoing {
-                    app.status = "SENDING UNSEND REQUEST…".into();
-                    terminal.draw(|frame| draw(frame, app))?;
-                    if let Err(error) = client.unsend_message(&peer, timestamp).await {
-                        app.status = format!("UNSEND FAILED · {error}");
-                        continue;
-                    }
+                let delivered = app
+                    .selected_message()
+                    .is_some_and(|m| m.send_state == SendState::Sent && !m.system);
+                let unsend = outgoing && delivered;
+                if unsend {
+                    // Remove now like Session does; the request goes out in
+                    // the background.
+                    let task_client = Arc::clone(client);
+                    let task_peer = peer.clone();
+                    background_tasks.push((
+                        spawn_network(move || async move {
+                            task_client.unsend_message(&task_peer, timestamp).await
+                        }),
+                        "unsend",
+                    ));
                 }
                 if let Some(removed) = app.remove_selected_message()
                     && let Err(error) = store.delete_message(&peer, &removed)
@@ -3404,7 +4149,7 @@ async fn run(
                     app.status = format!("LOCAL DELETE ERROR · {error}");
                     continue;
                 }
-                app.status = if outgoing {
+                app.status = if unsend {
                     "MESSAGE UNSENT".into()
                 } else {
                     "MESSAGE DELETED LOCALLY".into()
@@ -3481,12 +4226,24 @@ async fn run(
                         let task_client = Arc::clone(client);
                         let task_peer = recipient.clone();
                         let profile_name = app.profile_name.clone();
+                        let quote = app.reply_to.take().map(data_quote);
+                        let expiration = app
+                            .conversations
+                            .get(app.selected)
+                            .and_then(|c| c.disappearing);
                         let paths: Vec<std::path::PathBuf> =
                             paths.into_iter().map(std::path::PathBuf::from).collect();
                         attachment_task = Some((
                             spawn_network(move || async move {
                                 task_client
-                                    .send_attachments(&task_peer, &paths, &caption, &profile_name)
+                                    .send_attachments(
+                                        &task_peer,
+                                        &paths,
+                                        &caption,
+                                        &profile_name,
+                                        quote,
+                                        expiration,
+                                    )
                                     .await
                             }),
                             recipient,
@@ -3653,43 +4410,141 @@ async fn run(
                     _ if app.input_mode == InputMode::ContactId => {
                         app.status = "UNKNOWN COMMAND · ESC TO CANCEL ADDING A CONTACT".into();
                     }
+                    "/retry" => {
+                        app.input.clear();
+                        let retry = app.conversations.get_mut(app.selected).and_then(|c| {
+                            let message = c.messages.get_mut(c.selected_message)?;
+                            (message.outgoing && message.send_state == SendState::Failed).then(|| {
+                                message.send_state = SendState::Sending;
+                                (c.id.clone(), message.clone())
+                            })
+                        });
+                        match retry {
+                            Some((peer, message)) => {
+                                send_tasks.push(spawn_text_send(client, app, &peer, &message));
+                                app.status = "RETRYING…".into();
+                            }
+                            None => app.status = "SELECT A FAILED MESSAGE TO RETRY".into(),
+                        }
+                    }
+                    "/react" => {
+                        app.input.clear();
+                        if rest.is_empty() {
+                            app.status = "USAGE · /react EMOJI (again to remove)".into();
+                        } else {
+                            react_to_selected(app, client, store, rest, &mut background_tasks);
+                        }
+                    }
+                    "/disappear" => {
+                        app.input.clear();
+                        let Some(conversation) = app.conversations.get(app.selected) else {
+                            continue;
+                        };
+                        if rest.is_empty() {
+                            app.status = format!(
+                                "DISAPPEARING MESSAGES · {}",
+                                Expiration::describe(conversation.disappearing)
+                            );
+                            continue;
+                        }
+                        if conversation.id.starts_with("03") {
+                            app.status =
+                                "GROUP TIMERS ARE SET BY ADMINS IN THE GROUP SETTINGS".into();
+                            continue;
+                        }
+                        let setting = match Expiration::parse(rest) {
+                            Ok(setting) => setting,
+                            Err(usage) => {
+                                app.status = usage;
+                                continue;
+                            }
+                        };
+                        let peer = conversation.id.clone();
+                        let timestamp = now_ms();
+                        let conversation = &mut app.conversations[app.selected];
+                        conversation.disappearing = setting;
+                        let notice = Message::system(
+                            format!(
+                                "You set disappearing messages to {}",
+                                Expiration::describe(setting)
+                            ),
+                            timestamp,
+                        );
+                        let _ = store.save_message(&peer, &notice);
+                        conversation.messages.push(notice);
+                        conversation.selected_message = conversation.messages.len() - 1;
+                        let _ = store.set_disappearing(&peer, setting);
+                        let task_client = Arc::clone(client);
+                        let data_message = DataMessage {
+                            timestamp: Some(timestamp),
+                            flags: Some(2),
+                            ..Default::default()
+                        };
+                        background_tasks.push((
+                            spawn_network(move || async move {
+                                task_client
+                                    .send_data_message(&peer, data_message, setting)
+                                    .await
+                                    .map(|_| ())
+                            }),
+                            "timer update",
+                        ));
+                        app.status = format!(
+                            "DISAPPEARING MESSAGES · {}",
+                            Expiration::describe(setting)
+                        );
+                    }
+                    "/accept" => {
+                        app.input.clear();
+                        let invites = store.local_groups(false).unwrap_or_default();
+                        let current = app.conversations.get(app.selected).map(|c| c.id.clone());
+                        let chosen = invites
+                            .iter()
+                            .rev()
+                            .find(|(_, inviter)| Some(inviter) == current.as_ref())
+                            .or_else(|| invites.last());
+                        match chosen {
+                            Some((group, _)) => {
+                                let _ = store.set_group_joined(&group.id);
+                                let index = app.ensure_contact(&group.id);
+                                app.conversations[index].name = group.name.clone();
+                                let _ = store.save_contact_name(&group.id, &group.name);
+                                app.selected = index;
+                                last_sync = Instant::now();
+                                start_sync(app, client, store, &mut sync_task);
+                                app.status = format!("JOINING GROUP · {}", group.name);
+                            }
+                            None => app.status = "NO PENDING GROUP INVITES".into(),
+                        }
+                    }
                     _ => {
                         let body = app.input.trim().to_owned();
                         if body.is_empty() {
                             app.focus = FocusArea::Composer;
                             continue;
                         }
-                        let Some(recipient) = app.conversations.get(app.selected).map(|c| c.id.clone())
-                        else {
+                        let Some(conversation) = app.conversations.get_mut(app.selected) else {
                             app.status = "ADD A CONTACT FIRST WITH CTRL+N".into();
                             continue;
                         };
-                        app.status = "SENDING THROUGH SESSION ONION ROUTING…".into();
-                        terminal.draw(|frame| draw(frame, app))?;
-                        match client
-                            .send_message(&recipient, &body, &app.profile_name)
-                            .await
-                        {
-                            Ok((timestamp_ms, sync_copy_sent)) => {
-                                app.input.clear();
-                                let message = Message::new(body, timestamp_ms, true);
-                                let save = store.save_message(&recipient, &message);
-                                if let Some(convo) = app.conversations.get_mut(app.selected) {
-                                    convo.messages.push(message);
-                                    convo.selected_message = convo.messages.len() - 1;
-                                    convo.refresh_preview();
-                                }
-                                app.sort_conversations();
-                                app.status = match save {
-                                    Err(error) => format!("SENT · LOCAL SAVE ERROR · {error}"),
-                                    Ok(()) if sync_copy_sent => {
-                                        "SENT · SYNCED TO YOUR OTHER DEVICES".into()
-                                    }
-                                    Ok(()) => "SENT · OTHER DEVICE SYNC COPY FAILED".into(),
-                                };
-                            }
-                            Err(error) => app.status = format!("SEND FAILED · {error}"),
+                        if conversation.read_only {
+                            app.status = "YOU CAN READ BUT NOT POST IN THIS GROUP".into();
+                            continue;
                         }
+                        let peer = conversation.id.clone();
+                        let mut message = Message::new(body, now_ms(), true);
+                        message.send_state = SendState::Sending;
+                        message.quote = app.reply_to.take();
+                        message.expiration = conversation.disappearing;
+                        message.start_expiry(None);
+                        conversation.messages.push(message.clone());
+                        conversation.selected_message = conversation.messages.len() - 1;
+                        conversation.refresh_preview();
+                        app.input.clear();
+                        last_typing = None;
+                        send_tasks.push(spawn_text_send(client, app, &peer, &message));
+                        app.sort_conversations();
+                        app.status = "SENDING…".into();
                     }
                 }
             }
@@ -3698,10 +4553,170 @@ async fn run(
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.focus = FocusArea::Composer;
-                app.input.push(c)
+                app.input.push(c);
+                // Session-style typing indicator for 1:1 chats, at most every 10 s.
+                if app.input_mode == InputMode::Message
+                    && !app.input.starts_with('/')
+                    && let Some(peer) = app
+                        .conversations
+                        .get(app.selected)
+                        .map(|c| c.id.clone())
+                        .filter(|id| id.starts_with("05") && *id != client.identity.session_id)
+                    && last_typing
+                        .as_ref()
+                        .is_none_or(|(last_peer, at)| *last_peer != peer || at.elapsed() > Duration::from_secs(10))
+                {
+                    last_typing = Some((peer.clone(), Instant::now()));
+                    let task_client = Arc::clone(client);
+                    background_tasks.push((
+                        spawn_network(move || async move { task_client.send_typing(&peer, true).await }),
+                        "typing",
+                    ));
+                }
             }
             _ => {}
         }
+    }
+}
+
+fn data_quote(quote: QuoteRef) -> DataQuote {
+    DataQuote {
+        id: quote.id,
+        author: quote.author,
+        text: Some(quote.text).filter(|text| !text.is_empty()),
+        attachments: Vec::new(),
+    }
+}
+
+/// Send a text message (already shown as "sending") in the background.
+fn spawn_text_send(
+    client: &Arc<SessionClient>,
+    app: &App,
+    peer: &str,
+    message: &Message,
+) -> (tokio::task::JoinHandle<Result<bool, String>>, String, u64) {
+    let data_message = DataMessage {
+        body: Some(message.body.clone()),
+        timestamp: Some(message.timestamp_ms),
+        profile: profile_for(&app.profile_name, message.timestamp_ms),
+        quote: message.quote.clone().map(data_quote),
+        ..Default::default()
+    };
+    let expiration = message.expiration;
+    let task_client = Arc::clone(client);
+    let task_peer = peer.to_owned();
+    (
+        spawn_network(move || async move {
+            task_client
+                .send_data_message(&task_peer, data_message, expiration)
+                .await
+        }),
+        peer.to_owned(),
+        message.timestamp_ms,
+    )
+}
+
+/// Add or remove (if already ours) a reaction on a message and record it.
+fn apply_reaction(message: &mut Message, emoji: &str, author: &str, remove: bool) {
+    if let Some(entry) = message.reactions.iter_mut().find(|r| r.emoji == emoji) {
+        entry.authors.retain(|a| a != author);
+        if !remove {
+            entry.authors.push(author.to_owned());
+        }
+    } else if !remove {
+        message.reactions.push(ReactionEntry {
+            emoji: emoji.to_owned(),
+            authors: vec![author.to_owned()],
+        });
+    }
+    message.reactions.retain(|r| !r.authors.is_empty());
+}
+
+/// Toggle our `emoji` reaction on the selected message (Session behaviour:
+/// reacting again with the same emoji removes it).
+fn react_to_selected(
+    app: &mut App,
+    client: &Arc<SessionClient>,
+    store: &LocalStore,
+    emoji: &str,
+    tasks: &mut Vec<(tokio::task::JoinHandle<Result<(), String>>, &'static str)>,
+) {
+    let local_id = client.identity.session_id.clone();
+    let Some(conversation) = app.conversations.get_mut(app.selected) else {
+        return;
+    };
+    if conversation.read_only {
+        app.status = "YOU CAN READ BUT NOT POST IN THIS GROUP".into();
+        return;
+    }
+    let peer = conversation.id.clone();
+    let expiration = conversation.disappearing;
+    let Some(message) = conversation.messages.get_mut(conversation.selected_message) else {
+        app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+        return;
+    };
+    if message.system || message.send_state != SendState::Sent {
+        app.status = "THIS MESSAGE CAN'T TAKE REACTIONS".into();
+        return;
+    }
+    let remove = message
+        .reactions
+        .iter()
+        .any(|r| r.emoji == emoji && r.authors.contains(&local_id));
+    let author = message.author(&peer, &local_id).to_owned();
+    let target = message.timestamp_ms;
+    apply_reaction(message, emoji, &local_id, remove);
+    let _ = store.update_message(&peer, message);
+    let timestamp = now_ms();
+    let data_message = DataMessage {
+        timestamp: Some(timestamp),
+        reaction: Some(libsession::proto::session_protos::data_message::Reaction {
+            id: target,
+            author,
+            emoji: Some(emoji.to_owned()),
+            action: i32::from(remove),
+        }),
+        profile: profile_for(&app.profile_name, timestamp),
+        ..Default::default()
+    };
+    let task_client = Arc::clone(client);
+    tasks.push((
+        spawn_network(move || async move {
+            task_client
+                .send_data_message(&peer, data_message, expiration)
+                .await
+                .map(|_| ())
+        }),
+        "reaction",
+    ));
+    app.status = if remove {
+        format!("REACTION {emoji} REMOVED")
+    } else {
+        format!("REACTED {emoji}")
+    };
+}
+
+/// Delete disappearing messages whose timer has run out.
+fn remove_expired_messages(app: &mut App, store: &LocalStore) {
+    let now = now_ms();
+    for conversation in &mut app.conversations {
+        if !conversation
+            .messages
+            .iter()
+            .any(|m| m.expires_at.is_some_and(|at| at <= now))
+        {
+            continue;
+        }
+        let peer = conversation.id.clone();
+        conversation.messages.retain(|message| {
+            let expired = message.expires_at.is_some_and(|at| at <= now);
+            if expired {
+                let _ = store.delete_message(&peer, message);
+            }
+            !expired
+        });
+        conversation.clamp_selection();
+        conversation.refresh_preview();
     }
 }
 
@@ -3715,9 +4730,15 @@ fn start_sync(
         app.status = "SYNC ALREADY RUNNING".into();
         return;
     }
-    let (cursor, group_cursors) = match (store.get_last_hash(), store.get_group_cursors()) {
-        (Ok(hash), Ok(groups)) => (hash, groups),
-        (Err(error), _) | (_, Err(error)) => {
+    let (cursor, group_cursors, local_groups) = match (
+        store.get_last_hash(),
+        store.get_group_cursors(),
+        store.local_groups(true),
+    ) {
+        (Ok(hash), Ok(groups), Ok(local)) => {
+            (hash, groups, local.into_iter().map(|(group, _)| group).collect())
+        }
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
             app.status = format!("SYNC CURSOR ERROR · {error}");
             return;
         }
@@ -3733,7 +4754,7 @@ fn start_sync(
     *task = Some(spawn_network(move || async move {
         match tokio::time::timeout(
             Duration::from_secs(90),
-            client.retrieve_messages(cursor.as_deref(), group_cursors),
+            client.retrieve_messages(cursor.as_deref(), group_cursors, local_groups),
         )
         .await
         {
@@ -3750,12 +4771,17 @@ fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> Option<(
     let conversation = app.conversations.get_mut(app.selected)?;
     let peer = conversation.id.clone();
     let mut timestamps = Vec::new();
+    let now = now_ms();
     for message in &mut conversation.messages {
         if !message.outgoing && !message.is_read {
             message.is_read = true;
             timestamps.push(message.timestamp_ms);
             if let Err(error) = store.mark_message_read(&peer, message.timestamp_ms) {
                 app.status = format!("READ STATE SAVE FAILED · {error}");
+            }
+            if message.expiration.is_some() {
+                message.start_expiry(Some(now));
+                let _ = store.update_message(&peer, message);
             }
         }
     }
@@ -3837,7 +4863,11 @@ fn finish_sync(
     for group in result.groups.iter() {
         let index = app.ensure_contact(&group.id);
         app.conversations[index].name = group.name.clone();
+        app.conversations[index].read_only = !group.can_write;
         let _ = store.save_contact_name(&group.id, &group.name);
+    }
+    for group in &result.invite_responses {
+        let _ = store.set_group_responded(group);
     }
     debug_log(
         "sync.complete",
@@ -3860,7 +4890,7 @@ fn finish_sync(
         let _ = store.set_group_cursor(group, hash);
     }
     let mut added = 0;
-    for message in result.messages {
+    for mut message in result.messages {
         let is_new = store.mark_seen(&message.hash).unwrap_or(false);
         if !is_new || !app.seen_hashes.insert(message.hash) {
             continue;
@@ -3918,6 +4948,33 @@ fn finish_sync(
             continue;
         }
         let is_group = message.contact_id.starts_with("03");
+        if let Some(started) = message.typing {
+            if !message.outgoing
+                && let Some(conversation) =
+                    app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+            {
+                let fresh = now_ms().saturating_sub(message.timestamp_ms) < 20_000;
+                conversation.typing_until = (started && fresh)
+                    .then(|| Instant::now() + Duration::from_secs(15));
+            }
+            continue;
+        }
+        if let Some((target, target_author, emoji, remove)) = message.reaction.take() {
+            let author = message.sender_id.clone();
+            if let Some(conversation) =
+                app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+            {
+                let peer = conversation.id.clone();
+                if let Some(target_message) = conversation.messages.iter_mut().find(|m| {
+                    m.timestamp_ms == target && m.author(&peer, local_id) == target_author
+                }) {
+                    apply_reaction(target_message, &emoji, &author, remove);
+                    let _ = store.update_message(&peer, target_message);
+                    added += 1;
+                }
+            }
+            continue;
+        }
         if let Some(name) = message.sender_name.as_deref()
             && !message.outgoing
         {
@@ -3936,9 +4993,86 @@ fn finish_sync(
                 let _ = store.save_contact_name(&message.contact_id, name);
             }
         }
-        let body = message.body.unwrap_or_default();
+        if let Some(event) = message.event.take() {
+            let actor = if message.outgoing {
+                "You".to_owned()
+            } else {
+                app.sender_label(&message.sender_id)
+            };
+            let text = match event {
+                ChatEvent::Notice(text) => format!("{actor} {text}"),
+                ChatEvent::TimerChanged(setting) => {
+                    let index = app.ensure_contact(&message.contact_id);
+                    app.conversations[index].disappearing = setting;
+                    let _ = store.set_disappearing(&message.contact_id, setting);
+                    format!(
+                        "{actor} set disappearing messages to {}",
+                        Expiration::describe(setting)
+                    )
+                }
+                ChatEvent::Members { action, ids } => {
+                    let names: Vec<String> = ids.iter().map(|id| app.sender_label(id)).collect();
+                    format!("{actor} {action} {}", names.join(", "))
+                }
+                ChatEvent::Invite(group) => {
+                    if !group.id.starts_with("03") || group.id.len() != 66 {
+                        continue;
+                    }
+                    let _ = store.save_invite(&group, &message.sender_id);
+                    format!(
+                        "{actor} invited you to the group \"{}\" · type /accept to join",
+                        group.name
+                    )
+                }
+                ChatEvent::DeleteMemberContent(ids) => {
+                    if let Some(conversation) =
+                        app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+                    {
+                        let peer = conversation.id.clone();
+                        conversation.messages.retain(|m| {
+                            let remove = m.sender.as_ref().is_some_and(|sender| ids.contains(sender))
+                                || (m.outgoing && ids.iter().any(|id| id == local_id));
+                            if remove {
+                                let _ = store.delete_message(&peer, m);
+                            }
+                            !remove
+                        });
+                        conversation.clamp_selection();
+                        conversation.refresh_preview();
+                    }
+                    format!("{actor} removed messages from {} member(s)", ids.len())
+                }
+            };
+            let index = app.ensure_contact(&message.contact_id);
+            let conversation = &mut app.conversations[index];
+            if conversation
+                .messages
+                .iter()
+                .any(|m| m.system && m.body == text && m.timestamp_ms == message.timestamp_ms)
+            {
+                continue;
+            }
+            let notice = Message::system(text, message.timestamp_ms);
+            let _ = store.save_message(&message.contact_id, &notice);
+            let position = conversation
+                .messages
+                .iter()
+                .position(|m| m.timestamp_ms > notice.timestamp_ms)
+                .unwrap_or(conversation.messages.len());
+            conversation.messages.insert(position, notice);
+            conversation.clamp_selection();
+            added += 1;
+            continue;
+        }
+        let body = message.body.take().unwrap_or_default();
         if body.is_empty() && message.attachments.is_empty() {
             continue;
+        }
+        if let Some(conversation) =
+            app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+            && !message.outgoing
+        {
+            conversation.typing_until = None;
         }
         if message.outgoing
             && let Some(self_convo) = app.conversations.iter_mut().find(|c| c.id == local_id)
@@ -3967,6 +5101,10 @@ fn finish_sync(
         // main loop then marks them read and sends the read receipt.
         local_message.is_read = message.outgoing;
         local_message.sender = sender;
+        local_message.quote = message.quote.take();
+        local_message.links = std::mem::take(&mut message.links);
+        local_message.expiration = message.expiration;
+        local_message.start_expiry(None);
         local_message.image_previews = vec![None; message.attachments.len()];
         for (attachment_index, meta) in message.attachments.iter().enumerate() {
             download_queue.push_back(PendingDownload {
@@ -4312,7 +5450,28 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("   {}", title_id), Style::default().fg(MUTED)),
-        Span::styled("              SESSION ID", Style::default().fg(TEAL)),
+        Span::styled(
+            selected
+                .map(|c| {
+                    let mut tags = Vec::new();
+                    if c.typing_until.is_some_and(|until| until > Instant::now()) {
+                        tags.push("typing…".to_owned());
+                    }
+                    if let Some(setting) = c.disappearing {
+                        tags.push(format!("⏱ {}", Expiration::describe(Some(setting))));
+                    }
+                    if c.read_only {
+                        tags.push("read-only".to_owned());
+                    }
+                    if tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("   {}", tags.join(" · "))
+                    }
+                })
+                .unwrap_or_default(),
+            Style::default().fg(TEAL),
+        ),
     ]))
     .block(
         Block::default()
@@ -4335,6 +5494,19 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 " "
             };
+            if message.system {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " {marker}  ── {} · {} ──",
+                        format_time(message.timestamp_ms),
+                        message.body
+                    ),
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                )));
+                lines.push(Line::from(" "));
+                message_ranges.push((message_start, lines.len(), message_index));
+                continue;
+            }
             let (tag, color) = if message.outgoing {
                 ("YOU".to_owned(), TEAL)
             } else if let Some(sender) = message.sender.as_deref() {
@@ -4356,9 +5528,11 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 Span::styled(format_time(message.timestamp_ms), Style::default().fg(MUTED)),
             ];
             if message.outgoing {
-                let (ticks, tick_color) = match message.receipt_status {
-                    2 => (" ✓✓", TEAL),
-                    1 => (" ✓✓", MUTED),
+                let (ticks, tick_color) = match (message.send_state, message.receipt_status) {
+                    (SendState::Sending, _) => (" ⋯ sending", MUTED),
+                    (SendState::Failed, _) => (" ✗ failed · /retry", Color::Red),
+                    (_, 2) => (" ✓✓", TEAL),
+                    (_, 1) => (" ✓✓", MUTED),
                     _ => (" ✓", MUTED),
                 };
                 metadata.push(Span::styled(
@@ -4366,7 +5540,26 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     Style::default().fg(tick_color).add_modifier(Modifier::BOLD),
                 ));
             }
+            if let Some(expires_at) = message.expires_at {
+                let left = expires_at.saturating_sub(now_ms()) / 1000;
+                metadata.push(Span::styled(
+                    format!("  ⏱ {}", format_duration(left.max(1) as u32)),
+                    Style::default().fg(MUTED),
+                ));
+            } else if message.expiration.is_some() {
+                metadata.push(Span::styled("  ⏱", Style::default().fg(MUTED)));
+            }
             lines.push(Line::from(metadata));
+            if let Some(quote) = message.quote.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    ┃ ↪ {}: {}",
+                        app.sender_label(&quote.author),
+                        quote.text.lines().next().unwrap_or_default()
+                    ),
+                    Style::default().fg(MUTED),
+                )));
+            }
             let total = message.attachments.len();
             for (attachment_index, attachment) in message.attachments.iter().enumerate() {
                 let attachment_start = lines.len();
@@ -4414,6 +5607,31 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     format!("    {text_line}"),
                     Style::default().fg(TEXT),
                 )));
+            }
+            for (url, title) in &message.links {
+                lines.push(Line::from(Span::styled(
+                    match title {
+                        Some(title) if !title.is_empty() => format!("    🔗 {title} · {url}"),
+                        _ => format!("    🔗 {url}"),
+                    },
+                    Style::default().fg(BLUE),
+                )));
+            }
+            if !message.reactions.is_empty() {
+                let mut spans = vec![Span::raw("    ")];
+                for reaction in &message.reactions {
+                    let mine = reaction.authors.iter().any(|a| *a == app.local_id);
+                    spans.push(Span::styled(
+                        format!(" {} {} ", reaction.emoji, reaction.authors.len()),
+                        if mine {
+                            Style::default().fg(BG).bg(TEAL)
+                        } else {
+                            Style::default().fg(TEXT).bg(PANEL)
+                        },
+                    ));
+                    spans.push(Span::raw(" "));
+                }
+                lines.push(Line::from(spans));
             }
             lines.push(Line::from(" "));
             message_ranges.push((message_start, lines.len(), message_index));
@@ -4545,10 +5763,16 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     ]))
     .block(
         Block::default()
-            .title(if app.focus == FocusArea::Composer {
-                " COMPOSER · FOCUS · Tab to change "
-            } else {
-                " COMPOSER · Tab to focus "
+            .title(match app.reply_to.as_ref() {
+                Some(quote) => format!(
+                    " ↪ REPLYING TO {}: {} · Esc cancels ",
+                    app.sender_label(&quote.author),
+                    quote.text.chars().take(40).collect::<String>()
+                ),
+                None if app.focus == FocusArea::Composer => {
+                    " COMPOSER · FOCUS · Tab to change ".to_owned()
+                }
+                None => " COMPOSER · Tab to focus ".to_owned(),
             })
             .borders(Borders::TOP)
             .border_style(if app.focus == FocusArea::Composer {
@@ -4584,6 +5808,12 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         Line::from("Ctrl+U      Clear the composer"),
         Line::from("/name NAME Set the display name sent with your messages"),
         Line::from("/rsync     Retrieve your inbox and sync groups from this account"),
+        Line::from("r / +       (Messages focus) reply to / 👍 the selected message"),
+        Line::from("/react 😀   React to the selected message (again removes it)"),
+        Line::from("/retry      Resend the selected failed message"),
+        Line::from("/disappear off | read 12h | send 1d   Disappearing messages (1:1)"),
+        Line::from("/accept     Join the group you were invited to"),
+        Line::from("Image view  ←/→ previous/next image of the message, Esc closes"),
         Line::from("Enter       Send an end-to-end encrypted message"),
         Line::from("Backspace   Edit the message draft"),
         Line::from("/? / Esc    Open / close this panel"),
@@ -4684,5 +5914,138 @@ mod tests {
         let a = session_tui_media::attachment_blob_path(root, "05ab", 7, 0);
         let b = session_tui_media::attachment_blob_path(root, "05ab", 7, 1);
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod seed_file_tests {
+    use super::*;
+
+    #[test]
+    fn seed_file_round_trip_and_wrong_passphrase() {
+        let seed = [42u8; 32];
+        let data = encrypt_seed_file(&seed, "correct horse").unwrap();
+        assert_eq!(decrypt_seed_file(&data, "correct horse").unwrap(), seed);
+        assert!(decrypt_seed_file(&data, "wrong").is_err());
+        assert!(decrypt_seed_file(b"garbage", "x").is_err());
+    }
+
+    #[test]
+    fn durations_parse_and_format() {
+        assert_eq!(parse_duration("12h"), Some(43_200));
+        assert_eq!(parse_duration("1d"), Some(86_400));
+        assert_eq!(parse_duration("0m"), None);
+        assert_eq!(parse_duration("5"), None);
+        assert_eq!(format_duration(86_400), "1d");
+        assert_eq!(format_duration(90), "90s");
+        assert_eq!(
+            Expiration::parse("read 5m").unwrap(),
+            Some(Expiration { kind: 1, seconds: 300 })
+        );
+        assert_eq!(Expiration::parse("off").unwrap(), None);
+        assert!(Expiration::parse("later").is_err());
+    }
+
+    #[test]
+    fn reactions_toggle_per_author() {
+        let mut message = Message::new("hi".into(), 1, false);
+        apply_reaction(&mut message, "👍", "05a", false);
+        apply_reaction(&mut message, "👍", "05b", false);
+        assert_eq!(message.reactions[0].authors.len(), 2);
+        apply_reaction(&mut message, "👍", "05a", true);
+        apply_reaction(&mut message, "👍", "05b", true);
+        assert!(message.reactions.is_empty());
+    }
+
+    #[test]
+    fn content_parser_handles_session_message_types() {
+        use libsession::proto::session_protos::{
+            data_message::Reaction, DataExtractionNotification, ReceiptMessage,
+        };
+        let me = "05".to_owned() + &"11".repeat(32);
+        let peer = "05".to_owned() + &"22".repeat(32);
+        let parse = |content: Content| {
+            parse_content(&me, "h".into(), peer.clone(), peer.clone(), 1000, content)
+        };
+        // Album with caption and reply.
+        let pointer = |name: &str| AttachmentPointer {
+            id: 1,
+            content_type: Some("image/jpeg".into()),
+            file_name: Some(name.into()),
+            ..Default::default()
+        };
+        let album = parse(Content {
+            data_message: Some(DataMessage {
+                body: Some("look".into()),
+                timestamp: Some(5),
+                attachments: vec![pointer("a.jpg"), pointer("b.jpg"), pointer("c.jpg")],
+                quote: Some(DataQuote {
+                    id: 3,
+                    author: me.clone(),
+                    text: Some("earlier".into()),
+                    attachments: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            expiration_type: Some(2),
+            expiration_timer: Some(60),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(album.attachments.len(), 3);
+        assert_eq!(album.body.as_deref(), Some("look"));
+        assert_eq!(album.quote.as_ref().unwrap().id, 3);
+        assert_eq!(album.expiration, Some(Expiration { kind: 2, seconds: 60 }));
+        // Reaction.
+        let reaction = parse(Content {
+            data_message: Some(DataMessage {
+                timestamp: Some(6),
+                reaction: Some(Reaction {
+                    id: 5,
+                    author: me.clone(),
+                    emoji: Some("❤".into()),
+                    action: 0,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(reaction.reaction, Some((5, me.clone(), "❤".into(), false)));
+        // Screenshot notice and receipts.
+        let notice = parse(Content {
+            data_extraction_notification: Some(DataExtractionNotification {
+                r#type: 1,
+                timestamp: Some(7),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(notice.event, Some(ChatEvent::Notice(_))));
+        let receipt = parse(Content {
+            receipt_message: Some(ReceiptMessage {
+                r#type: 1,
+                timestamp: vec![5],
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(receipt.receipt, Some((1, vec![5])));
+        // Timer update from the peer.
+        let timer = parse(Content {
+            data_message: Some(DataMessage {
+                timestamp: Some(8),
+                flags: Some(2),
+                ..Default::default()
+            }),
+            expiration_type: Some(1),
+            expiration_timer: Some(3600),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            timer.event,
+            Some(ChatEvent::TimerChanged(Some(Expiration { kind: 1, seconds: 3600 })))
+        ));
     }
 }

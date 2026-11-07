@@ -6,17 +6,19 @@ This repository includes the Session Rust core modules used by the client, so it
 
 ## Features
 
-- Sign in with a 32-byte hex seed or a 13-word Session recovery phrase.
-- Chat with contacts and groups; poll for new messages automatically or run `/rsync`.
-- Send and receive text, images, audio files, and other files.
-- Preview received images and save attachments with `/save`.
-- Delete or unsend supported messages.
-- Store local history in an SQLCipher-encrypted database.
+- Sign in with a 32-byte hex seed or a 13-word Session recovery phrase. The seed can be saved: with DPAPI on Windows, and on Linux/macOS in a passphrase-encrypted file (Argon2id + XChaCha20-Poly1305, mode 0600). `--forget-seed` removes it.
+- Chat with contacts and groups (as admin or ordinary member); accept group invites with `/accept`. Messages are fetched automatically, or with `/rsync`.
+- Messages are sent in the background; failed ones can be resent with `/retry`.
+- Send and receive text, images, audio and other files. Several files can go in one message (`/attach a.jpg b.jpg -- caption`), and albums are shown as one message.
+- View images with `/view N` or a mouse click, and use ←/→ to step through the images in a message. Save attachments with `/save [N] [PATH]`.
+- Replies (`r` on a message), reactions (`+` or `/react EMOJI`), disappearing messages (`/disappear off | read 12h | send 1d`), typing indicators, link previews, and notices for screenshots, missed calls and group changes.
+- Delete or unsend messages, with read and delivery receipts.
+- Local history is stored in an SQLCipher-encrypted database.
 - Use `https_proxy` or `HTTPS_PROXY` for HTTPS connections.
 - Use `--debug` to write `session-tui-debug.log` in the current directory.
-- Switch focus among contacts, messages, and the composer with Tab; use arrow keys to navigate.
+- Tab switches focus among chats, messages and the composer; use the arrow keys to navigate.
 
-Delivery and read indicators depend on updates received from the Session network and the other device, so they may not appear immediately.
+Voice and video calls are not supported.
 
 ## Build
 
