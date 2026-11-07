@@ -1,6 +1,7 @@
 mod session_tui_media;
 mod session_tui_group;
 mod session_tui_input;
+mod session_tui_account;
 
 use std::time::Instant;
 use std::{
@@ -22,7 +23,7 @@ use libsession::{
     config::{
         config_base::ConfigBase,
         groups::info::GroupInfo as SharedGroupInfo,
-        user_groups::{GroupInfo as UserGroupInfo, UserGroups},
+        user_groups::GroupInfo as UserGroupInfo,
     },
     crypto::{curve25519, ed25519, random, session_encrypt},
     network::{
@@ -457,6 +458,10 @@ struct App {
     cursor: usize,
     /// Ring the terminal bell for new messages (`/bell on|off`).
     bell: bool,
+    /// Contacts blocked in the account config.
+    blocked: HashSet<String>,
+    /// Contacts already approved in the account config.
+    approved: HashSet<String>,
     /// The terminal window has focus (from focus events).
     window_focused: bool,
     /// Quick-reaction bar for the selected message is open.
@@ -492,6 +497,8 @@ impl App {
             reply_to: None,
             cursor: 0,
             bell: true,
+            blocked: HashSet::new(),
+            approved: HashSet::new(),
             window_focused: true,
             reaction_picker: false,
             show_emoji: false,
@@ -1199,6 +1206,7 @@ struct RetrieveResult {
     group_cursors: HashMap<String, String>,
     /// Joined groups we have now sent the invite acceptance to.
     invite_responses: Vec<String>,
+    account: Option<AccountSyncResult>,
 }
 
 /// One attachment waiting to be downloaded into the local cache.
@@ -1281,6 +1289,19 @@ struct SessionClient {
 }
 
 /// Result of mirroring an outgoing message to this account's own swarm.
+/// Result of one account-config sync.
+struct AccountSyncResult {
+    state: session_tui_account::AccountState,
+    user_groups: Vec<UserGroupInfo>,
+    /// New dumps for profile/contacts/read state/groups (None: keep old).
+    dumps: [Option<Vec<u8>>; 4],
+    /// Pending changes that are now stored on the swarm.
+    applied: Vec<session_tui_account::AccountChange>,
+}
+
+/// Account config messages live for 30 days and are re-pushed on change.
+const CONFIG_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 struct SyncCopy {
     sent: bool,
     /// Hash of the copy in our swarm (needed to delete it on unsend).
@@ -1343,6 +1364,7 @@ impl LocalStore {
                  CREATE TABLE IF NOT EXISTS seen_hashes (hash TEXT PRIMARY KEY);
                  CREATE TABLE IF NOT EXISTS sync_state (id INTEGER PRIMARY KEY CHECK(id = 1), last_hash TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS profiles (session_id TEXT PRIMARY KEY, display_name TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS config_dumps (slot INTEGER PRIMARY KEY, dump BLOB NOT NULL);
                  CREATE TABLE IF NOT EXISTS group_invites (
                     group_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -1586,6 +1608,54 @@ impl LocalStore {
             app.seen_hashes.insert(hash.map_err(|e| e.to_string())?);
         }
         Ok(())
+    }
+
+    /// Saved account config state: profile, contacts, read state, groups.
+    fn account_dumps(&self) -> [Option<Vec<u8>>; 4] {
+        std::array::from_fn(|slot| {
+            self.connection
+                .query_row(
+                    "SELECT dump FROM config_dumps WHERE slot = ?1",
+                    [slot as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        })
+    }
+
+    fn save_account_dump(&self, slot: usize, dump: &[u8]) -> Result<(), String> {
+        self.connection.execute(
+            "INSERT INTO config_dumps(slot, dump) VALUES (?1, ?2) ON CONFLICT(slot) DO UPDATE SET dump=excluded.dump",
+            params![slot as i64, dump],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn pending_account_changes(&self) -> Vec<session_tui_account::AccountChange> {
+        self.get_setting("account_changes")
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+
+    fn set_pending_account_changes(
+        &self,
+        changes: &[session_tui_account::AccountChange],
+    ) -> Result<(), String> {
+        self.set_setting(
+            "account_changes",
+            &serde_json::to_string(changes).map_err(|e| e.to_string())?,
+        )
+    }
+
+    /// Queue a change for the account config; it is pushed on the next sync.
+    fn queue_account_change(&self, change: session_tui_account::AccountChange) {
+        let mut pending = self.pending_account_changes();
+        session_tui_account::AccountChange::queue(&mut pending, change);
+        if let Err(error) = self.set_pending_account_changes(&pending) {
+            debug_log("account.queue_failed", &error);
+        }
     }
 
     fn get_setting(&self, key: &str) -> Option<String> {
@@ -2218,92 +2288,11 @@ impl SessionClient {
     async fn discover_groups(
         &self,
         local_groups: &[LocalGroup],
+        user_groups: Vec<UserGroupInfo>,
     ) -> Result<Vec<DiscoveredGroup>, String> {
-        let messages = self
-            .retrieve_namespace_raw(&self.identity.session_id, 5, &SwarmAuth::User)
-            .await?;
-        let mut unwrapped_messages = Vec::new();
-        let mut unwrap_failures = 0usize;
-        let mut double_wrapped = 0usize;
-        for (hash, wire) in &messages {
-            match self.unwrap_user_groups_config(wire) {
-                Ok(mut config_data) => {
-                    if let Ok(inner_config_data) = self.unwrap_user_groups_config(&config_data) {
-                        config_data = inner_config_data;
-                        double_wrapped += 1;
-                    }
-                    unwrapped_messages.push((hash.clone(), config_data));
-                }
-                Err(error) => {
-                    unwrap_failures += 1;
-                    debug_log("group.config.unwrap_failed", &error);
-                }
-            }
-        }
-        debug_log(
-            "group.config.unwrapped",
-            &format!(
-                "messages={} successful={} failed={unwrap_failures} double_wrapped={double_wrapped} payload_bytes={}",
-                messages.len(),
-                unwrapped_messages.len(),
-                unwrapped_messages
-                    .iter()
-                    .map(|(_, data)| data.len())
-                    .sum::<usize>()
-            ),
-        );
-        let mut payload_decrypted = 0usize;
-        let mut payload_bencode_dicts = 0usize;
-        let mut payload_compressed = 0usize;
-        let mut payload_multipart = 0usize;
-        let mut payload_other = 0usize;
-        let account_seed: [u8; 32] = self.identity.ed_secret[..32]
-            .try_into()
-            .map_err(|error: std::array::TryFromSliceError| error.to_string())?;
-        for (_, payload) in &unwrapped_messages {
-            if let Ok(plaintext) = libsession::config::encrypt::config_decrypt(
-                payload,
-                &account_seed,
-                "UserGroups",
-            ) {
-                payload_decrypted += 1;
-                let first_nonzero = plaintext.iter().copied().find(|byte| *byte != 0);
-                match first_nonzero {
-                    Some(b'd') => payload_bencode_dicts += 1,
-                    Some(b'z') => payload_compressed += 1,
-                    Some(b'm') => payload_multipart += 1,
-                    _ => payload_other += 1,
-                }
-            }
-        }
-        debug_log(
-            "group.config.payload_probe",
-            &format!(
-                "messages={} decrypted={} bencode_dicts={} compressed={} multipart={} other={}",
-                unwrapped_messages.len(),
-                payload_decrypted,
-                payload_bencode_dicts,
-                payload_compressed,
-                payload_multipart,
-                payload_other
-            ),
-        );
-        let mut config = ConfigBase::<UserGroups>::new(&self.identity.ed_secret, None)?;
-        let merge: Vec<(&str, &[u8])> = unwrapped_messages
-            .iter()
-            .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
-            .collect();
-        let merged_hashes = config.merge(&merge)?;
-
-        let user_groups: Vec<UserGroupInfo> = config.config_type.iter_groups().cloned().collect();
         debug_log(
             "group.user_config.parsed",
-            &format!(
-                "groups={} config_messages={} merged_messages={}",
-                user_groups.len(),
-                messages.len(),
-                merged_hashes.len()
-            ),
+            &format!("groups={}", user_groups.len()),
         );
         // Groups joined through an invite in this client are not in the
         // account's UserGroups config, so they are added from local storage.
@@ -2473,7 +2462,10 @@ impl SessionClient {
         Ok(discovered_groups)
     }
 
-    fn unwrap_user_groups_config(&self, wire: &[u8]) -> Result<Vec<u8>, String> {
+    /// Older Session clients wrapped config data in an envelope holding a
+    /// `SharedConfigMessage` (kind 1 profile, 2 contacts, 3 read state,
+    /// 4 groups); current ones store it raw.
+    fn unwrap_shared_config(&self, wire: &[u8], kind: i32) -> Result<Vec<u8>, String> {
         let ws = WebSocketMessage::decode(wire)
             .map_err(|error| format!("invalid config websocket frame: {error}"))?;
         if ws.r#type != Some(web_socket_message::Type::Request as i32) {
@@ -2500,13 +2492,188 @@ impl SessionClient {
         let shared = content
             .shared_config_message
             .ok_or_else(|| "config content has no SharedConfigMessage".to_owned())?;
-        if shared.kind != 4 {
+        if shared.kind != kind {
             return Err(format!(
-                "shared config kind mismatch: expected UserGroups (4), got {}",
+                "shared config kind mismatch: expected {kind}, got {}",
                 shared.kind
             ));
         }
         Ok(shared.data)
+    }
+
+    /// Fetch one user config namespace and merge it (raw, or legacy
+    /// envelope-wrapped). Returns whether it is safe to push to it: we
+    /// fetched it and either it is empty or we understood its contents.
+    async fn merge_config_namespace<T: libsession::config::config_base::ConfigType>(
+        &self,
+        config: &mut ConfigBase<T>,
+        namespace: i32,
+        kind: i32,
+    ) -> bool {
+        let messages = match self
+            .retrieve_namespace_raw(&self.identity.session_id, namespace, &SwarmAuth::User)
+            .await
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                debug_log(
+                    "account.fetch_failed",
+                    &format!("namespace={namespace} error={error}"),
+                );
+                return false;
+            }
+        };
+        let raw: Vec<(&str, &[u8])> = messages
+            .iter()
+            .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
+            .collect();
+        let mut good = config.merge(&raw).map(|hashes| hashes.len()).unwrap_or(0);
+        if good < messages.len() {
+            let unwrapped: Vec<(String, Vec<u8>)> = messages
+                .iter()
+                .filter_map(|(hash, wire)| {
+                    let mut data = self.unwrap_shared_config(wire, kind).ok()?;
+                    if let Ok(inner) = self.unwrap_shared_config(&data, kind) {
+                        data = inner;
+                    }
+                    Some((hash.clone(), data))
+                })
+                .collect();
+            if !unwrapped.is_empty() {
+                let refs: Vec<(&str, &[u8])> = unwrapped
+                    .iter()
+                    .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
+                    .collect();
+                good += config.merge(&refs).map(|hashes| hashes.len()).unwrap_or(0);
+            }
+        }
+        debug_log(
+            "account.merged",
+            &format!("namespace={namespace} messages={} understood={good}", messages.len()),
+        );
+        messages.is_empty() || good > 0
+    }
+
+    /// Push a dirty config to our swarm and confirm it. Returns false if the
+    /// push failed (the caller then keeps the old dump and pending changes).
+    async fn push_config_namespace<T: libsession::config::config_base::ConfigType>(
+        &self,
+        config: &mut ConfigBase<T>,
+        namespace: i32,
+    ) -> bool {
+        if !config.needs_push() {
+            return true;
+        }
+        let pushed = config.push();
+        let pubkey_ed25519 = hex::encode(self.identity.ed_public);
+        let mut last_hash = None;
+        for message in &pushed.messages {
+            let timestamp_ms = now_ms();
+            let encoded = STANDARD.encode(message);
+            let response = self
+                .network
+                .send_store(&StoreParams {
+                    pubkey: &self.identity.session_id,
+                    pubkey_ed25519: Some(&pubkey_ed25519),
+                    namespace,
+                    timestamp_ms,
+                    ttl_ms: CONFIG_TTL_MS,
+                    data_base64: &encoded,
+                    signing_key: Some(&self.identity.ed_secret),
+                })
+                .await;
+            match response {
+                Ok(response) if response.status_code == 200 => {
+                    last_hash = response
+                        .body
+                        .as_deref()
+                        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                        .as_ref()
+                        .and_then(find_message_hash);
+                }
+                Ok(response) => {
+                    debug_log(
+                        "account.push_failed",
+                        &format!("namespace={namespace} http_status={}", response.status_code),
+                    );
+                    return false;
+                }
+                Err(error) => {
+                    debug_log(
+                        "account.push_failed",
+                        &format!("namespace={namespace} error={error}"),
+                    );
+                    return false;
+                }
+            }
+        }
+        let Some(hash) = last_hash else {
+            debug_log("account.push_failed", &format!("namespace={namespace} reason=no_hash"));
+            return false;
+        };
+        config.confirm_pushed(pushed.seqno, &hash);
+        debug_log(
+            "account.pushed",
+            &format!("namespace={namespace} seqno={}", pushed.seqno),
+        );
+        if let Err(error) = self.delete_own_messages(&pushed.obsolete_hashes).await {
+            debug_log("account.obsolete_delete_failed", &error);
+        }
+        true
+    }
+
+    /// Merge the account's shared config from the swarm, apply our pending
+    /// local changes and push them.
+    async fn sync_account(
+        &self,
+        dumps: [Option<Vec<u8>>; 4],
+        changes: Vec<session_tui_account::AccountChange>,
+    ) -> Result<AccountSyncResult, String> {
+        use session_tui_account::AccountChange;
+        let mut configs = session_tui_account::AccountConfigs::new(&self.identity.ed_secret, &dumps)?;
+        let safe = [
+            self.merge_config_namespace(&mut configs.profile, 2, 1).await,
+            self.merge_config_namespace(&mut configs.contacts, 3, 2).await,
+            self.merge_config_namespace(&mut configs.convos, 4, 3).await,
+            self.merge_config_namespace(&mut configs.groups, 5, 4).await,
+        ];
+        let slot = |change: &AccountChange| match change {
+            AccountChange::ProfileName(_) => 0,
+            AccountChange::ApproveContact { .. }
+            | AccountChange::SetBlocked { .. }
+            | AccountChange::ContactExpiry { .. } => 1,
+            AccountChange::ReadUpTo { .. } => 2,
+            AccountChange::JoinGroup { .. } => 3,
+        };
+        let mut attempted = Vec::new();
+        for change in changes {
+            if safe[slot(&change)] {
+                configs.apply(&change);
+                attempted.push(change);
+            }
+        }
+        let pushed = [
+            safe[0] && self.push_config_namespace(&mut configs.profile, 2).await,
+            safe[1] && self.push_config_namespace(&mut configs.contacts, 3).await,
+            safe[2] && self.push_config_namespace(&mut configs.convos, 4).await,
+            safe[3] && self.push_config_namespace(&mut configs.groups, 5).await,
+        ];
+        let applied = attempted
+            .into_iter()
+            .filter(|change| pushed[slot(change)])
+            .collect();
+        let state = configs.state();
+        let user_groups = configs.groups.get().iter_groups().cloned().collect();
+        let all_dumps = configs.dumps();
+        // Keep the previous dump where we could not push: the change is
+        // re-applied (and re-pushed) next time.
+        let dumps = std::array::from_fn(|i| pushed[i].then(|| all_dumps[i].clone()));
+        Ok(AccountSyncResult {
+            state,
+            user_groups,
+            dumps,
+            applied,
+        })
     }
 
     async fn retrieve_group_messages(
@@ -3135,6 +3302,8 @@ impl SessionClient {
         last_hash: Option<&str>,
         group_cursors: HashMap<String, String>,
         local_groups: Vec<LocalGroup>,
+        account_dumps: [Option<Vec<u8>>; 4],
+        account_changes: Vec<session_tui_account::AccountChange>,
     ) -> Result<RetrieveResult, String> {
         debug_log(
             "retrieve.begin",
@@ -3291,7 +3460,18 @@ impl SessionClient {
             }
             incoming.push(message);
         }
-        let groups = match self.discover_groups(&local_groups).await {
+        let account = match self.sync_account(account_dumps, account_changes).await {
+            Ok(account) => Some(account),
+            Err(error) => {
+                debug_log("account.sync_failed", &error);
+                None
+            }
+        };
+        let user_groups = account
+            .as_ref()
+            .map(|account| account.user_groups.clone())
+            .unwrap_or_default();
+        let groups = match self.discover_groups(&local_groups, user_groups).await {
             Ok(groups) => groups,
             Err(error) => {
                 debug_log("group.sync.failed", &format!("error={error}"));
@@ -3361,6 +3541,7 @@ impl SessionClient {
             groups,
             group_cursors: new_group_cursors,
             invite_responses,
+            account,
         })
     }
 }
@@ -3772,6 +3953,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     app.recovery_seed = client.identity.recovery_phrase.clone();
     if let Err(error) = store.load(&mut app) {
         app.status = format!("LOCAL HISTORY ERROR · {error}");
+    }
+    // Account state from the last sync, before the network is reached.
+    if let Ok(configs) =
+        session_tui_account::AccountConfigs::new(&client.identity.ed_secret, &store.account_dumps())
+    {
+        apply_account_state(&mut app, &store, &configs.state());
     }
     let result = run(&mut terminal, &mut app, &client, &store).await;
     restore_terminal();
@@ -4488,10 +4675,16 @@ async fn run(
                 if app.input_mode == InputMode::ContactId && !app.input.starts_with('/') =>
             {
                 app.submit_contact_id();
-                if let Some(contact) = app.conversations.get(app.selected)
-                    && let Err(error) = store.save_contact(&contact.id)
+                if app.input_mode == InputMode::Message
+                    && let Some(contact) = app.conversations.get(app.selected)
                 {
-                    app.status = format!("LOCAL CONTACT ERROR · {error}");
+                    if let Err(error) = store.save_contact(&contact.id) {
+                        app.status = format!("LOCAL CONTACT ERROR · {error}");
+                    }
+                    store.queue_account_change(session_tui_account::AccountChange::ApproveContact {
+                        id: contact.id.clone(),
+                        name: None,
+                    });
                 }
             }
             KeyCode::Enter => {
@@ -4705,10 +4898,11 @@ async fn run(
                             app.status = "NAME TOO LONG · MAXIMUM 100 UTF-8 BYTES".into();
                         } else {
                             app.profile_name = rest.to_owned();
+                            store.queue_account_change(
+                                session_tui_account::AccountChange::ProfileName(rest.to_owned()),
+                            );
                             app.status = match store.save_profile_name(&app.profile_name) {
-                                Ok(()) => {
-                                    "PROFILE NAME SAVED · IT WILL SYNC WITH YOUR NEXT MESSAGE".into()
-                                }
+                                Ok(()) => "PROFILE NAME SAVED · SYNCING TO YOUR OTHER DEVICES".into(),
                                 Err(error) => format!("PROFILE SAVE FAILED · {error}"),
                             };
                         }
@@ -4734,6 +4928,33 @@ async fn run(
                         app.status = match open_selected_image(app, index) {
                             Ok(()) => "IMAGE PREVIEW · PRESS ESC TO CLOSE".into(),
                             Err(error) => format!("IMAGE PREVIEW FAILED · {error}"),
+                        };
+                    }
+                    "/block" | "/unblock" => {
+                        app.input.clear();
+                        let blocked = command == "/block";
+                        let Some(id) = app
+                            .conversations
+                            .get(app.selected)
+                            .map(|c| c.id.clone())
+                            .filter(|id| id.starts_with("05") && *id != app.local_id)
+                        else {
+                            app.status = "OPEN A 1:1 CHAT FIRST".into();
+                            continue;
+                        };
+                        if blocked {
+                            app.blocked.insert(id.clone());
+                        } else {
+                            app.blocked.remove(&id);
+                        }
+                        store.queue_account_change(session_tui_account::AccountChange::SetBlocked {
+                            id,
+                            blocked,
+                        });
+                        app.status = if blocked {
+                            "CONTACT BLOCKED · THEIR MESSAGES ARE IGNORED ON ALL YOUR DEVICES".into()
+                        } else {
+                            "CONTACT UNBLOCKED".into()
                         };
                     }
                     "/bell" => {
@@ -4831,6 +5052,10 @@ async fn run(
                         conversation.messages.push(notice);
                         conversation.selected_message = conversation.messages.len() - 1;
                         let _ = store.set_disappearing(&peer, setting);
+                        store.queue_account_change(session_tui_account::AccountChange::ContactExpiry {
+                            id: peer.clone(),
+                            expiry: setting.map(|e| (e.kind, e.seconds)),
+                        });
                         let task_client = Arc::clone(client);
                         let data_message = DataMessage {
                             timestamp: Some(timestamp),
@@ -4863,6 +5088,13 @@ async fn run(
                         match chosen {
                             Some((group, _)) => {
                                 let _ = store.set_group_joined(&group.id);
+                                store.queue_account_change(
+                                    session_tui_account::AccountChange::JoinGroup {
+                                        id: group.id.clone(),
+                                        name: group.name.clone(),
+                                        auth_data: group.auth_data.clone(),
+                                    },
+                                );
                                 let index = app.ensure_contact(&group.id);
                                 app.conversations[index].name = group.name.clone();
                                 let _ = store.save_contact_name(&group.id, &group.name);
@@ -4888,7 +5120,22 @@ async fn run(
                             app.status = "YOU CAN READ BUT NOT POST IN THIS GROUP".into();
                             continue;
                         }
+                        if app.blocked.contains(&conversation.id) {
+                            app.status = "THIS CONTACT IS BLOCKED · /unblock FIRST".into();
+                            continue;
+                        }
                         let peer = conversation.id.clone();
+                        if peer.starts_with("05") && !app.approved.contains(&peer) {
+                            // Messaging someone approves them, as in Session.
+                            app.approved.insert(peer.clone());
+                            store.queue_account_change(
+                                session_tui_account::AccountChange::ApproveContact {
+                                    id: peer.clone(),
+                                    name: (conversation.name != short_id(&peer))
+                                        .then(|| conversation.name.clone()),
+                                },
+                            );
+                        }
                         let mut message = Message::new(expand_shortcodes(&body), now_ms(), true);
                         message.send_state = SendState::Sending;
                         message.quote = app.reply_to.take();
@@ -5078,6 +5325,75 @@ fn remove_expired_messages(app: &mut App, store: &LocalStore) {
     }
 }
 
+/// Bring the local view in line with the account config shared by this
+/// account's devices.
+fn apply_account_state(
+    app: &mut App,
+    store: &LocalStore,
+    state: &session_tui_account::AccountState,
+) {
+    let pending = store.pending_account_changes();
+    if let Some(name) = state.profile_name.as_deref()
+        && !pending
+            .iter()
+            .any(|c| matches!(c, session_tui_account::AccountChange::ProfileName(_)))
+        && app.profile_name != name
+    {
+        app.profile_name = name.to_owned();
+        let _ = store.save_profile_name(name);
+    }
+    app.blocked.clear();
+    app.approved.clear();
+    for contact in &state.contacts {
+        if contact.blocked {
+            app.blocked.insert(contact.id.clone());
+        }
+        if contact.approved {
+            app.approved.insert(contact.id.clone());
+        }
+        if contact.id == app.local_id || !(contact.approved || contact.blocked) {
+            continue;
+        }
+        let index = app.ensure_contact(&contact.id);
+        let _ = store.save_contact(&contact.id);
+        let conversation = &mut app.conversations[index];
+        if let Some(name) = contact.name.as_deref()
+            && conversation.name != name
+        {
+            conversation.name = name.to_owned();
+            let _ = store.save_contact_name(&contact.id, name);
+        }
+        let expiry = contact.expiry.map(|(kind, seconds)| Expiration { kind, seconds });
+        let pending_expiry = pending.iter().any(|c| {
+            matches!(c, session_tui_account::AccountChange::ContactExpiry { id, .. } if *id == contact.id)
+        });
+        if !pending_expiry && conversation.disappearing != expiry {
+            conversation.disappearing = expiry;
+            let _ = store.set_disappearing(&contact.id, expiry);
+        }
+    }
+    // Messages read on another device.
+    let now = now_ms();
+    for (conversation_id, last_read) in &state.last_read {
+        let Some(conversation) = app.conversations.iter_mut().find(|c| c.id == *conversation_id)
+        else {
+            continue;
+        };
+        let peer = conversation.id.clone();
+        for message in &mut conversation.messages {
+            if !message.outgoing && !message.is_read && message.timestamp_ms as i64 <= *last_read {
+                message.is_read = true;
+                let _ = store.mark_message_read(&peer, message.timestamp_ms);
+                if message.expiration.is_some() {
+                    message.start_expiry(Some(now));
+                    let _ = store.update_message(&peer, message);
+                }
+            }
+        }
+    }
+    app.sort_conversations();
+}
+
 fn start_sync(
     app: &mut App,
     client: &Arc<SessionClient>,
@@ -5106,13 +5422,21 @@ fn start_sync(
         "sync.spawn",
         &format!("cursor_present={}", cursor.is_some()),
     );
+    let account_dumps = store.account_dumps();
+    let account_changes = store.pending_account_changes();
     let client = Arc::clone(client);
     // Network bootstrap keeps ThreadRng across an await, making the future
     // !Send, so it runs on a dedicated current-thread runtime.
     *task = Some(spawn_network(move || async move {
         match tokio::time::timeout(
             Duration::from_secs(90),
-            client.retrieve_messages(cursor.as_deref(), group_cursors, local_groups),
+            client.retrieve_messages(
+                cursor.as_deref(),
+                group_cursors,
+                local_groups,
+                account_dumps,
+                account_changes,
+            ),
         )
         .await
         {
@@ -5142,6 +5466,12 @@ fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> Option<(
                 let _ = store.update_message(&peer, message);
             }
         }
+    }
+    if let Some(latest) = timestamps.iter().max() {
+        store.queue_account_change(session_tui_account::AccountChange::ReadUpTo {
+            conversation: peer.clone(),
+            timestamp_ms: *latest as i64,
+        });
     }
     (!timestamps.is_empty()).then_some((peer, timestamps))
 }
@@ -5218,6 +5548,25 @@ fn finish_sync(
         }
     };
     let mut notify = 0usize;
+    let mut result = result;
+    if let Some(account) = result.account.take() {
+        for (slot, dump) in account.dumps.iter().enumerate() {
+            if let Some(dump) = dump {
+                let _ = store.save_account_dump(slot, dump);
+            }
+        }
+        if !account.applied.is_empty() {
+            // Changes queued while this sync ran stay pending.
+            let mut pending = store.pending_account_changes();
+            for applied in &account.applied {
+                if let Some(index) = pending.iter().position(|change| change == applied) {
+                    pending.remove(index);
+                }
+            }
+            let _ = store.set_pending_account_changes(&pending);
+        }
+        apply_account_state(app, store, &account.state);
+    }
     let groups_found = result.groups.len();
     for group in result.groups.iter() {
         let index = app.ensure_contact(&group.id);
@@ -5307,6 +5656,10 @@ fn finish_sync(
             continue;
         }
         let is_group = message.contact_id.starts_with("03");
+        if !message.outgoing && app.blocked.contains(&message.sender_id) && !is_group {
+            // Session drops 1:1 messages from blocked contacts.
+            continue;
+        }
         if let Some(started) = message.typing {
             if !message.outgoing
                 && let Some(conversation) =
@@ -5896,6 +6249,9 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     if c.read_only {
                         tags.push("read-only".to_owned());
                     }
+                    if app.blocked.contains(&c.id) {
+                        tags.push("blocked".to_owned());
+                    }
                     if tags.is_empty() {
                         String::new()
                     } else {
@@ -6283,13 +6639,14 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+N", "Start a chat with a Session ID"),
             ("/disappear off | read 12h | send 1d", "Disappearing messages for this 1:1 chat"),
             ("/accept", "Join the group you were invited to"),
+            ("/block · /unblock", "Block / unblock this 1:1 contact on all your devices"),
             ("/rsync", "Fetch messages now (also automatic)"),
         ],
     ),
     (
         "Settings",
         &[
-            ("/name [NAME]", "Show / set the display name sent with your messages"),
+            ("/name [NAME]", "Show / set your display name (synced to your other devices)"),
             ("/bell on|off", "Terminal bell for new messages (title shows unread count)"),
             ("--debug", "Start with a debug log (session-tui-debug.log)"),
             ("--forget-seed", "Start and delete the saved seed"),

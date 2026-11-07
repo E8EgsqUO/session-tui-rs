@@ -112,6 +112,11 @@ pub struct ConfigBase<T: ConfigType> {
 
     /// Signer callback for outgoing signatures.
     signer: Option<SignCallable>,
+
+    /// `config_type` was changed through `get_mut()` and must be written
+    /// back into the message data. Without this, re-serialising the typed
+    /// view would silently drop fields the Rust types do not model.
+    type_modified: bool,
 }
 
 impl<T: ConfigType> ConfigBase<T> {
@@ -132,6 +137,7 @@ impl<T: ConfigType> ConfigBase<T> {
             old_hashes: HashSet::new(),
             verifier: None,
             signer: None,
+            type_modified: false,
         };
 
         if let Some(dump_data) = dump {
@@ -162,6 +168,7 @@ impl<T: ConfigType> ConfigBase<T> {
             old_hashes: HashSet::new(),
             verifier: None,
             signer: None,
+            type_modified: false,
         };
 
         // Set up signature verification with the group's public key
@@ -266,11 +273,25 @@ impl<T: ConfigType> ConfigBase<T> {
     /// Marks the config as dirty, indicating local changes.
     fn mark_dirty(&mut self) {
         if self.state != ConfigState::Dirty {
+            // Like C++ `ConfigBase::dirty()`: a new local change starts a new
+            // config version (seqno + 1, current diff moved into the lagged
+            // diffs). Without this a push would reuse the seqno other clients
+            // already have and be treated as stale or conflicting.
+            self.message = self.message.increment();
             self.set_state(ConfigState::Dirty);
-            // When we go dirty, we need to increment the underlying message
-            // The C++ code creates a new MutableConfigMessage from the old config.
-            // We already have a MutableConfigMessage, so we just track that we're dirty.
         }
+    }
+
+    /// Edit the raw config data in place (only the keys the closure touches
+    /// change), then refresh the typed view from it.
+    pub fn edit_data<R>(&mut self, edit: impl FnOnce(&mut ConfigData) -> R) -> R {
+        self.sync_to_message();
+        self.mark_dirty();
+        let result = edit(self.message.data_mut());
+        let data = self.message.data().clone();
+        self.config_type = T::default();
+        self.config_type.load_from_data(&data);
+        result
     }
 
     /// Sets the config state, tracking old hashes.
@@ -288,6 +309,10 @@ impl<T: ConfigType> ConfigBase<T> {
 
     /// Applies config type changes to the message data before pushing.
     fn sync_to_message(&mut self) {
+        if !self.type_modified {
+            return;
+        }
+        self.type_modified = false;
         let mut data = self.message.data().clone();
         self.config_type.store_to_data(&mut data);
         *self.message.data_mut() = data;
@@ -562,6 +587,7 @@ impl<T: ConfigType> ConfigBase<T> {
     /// Direct mutable access to the config type. Marks the config as dirty.
     pub fn get_mut(&mut self) -> &mut T {
         self.mark_dirty();
+        self.type_modified = true;
         &mut self.config_type
     }
 }
