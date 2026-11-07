@@ -1,0 +1,81 @@
+[package]
+name = "libsession"
+version = "0.1.8"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-3.0-only"
+description = "Session messenger terminal client written in Rust, with text chat and image, audio, and file attachments; no voice or video calls"
+keywords = ["session", "messenger", "encryption", "onion-routing", "privacy"]
+categories = ["cryptography", "network-programming"]
+readme = "README.md"
+repository = "https://github.com/E8EgsqUO/session-tui-rs"
+homepage = "https://github.com/E8EgsqUO/session-tui-rs"
+documentation = "https://docs.rs/libsession"
+
+[dependencies]
+# Crypto primitives
+ed25519-dalek = { version = "2.2.0", features = ["hazmat"] }
+curve25519-dalek = { version = "4.1.3", features = ["group", "digest"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+chacha20poly1305 = "0.10.1"
+chacha20 = { version = "0.10.0", features = ["xchacha"] }
+blake2 = "0.10.6"
+blake2b_simd = "1.0.4"
+sha2 = "0.11.0"
+sha2_0_10 = { package = "sha2", version = "0.10.8" }
+rand = "0.10.0"
+zeroize = { version = "1.8.2", features = ["derive"] }
+hex = "0.4.3"
+base64 = "0.22.1"
+argon2 = "0.5.3"
+crypto_secretbox = "0.1.1"
+crypto_box = { version = "0.9.1", features = ["seal"] }
+salsa20 = "0.10.2"
+poly1305 = "0.8.0"
+aes-gcm = "0.10.3"
+aes = "0.8.4"
+cbc = { version = "0.1.2", features = ["alloc", "block-padding"] }
+hmac = "0.12.1"
+image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_bencode = "0.2.4"
+serde_json = "1.0.149"
+prost = "0.14.3"
+
+# Compression
+zstd = "0.13.3"
+
+# Networking
+tokio = { version = "1.51.1", features = ["full"] }
+quinn = "0.11.9"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider", "json"] }
+webpki-roots = "1.0"
+rustls-pemfile = "2"
+ratatui = "0.29.0"
+ratatui-image = "3.0.0"
+time = { version = "0.3", features = ["local-offset", "formatting"] }
+crossterm = "0.28.1"
+rpassword = "7.4.0"
+rusqlite = { version = "0.32.1", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# Logging / errors
+tracing = "0.1.44"
+thiserror = "2.0.18"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[build-dependencies]
+prost-build = "0.14.3"
+
+[dev-dependencies]
+proptest = "1.11.0"
+hex-literal = "1.1.0"
+tokio = { version = "1.51.1", features = ["test-util", "macros"] }
+
+[[bin]]
+name = "session-tui"
+path = "src/bin/session_tui.rs"

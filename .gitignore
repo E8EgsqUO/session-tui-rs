@@ -1,0 +1,6 @@
+/target/
+/.claude/
+/session-tui-debug.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
