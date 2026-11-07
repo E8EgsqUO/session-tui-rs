@@ -476,6 +476,8 @@ struct App {
     window_focused: bool,
     /// Quick-reaction bar for the selected message is open.
     reaction_picker: bool,
+    /// Delete choice is open; `true` when "delete for everyone" is allowed.
+    delete_prompt: Option<bool>,
     /// Emoji shortcode list is open.
     show_emoji: bool,
     help_scroll: u16,
@@ -511,6 +513,7 @@ impl App {
             approved: HashSet::new(),
             window_focused: true,
             reaction_picker: false,
+            delete_prompt: None,
             show_emoji: false,
             help_scroll: 0,
             transcript_scroll: (0, 0),
@@ -4475,6 +4478,18 @@ async fn run(
             }
             continue;
         }
+        if let Some(can_unsend) = app.delete_prompt.take() {
+            match key.code {
+                KeyCode::Char('1') => {
+                    app.status = delete_selected(app, client, store, &mut background_tasks, false);
+                }
+                KeyCode::Char('2') if can_unsend => {
+                    app.status = delete_selected(app, client, store, &mut background_tasks, true);
+                }
+                _ => app.status = "DELETE CANCELLED".into(),
+            }
+            continue;
+        }
         if app.reaction_picker {
             app.reaction_picker = false;
             if let KeyCode::Char(c @ '1'..='6') = key.code {
@@ -4643,47 +4658,22 @@ async fn run(
                 }
             }
             KeyCode::Delete if app.input.is_empty() => {
-                let Some((timestamp, outgoing)) = app
-                    .selected_message()
-                    .map(|message| (message.timestamp_ms, message.outgoing))
-                else {
+                let Some((outgoing, local_only)) = app.selected_message().map(|message| {
+                    (
+                        message.outgoing,
+                        (message.outgoing && message.send_state != SendState::Sent)
+                            || message.system,
+                    )
+                }) else {
                     app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
                     continue;
                 };
-                let peer = app.conversations[app.selected].id.clone();
-                let delivered = app
-                    .selected_message()
-                    .is_some_and(|m| m.send_state == SendState::Sent && !m.system);
-                let unsend = outgoing && delivered;
-                if unsend {
-                    // Remove now like Session does; the request goes out in
-                    // the background.
-                    let task_client = Arc::clone(client);
-                    let task_peer = peer.clone();
-                    let own_hashes = app
-                        .selected_message()
-                        .map(|m| m.swarm_hashes.clone())
-                        .unwrap_or_default();
-                    background_tasks.push((
-                        spawn_network(move || async move {
-                            task_client
-                                .unsend_message(&task_peer, timestamp, own_hashes)
-                                .await
-                        }),
-                        "unsend",
-                    ));
-                }
-                if let Some(removed) = app.remove_selected_message()
-                    && let Err(error) = store.delete_message(&peer, &removed)
-                {
-                    app.status = format!("LOCAL DELETE ERROR · {error}");
-                    continue;
-                }
-                app.status = if unsend {
-                    "MESSAGE UNSENT".into()
+                if local_only {
+                    // Never left this device: nothing to unsend.
+                    app.status = delete_selected(app, client, store, &mut background_tasks, false);
                 } else {
-                    "MESSAGE DELETED LOCALLY".into()
-                };
+                    app.delete_prompt = Some(outgoing);
+                }
             }
             KeyCode::Enter
                 if app.input_mode == InputMode::ContactId && !app.input.starts_with('/') =>
@@ -5313,6 +5303,47 @@ fn react_to_selected(
     } else {
         format!("REACTED {emoji}")
     };
+}
+
+/// Delete the selected message on this device, and for `everyone` also
+/// unsend it (our own sent messages only). Returns the status line.
+fn delete_selected(
+    app: &mut App,
+    client: &Arc<SessionClient>,
+    store: &LocalStore,
+    tasks: &mut Vec<(tokio::task::JoinHandle<Result<(), String>>, &'static str)>,
+    everyone: bool,
+) -> String {
+    let Some(peer) = app.conversations.get(app.selected).map(|c| c.id.clone()) else {
+        return "NO CHAT SELECTED".into();
+    };
+    let Some(removed) = app.remove_selected_message() else {
+        return "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+    };
+    if everyone && removed.outgoing {
+        // Removed here at once, like Session; the unsend request (to the
+        // chat and to our other devices) goes out in the background.
+        let task_client = Arc::clone(client);
+        let timestamp = removed.timestamp_ms;
+        let own_hashes = removed.swarm_hashes.clone();
+        let task_peer = peer.clone();
+        tasks.push((
+            spawn_network(move || async move {
+                task_client
+                    .unsend_message(&task_peer, timestamp, own_hashes)
+                    .await
+            }),
+            "unsend",
+        ));
+    }
+    if let Err(error) = store.delete_message(&peer, &removed) {
+        return format!("LOCAL DELETE ERROR · {error}");
+    }
+    if everyone {
+        "MESSAGE DELETED FOR EVERYONE".into()
+    } else {
+        "MESSAGE DELETED ON THIS DEVICE".into()
+    }
 }
 
 /// Delete disappearing messages whose timer has run out.
@@ -6025,6 +6056,31 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     if app.show_help {
         draw_help(frame, area, app.help_scroll);
     }
+    if let Some(can_unsend) = app.delete_prompt {
+        let text = if can_unsend {
+            "  1 Delete on this device only    2 Delete for everyone    Esc cancel"
+        } else {
+            "  1 Delete on this device only    Esc cancel"
+        };
+        let width = (text.chars().count() as u16 + 4).min(area.width);
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(6),
+            width,
+            height: 3.min(area.height),
+        };
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(TEXT)))).block(
+                Block::default()
+                    .title(" Delete message ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .style(Style::default().bg(PANEL)),
+            ),
+            popup,
+        );
+    }
     if app.reaction_picker {
         let width = 46.min(area.width);
         let popup = Rect {
@@ -6581,6 +6637,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         && !app.show_help
         && !app.show_emoji
         && !app.reaction_picker
+        && app.delete_prompt.is_none()
         && app.recovery_seed.is_none()
     {
         frame.set_cursor_position((
@@ -6644,7 +6701,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("e  then 1-6", "Reaction bar: 😂 🥰 😢 😡 😮 😈"),
             ("+", "React 👍"),
             ("/react EMOJI", "React with any emoji or :shortcode: (again removes it)"),
-            ("Delete", "Delete; your own messages are unsent for everyone"),
+            ("Delete", "Delete: 1 on this device only · 2 for everyone (your messages)"),
             ("/retry", "Resend the selected failed message"),
             ("✓ / ✓✓ / teal ✓✓", "Sent / delivered / read"),
         ],
@@ -7059,5 +7116,37 @@ mod note_to_self_tests {
         let other = app.ensure_contact(&peer);
         assert_eq!(app.conversations[own].title(&me), "Note to Self");
         assert_eq!(app.conversations[other].title(&me), short_id(&peer));
+    }
+}
+
+#[cfg(test)]
+mod delete_prompt_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn screen(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn prompt_offers_everyone_only_for_own_messages() {
+        let me = "05".to_owned() + &"11".repeat(32);
+        let mut app = App::new(me);
+        app.delete_prompt = Some(true);
+        let own = screen(&mut app);
+        assert!(own.contains("Delete for everyone"));
+        assert!(own.contains("Delete on this device only"));
+        app.delete_prompt = Some(false);
+        let theirs = screen(&mut app);
+        assert!(!theirs.contains("Delete for everyone"));
+        assert!(theirs.contains("Delete on this device only"));
     }
 }
