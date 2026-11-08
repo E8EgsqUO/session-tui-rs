@@ -24,6 +24,10 @@ pub enum AccountChange {
     /// message someone) and record their display name.
     ApproveContact { id: String, name: Option<String> },
     SetBlocked { id: String, blocked: bool },
+    /// Chat deleted: hide it on all devices (priority -1, as Session does).
+    HideContact { id: String },
+    /// Contact deleted from the account.
+    RemoveContact { id: String },
     /// Disappearing setting for a 1:1 chat: (`Content` kind 1 = after read,
     /// 2 = after send, seconds) or `None` for off.
     ContactExpiry { id: String, expiry: Option<(i32, u32)> },
@@ -42,7 +46,19 @@ impl AccountChange {
             (SetBlocked { id: a, .. }, SetBlocked { id: b, .. })
             | (ContactExpiry { id: a, .. }, ContactExpiry { id: b, .. })
             | (JoinGroup { id: a, .. }, JoinGroup { id: b, .. }) => a != b,
-            (ApproveContact { id: a, .. }, ApproveContact { id: b, .. }) => a != b,
+            (ApproveContact { id: a, .. }, ApproveContact { id: b, .. })
+            | (HideContact { id: a }, HideContact { id: b })
+            | (HideContact { id: a }, ApproveContact { id: b, .. })
+            | (ApproveContact { id: a, .. }, HideContact { id: b }) => a != b,
+            // Removing a contact makes earlier changes to it pointless.
+            (
+                ApproveContact { id: a, .. }
+                | HideContact { id: a }
+                | SetBlocked { id: a, .. }
+                | ContactExpiry { id: a, .. }
+                | RemoveContact { id: a },
+                RemoveContact { id: b },
+            ) => a != b,
             (ReadUpTo { conversation: a, timestamp_ms: old_ts }, ReadUpTo { conversation: b, timestamp_ms: new_ts }) => {
                 a != b || old_ts > new_ts
             }
@@ -74,6 +90,8 @@ pub struct ContactState {
     /// Nickname if set, else the contact's own display name.
     pub name: Option<String>,
     pub approved: bool,
+    /// The chat was deleted (priority -1); the contact stays.
+    pub hidden: bool,
     pub blocked: bool,
     /// Same encoding as [`AccountChange::ContactExpiry`].
     pub expiry: Option<(i32, u32)>,
@@ -190,12 +208,17 @@ impl AccountConfigs {
                 };
                 let approved = current.as_ref().is_some_and(|e| get_int(e, b"a") != 0);
                 let has_name = current.as_ref().and_then(|e| get_str(e, b"n")).is_some();
-                if approved && (has_name || name.is_none()) {
+                let hidden = current.as_ref().is_some_and(|e| get_int(e, b"+") < 0);
+                if approved && !hidden && (has_name || name.is_none()) {
                     return false;
                 }
                 self.contacts.edit_data(|data| {
                     let entry = dict(dict(data, b"c"), &key);
                     entry.insert(b"a".to_vec(), ConfigValue::Integer(1));
+                    // Talking to a hidden (deleted) chat shows it again.
+                    if get_int(entry, b"+") < 0 {
+                        entry.remove(b"+".as_slice());
+                    }
                     if get_int(entry, b"j") == 0 {
                         entry.insert(b"j".to_vec(), ConfigValue::Integer(now_seconds()));
                     }
@@ -219,6 +242,36 @@ impl AccountConfigs {
                     entry
                         .entry(b"n".to_vec())
                         .or_insert_with(|| ConfigValue::String(Vec::new()));
+                });
+                true
+            }
+            AccountChange::HideContact { id } => {
+                let Some(key) = id_key(id) else { return false };
+                let exists = matches!(
+                    self.contacts.data().get(b"c".as_slice()),
+                    Some(ConfigValue::Dict(c)) if matches!(
+                        c.get(&key), Some(ConfigValue::Dict(e)) if get_int(e, b"+") >= 0
+                    )
+                );
+                if !exists {
+                    return false;
+                }
+                self.contacts.edit_data(|data| {
+                    set_int(dict(dict(data, b"c"), &key), b"+", -1);
+                });
+                true
+            }
+            AccountChange::RemoveContact { id } => {
+                let Some(key) = id_key(id) else { return false };
+                let exists = matches!(
+                    self.contacts.data().get(b"c".as_slice()),
+                    Some(ConfigValue::Dict(c)) if c.contains_key(&key)
+                );
+                if !exists {
+                    return false;
+                }
+                self.contacts.edit_data(|data| {
+                    dict(data, b"c").remove(&key);
                 });
                 true
             }
@@ -314,6 +367,7 @@ impl AccountConfigs {
                     id: hex::encode(key),
                     name,
                     approved: get_int(entry, b"a") != 0,
+                    hidden: get_int(entry, b"+") < 0,
                     blocked: get_int(entry, b"b") != 0,
                     expiry,
                 });

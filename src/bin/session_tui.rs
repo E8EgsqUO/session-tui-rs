@@ -319,7 +319,7 @@ const QUICK_REACTIONS: [&str; 6] = ["😂", "🥰", "😢", "😡", "😮", "�
 /// `:name:` shortcodes expanded in messages and `/react`.
 const EMOJI_SHORTCODES: &[(&str, &str)] = &[
     ("+1", "👍"), ("thumbsup", "👍"), ("-1", "👎"), ("thumbsdown", "👎"),
-    ("joy", "😂"), ("rofl", "🤣"), ("smile", "😄"), ("grin", "😁"),
+    ("joy", "😂"), ("haha", "😂"), ("lol", "😂"), ("xd", "😆"), ("rofl", "🤣"), ("smile", "😄"), ("grin", "😁"),
     ("laughing", "😆"), ("sweat_smile", "😅"), ("wink", "😉"), ("blush", "😊"),
     ("love", "🥰"), ("heart_eyes", "😍"), ("kiss", "😘"), ("thinking", "🤔"),
     ("neutral", "😐"), ("cry", "😢"), ("sob", "😭"), ("angry", "😠"),
@@ -372,6 +372,11 @@ const MAX_ATTACHMENTS: usize = 32;
 
 /// Upper bound on `more` pages fetched per namespace in one sync.
 const MAX_RETRIEVE_PAGES: usize = 20;
+
+const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
+const MIN_SIDEBAR_WIDTH: u16 = 20;
+/// Narrowest the chat window may get when the chat list is widened.
+const MIN_CHAT_WIDTH: u16 = 30;
 
 struct Conversation {
     name: String,
@@ -430,6 +435,14 @@ impl Conversation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChatAction {
+    /// `/delete`: the chat and its messages.
+    Delete,
+    /// `/remove`: the contact, and its chat.
+    Remove,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Message,
@@ -478,6 +491,8 @@ struct App {
     reaction_picker: bool,
     /// Delete choice is open; `true` when "delete for everyone" is allowed.
     delete_prompt: Option<bool>,
+    /// `/delete` or `/remove` waiting for confirmation, for this chat ID.
+    chat_prompt: Option<(ChatAction, String)>,
     /// Emoji shortcode list is open.
     show_emoji: bool,
     help_scroll: u16,
@@ -485,6 +500,23 @@ struct App {
     transcript_scroll: (usize, usize),
     transcript_conversation: usize,
     local_id: String,
+    /// Width of the chat list column, changed by dragging its right border.
+    sidebar_width: u16,
+    /// Column of the chat list's right border and the rows it spans.
+    divider: Option<Rect>,
+    /// The divider is being dragged with the mouse.
+    dragging_divider: bool,
+    /// Last left click (time, column, row), to detect double-clicks.
+    last_click: Option<(Instant, u16, u16)>,
+    /// Row count of each message in the open chat, by layout key.
+    layout_heights: (String, HashMap<u64, usize>),
+    /// `/exit` was refused once because a message was still sending.
+    exit_warned: bool,
+    /// Text waiting to be put on the system clipboard.
+    clipboard: Option<String>,
+    /// Top header (shows our own ID) and the chat's title bar.
+    header_area: Option<Rect>,
+    chat_title_area: Option<Rect>,
 }
 
 impl App {
@@ -514,11 +546,21 @@ impl App {
             window_focused: true,
             reaction_picker: false,
             delete_prompt: None,
+            chat_prompt: None,
             show_emoji: false,
             help_scroll: 0,
             transcript_scroll: (0, 0),
             transcript_conversation: usize::MAX,
             local_id,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            divider: None,
+            dragging_divider: false,
+            last_click: None,
+            clipboard: None,
+            exit_warned: false,
+            layout_heights: (String::new(), HashMap::new()),
+            header_area: None,
+            chat_title_area: None,
         }
     }
 
@@ -528,11 +570,30 @@ impl App {
         let selected_id = self.conversations.get(self.selected).map(|c| c.id.clone());
         self.conversations
             .sort_by_key(|c| std::cmp::Reverse(c.last_activity()));
+        // Message requests go below the regular chats, as their own section.
+        let requests: HashSet<String> = self
+            .conversations
+            .iter()
+            .filter(|c| self.is_request(c))
+            .map(|c| c.id.clone())
+            .collect();
+        self.conversations
+            .sort_by_key(|c| requests.contains(&c.id));
         if let Some(id) = selected_id
             && let Some(index) = self.conversations.iter().position(|c| c.id == id)
         {
             self.selected = index;
         }
+    }
+
+    /// A 1:1 chat started by someone we haven't approved: a message request.
+    /// We approve by replying or with `/accept`.
+    fn is_request(&self, conversation: &Conversation) -> bool {
+        conversation.id.starts_with("05")
+            && conversation.id != self.local_id
+            && !self.approved.contains(&conversation.id)
+            && !conversation.messages.is_empty()
+            && !conversation.messages.iter().any(|m| m.outgoing)
     }
 
     fn sender_label(&self, sender: &str) -> String {
@@ -698,11 +759,137 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
     Ok(())
 }
 
+/// Put `text` on the clipboard: OSC 52 for terminals that support it
+/// (Windows Terminal, most others, also over SSH), plus the desktop's own
+/// clipboard tool where there is one (VTE terminals ignore OSC 52).
+fn copy_to_clipboard(out: &mut impl Write, text: &str) {
+    let _ = write!(out, "\x1b]52;c;{}\x07", STANDARD.encode(text));
+    let _ = out.flush();
+    #[cfg(unix)]
+    {
+        use std::process::{Command, Stdio};
+        let tools: &[&[&str]] = if cfg!(target_os = "macos") {
+            &[&["pbcopy"]]
+        } else {
+            &[
+                &["wl-copy"],
+                &["xclip", "-selection", "clipboard"],
+                &["xsel", "--clipboard", "--input"],
+            ]
+        };
+        for tool in tools {
+            if tool[0] == "wl-copy" && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                continue;
+            }
+            if tool[0] != "wl-copy"
+                && tool[0] != "pbcopy"
+                && std::env::var_os("DISPLAY").is_none()
+            {
+                continue;
+            }
+            let Ok(mut child) = Command::new(tool[0])
+                .args(&tool[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            // xclip/xsel stay alive to serve the selection; reap in the background.
+            std::thread::spawn(move || child.wait());
+            break;
+        }
+    }
+}
+
 fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     if app.image_viewer.is_some() {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             app.image_viewer = None;
         }
+        return;
+    }
+    let double_click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && {
+        let now = Instant::now();
+        let double = app.last_click.is_some_and(|(at, column, row)| {
+            now.duration_since(at) < Duration::from_millis(500)
+                && column.abs_diff(mouse.column) <= 1
+                && row == mouse.row
+        });
+        app.last_click = (!double).then_some((now, mouse.column, mouse.row));
+        double
+    };
+    if let Some(seed) = app.recovery_seed.as_ref() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.clipboard = Some(seed.clone());
+            app.status = "RECOVERY PHRASE COPIED".into();
+        }
+        return;
+    }
+    let hit = |rect: Option<Rect>| {
+        rect.is_some_and(|r| {
+            mouse.column >= r.x
+                && mouse.column < r.right()
+                && mouse.row >= r.y
+                && mouse.row < r.bottom()
+        })
+    };
+    if double_click && hit(app.header_area) {
+        app.clipboard = Some(app.local_id.clone());
+        app.status = "YOUR SESSION ID COPIED".into();
+        return;
+    }
+    if double_click && hit(app.chat_title_area) {
+        if let Some(conversation) = app.conversations.get(app.selected) {
+            app.clipboard = Some(conversation.id.clone());
+            app.status = "SESSION ID COPIED".into();
+        }
+        return;
+    }
+    if double_click && hit(app.message_viewport) {
+        let text = app
+            .message_hitboxes
+            .iter()
+            .find(|(start, end, _, attachment)| {
+                attachment.is_none() && mouse.row >= *start && mouse.row <= *end
+            })
+            .and_then(|(_, _, index, _)| {
+                app.conversations.get(app.selected)?.messages.get(*index)
+            })
+            .map(|message| message.body.clone())
+            .filter(|body| !body.is_empty());
+        if let Some(text) = text {
+            app.clipboard = Some(text);
+            app.status = "MESSAGE COPIED".into();
+            return;
+        }
+    }
+    if app.dragging_divider {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(divider) = app.divider {
+                    // The border is the list's last column.
+                    let left = divider.x + 1 - app.sidebar_width;
+                    app.sidebar_width = mouse.column.saturating_sub(left) + 1;
+                }
+            }
+            MouseEventKind::Up(_) => app.dragging_divider = false,
+            _ => {}
+        }
+        return;
+    }
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && app.divider.is_some_and(|d| {
+            mouse.column.abs_diff(d.x) <= 1
+                && mouse.row >= d.y
+                && mouse.row < d.y.saturating_add(d.height)
+        })
+    {
+        app.dragging_divider = true;
         return;
     }
     let in_rect = |rect: Rect| {
@@ -1512,7 +1699,10 @@ impl LocalStore {
             let mut message = Message::new(String::new(), timestamp_ms, outgoing);
             message.receipt_status = receipt_status;
             message.is_read = is_read;
+            // Rewrite rows still using the old, bulky thumbnail format.
+            let mut needs_resave = false;
             if let Some(json) = stored.strip_prefix(STORED_MESSAGE_PREFIX) {
+                needs_resave |= json.contains("{\"rows\":");
                 let payload: StoredMessage =
                     serde_json::from_str(json).map_err(|e| e.to_string())?;
                 message.body = payload.body;
@@ -1543,9 +1733,7 @@ impl LocalStore {
                 *preview = session_tui_media::shrink_preview(std::mem::take(preview));
                 shrunk |= preview.rows.len() != before;
             }
-            if shrunk {
-                resave.push((peer.clone(), message.clone()));
-            }
+            needs_resave |= shrunk;
             // Rebuild missing previews from cached image blobs.
             for (index, meta) in message.attachments.iter().enumerate() {
                 if message.image_previews[index].is_some()
@@ -1556,7 +1744,10 @@ impl LocalStore {
                 let Some(root) = root.as_deref() else { break };
                 let path =
                     session_tui_media::attachment_blob_path(root, &peer, timestamp_ms, index);
-                message.image_previews[index] = std::fs::read(path).ok().and_then(|blob| {
+                let Ok(blob) = std::fs::read(path) else { continue };
+                // Saved, so this decrypt + decode happens once, not every start.
+                // An image that can't be decoded gets an empty preview.
+                message.image_previews[index] = Some(
                     session_tui_media::decrypt_attachment(
                         &blob,
                         &meta.key,
@@ -1565,7 +1756,12 @@ impl LocalStore {
                     )
                     .ok()
                     .and_then(|plaintext| session_tui_media::image_preview(&plaintext))
-                });
+                    .unwrap_or_default(),
+                );
+                needs_resave = true;
+            }
+            if needs_resave {
+                resave.push((peer.clone(), message.clone()));
             }
             let index = app.ensure_contact(&peer);
             let convo = &mut app.conversations[index];
@@ -1575,9 +1771,12 @@ impl LocalStore {
         }
         drop(statement);
 
+        // One transaction: a first start after an upgrade may rewrite many rows.
+        let _ = self.connection.execute_batch("BEGIN");
         for (peer, message) in &resave {
             let _ = self.update_message(peer, message);
         }
+        let _ = self.connection.execute_batch("COMMIT");
         let mut statement = self
             .connection
             .prepare("SELECT session_id, display_name FROM profiles")
@@ -1611,6 +1810,12 @@ impl LocalStore {
         }
         drop(statement);
         app.bell = self.get_setting("bell").as_deref() != Some("off");
+        if let Some(width) = self
+            .get_setting("sidebar_width")
+            .and_then(|w| w.parse().ok())
+        {
+            app.sidebar_width = width;
+        }
         app.sort_conversations();
         app.selected = 0;
 
@@ -2658,7 +2863,9 @@ impl SessionClient {
             AccountChange::ProfileName(_) => 0,
             AccountChange::ApproveContact { .. }
             | AccountChange::SetBlocked { .. }
-            | AccountChange::ContactExpiry { .. } => 1,
+            | AccountChange::ContactExpiry { .. }
+            | AccountChange::HideContact { .. }
+            | AccountChange::RemoveContact { .. } => 1,
             AccountChange::ReadUpTo { .. } => 2,
             AccountChange::JoinGroup { .. } => 3,
         };
@@ -3321,6 +3528,7 @@ impl SessionClient {
         local_groups: Vec<LocalGroup>,
         account_dumps: [Option<Vec<u8>>; 4],
         account_changes: Vec<session_tui_account::AccountChange>,
+        known_senders: HashSet<String>,
     ) -> Result<RetrieveResult, String> {
         debug_log(
             "retrieve.begin",
@@ -3469,7 +3677,12 @@ impl SessionClient {
                 ),
             );
             // Session acknowledges visible messages with a delivery receipt.
-            if !message.outgoing && message.body.is_some() {
+            // Strangers (message requests) get none, so they can't tell the
+            // account is online.
+            if !message.outgoing
+                && message.body.is_some()
+                && known_senders.contains(&sender_id)
+            {
                 delivery_receipts
                     .entry(sender_id)
                     .or_default()
@@ -3931,10 +4144,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = LOCAL_OFFSET.set(
         time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC),
     );
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    let result = runtime.block_on(async_main());
+    // Dropping the runtime would wait for network work still running on
+    // blocking threads (a sync can take up to 90 s). Local state is already
+    // saved, so don't wait for it.
+    runtime.shutdown_timeout(Duration::from_millis(300));
+    result
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
@@ -3986,19 +4204,56 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 type SyncTask = tokio::task::JoinHandle<Result<RetrieveResult, String>>;
 type DownloadTask = tokio::task::JoinHandle<Result<DownloadedAttachment, (PendingDownload, String)>>;
 
-/// Run a !Send network future on its own current-thread runtime.
+type NetworkJob =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> + Send>;
+
+/// The network thread: one long-lived current-thread runtime that runs all
+/// network work, so HTTPS connections stay pooled between syncs instead of
+/// being re-established (TLS handshakes) every few seconds.
+fn network_jobs() -> &'static tokio::sync::mpsc::UnboundedSender<NetworkJob> {
+    static JOBS: OnceLock<tokio::sync::mpsc::UnboundedSender<NetworkJob>> = OnceLock::new();
+    JOBS.get_or_init(|| {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkJob>();
+        std::thread::Builder::new()
+            .name("network".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("network runtime");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&runtime, async move {
+                    while let Some(job) = receiver.recv().await {
+                        tokio::task::spawn_local(job());
+                    }
+                });
+            })
+            .expect("network thread");
+        sender
+    })
+}
+
+/// Run a !Send network future on the network thread.
 fn spawn_network<T, F, Fut>(f: F) -> tokio::task::JoinHandle<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<T, String>>,
+    Fut: std::future::Future<Output = Result<T, String>> + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| "could not start network runtime".to_string())?;
-        runtime.block_on(f())
+    let (done, result) = tokio::sync::oneshot::channel();
+    let job: NetworkJob = Box::new(move || {
+        Box::pin(async move {
+            let _ = done.send(f().await);
+        })
+    });
+    let queued = network_jobs().send(job).is_ok();
+    tokio::spawn(async move {
+        if !queued {
+            return Err("network thread stopped".to_owned());
+        }
+        result
+            .await
+            .unwrap_or_else(|_| Err("network task failed".to_owned()))
     })
 }
 
@@ -4082,6 +4337,9 @@ fn enqueue_missing_downloads(
         return;
     };
     for conversation in &app.conversations {
+        if app.is_request(conversation) {
+            continue;
+        }
         for message in &conversation.messages {
             for (index, meta) in message.attachments.iter().enumerate() {
                 if meta.url.is_empty() {
@@ -4203,6 +4461,7 @@ async fn run(
     let mut last_typing: Option<(String, Instant)> = None;
     let mut last_expiry_sweep = Instant::now();
     let mut last_title_unread: Option<usize> = None;
+    let mut redraw = true;
     let mut last_draw = Instant::now();
     loop {
         // Finished text sends.
@@ -4284,7 +4543,16 @@ async fn run(
         if download_task.is_none()
             && let Some(job) = download_queue.pop_front()
         {
-            download_task = Some(start_download(client, job));
+            // Files from strangers are fetched (and images decoded) only
+            // once the request is accepted; /accept queues them again.
+            let from_request = app
+                .conversations
+                .iter()
+                .find(|c| c.id == job.peer)
+                .is_some_and(|c| app.is_request(c));
+            if !from_request {
+                download_task = Some(start_download(client, job));
+            }
         }
         if attachment_task
             .as_ref()
@@ -4405,13 +4673,20 @@ async fn run(
         }
         // Coalesce bursts of input (e.g. mouse-wheel spins): redraw once the
         // queue is empty, but at least every 50 ms.
-        if !event::poll(Duration::ZERO)? || last_draw.elapsed() >= Duration::from_millis(50) {
+        // Idle, only redraw once a second (results of background work, the
+        // typing indicator, expiry); input redraws right away. Each draw
+        // lays out the whole open chat, so this is most of the idle CPU.
+        if (redraw || last_draw.elapsed() >= Duration::from_secs(1))
+            && (!event::poll(Duration::ZERO)? || last_draw.elapsed() >= Duration::from_millis(50))
+        {
             terminal.draw(|frame| draw(frame, app))?;
             last_draw = Instant::now();
+            redraw = false;
         }
-        if !event::poll(Duration::from_millis(150))? {
+        if !event::poll(Duration::from_millis(250))? {
             continue;
         }
+        redraw = true;
         let key = match event::read()? {
             Event::FocusGained => {
                 app.window_focused = true;
@@ -4422,7 +4697,14 @@ async fn run(
                 continue;
             }
             Event::Mouse(mouse) => {
+                let was_dragging = app.dragging_divider;
                 handle_mouse(app, mouse);
+                if let Some(text) = app.clipboard.take() {
+                    copy_to_clipboard(terminal.backend_mut(), &text);
+                }
+                if was_dragging && !app.dragging_divider {
+                    let _ = store.set_setting("sidebar_width", &app.sidebar_width.to_string());
+                }
                 continue;
             }
             Event::Paste(text) if app.image_viewer.is_none() && app.recovery_seed.is_none() => {
@@ -4472,10 +4754,22 @@ async fn run(
             }
             continue;
         }
-        if app.recovery_seed.is_some() {
+        if let Some(seed) = app.recovery_seed.as_ref() {
+            if matches!(key.code, KeyCode::Char('c' | 'C')) {
+                copy_to_clipboard(terminal.backend_mut(), seed);
+                app.status = "RECOVERY PHRASE COPIED".into();
+            }
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 app.recovery_seed = None;
             }
+            continue;
+        }
+        if let Some((action, id)) = app.chat_prompt.take() {
+            app.status = if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                delete_chat(app, store, action, &id)
+            } else {
+                "CANCELLED".into()
+            };
             continue;
         }
         if let Some(can_unsend) = app.delete_prompt.take() {
@@ -4911,7 +5205,22 @@ async fn run(
                             };
                         }
                     }
-                    "/exit" if rest.is_empty() => return Ok(()),
+                    "/exit" if rest.is_empty() => {
+                        // Quitting no longer waits for network work, so
+                        // don't silently drop a message that is still going out.
+                        let sending = app
+                            .conversations
+                            .iter()
+                            .flat_map(|c| &c.messages)
+                            .any(|m| m.send_state == SendState::Sending);
+                        if sending && !app.exit_warned {
+                            app.input.clear();
+                            app.exit_warned = true;
+                            app.status = "STILL SENDING · /exit AGAIN TO QUIT ANYWAY".into();
+                            continue;
+                        }
+                        return Ok(());
+                    }
                     "/rsync" if rest.is_empty() => {
                         app.input.clear();
                         last_sync = Instant::now();
@@ -4960,6 +5269,26 @@ async fn run(
                         } else {
                             "CONTACT UNBLOCKED".into()
                         };
+                    }
+                    "/delete" | "/remove" => {
+                        app.input.clear();
+                        let action = if command == "/delete" {
+                            ChatAction::Delete
+                        } else {
+                            ChatAction::Remove
+                        };
+                        let Some(id) = app.conversations.get(app.selected).map(|c| c.id.clone())
+                        else {
+                            app.status = "NO CHAT SELECTED".into();
+                            continue;
+                        };
+                        if action == ChatAction::Remove
+                            && (!id.starts_with("05") || id == app.local_id)
+                        {
+                            app.status = "/remove IS FOR 1:1 CONTACTS · USE /delete".into();
+                            continue;
+                        }
+                        app.chat_prompt = Some((action, id));
                     }
                     "/bell" => {
                         app.input.clear();
@@ -5079,6 +5408,40 @@ async fn run(
                             "DISAPPEARING MESSAGES · {}",
                             Expiration::describe(setting)
                         );
+                    }
+                    "/accept" | "/decline"
+                        if app
+                            .conversations
+                            .get(app.selected)
+                            .is_some_and(|c| app.is_request(c)) =>
+                    {
+                        app.input.clear();
+                        let conversation = &app.conversations[app.selected];
+                        let peer = conversation.id.clone();
+                        if command == "/accept" {
+                            app.approved.insert(peer.clone());
+                            store.queue_account_change(
+                                session_tui_account::AccountChange::ApproveContact {
+                                    id: peer,
+                                    name: (conversation.name != short_id(&conversation.id))
+                                        .then(|| conversation.name.clone()),
+                                },
+                            );
+                            app.sort_conversations();
+                            enqueue_missing_downloads(app, &mut download_queue);
+                            app.status = "REQUEST ACCEPTED".into();
+                        } else {
+                            let removed = app.conversations.remove(app.selected);
+                            for message in &removed.messages {
+                                let _ = store.delete_message(&peer, message);
+                            }
+                            let _ = store.delete_empty_contact(&peer);
+                            app.selected = app
+                                .selected
+                                .min(app.conversations.len().saturating_sub(1));
+                            app.status =
+                                "REQUEST DECLINED · /block STOPS THEM WRITING AGAIN".into();
+                        }
                     }
                     "/accept" => {
                         app.input.clear();
@@ -5399,6 +5762,18 @@ fn apply_account_state(
         if contact.id == app.local_id || !(contact.approved || contact.blocked) {
             continue;
         }
+        // Chat deleted (here or on another device): drop it unless new
+        // messages arrived since.
+        if contact.hidden {
+            if let Some(index) = app.conversations.iter().position(|c| c.id == contact.id)
+                && app.conversations[index].messages.is_empty()
+            {
+                app.conversations.remove(index);
+                app.selected = app.selected.min(app.conversations.len().saturating_sub(1));
+                let _ = store.delete_empty_contact(&contact.id);
+            }
+            continue;
+        }
         let index = app.ensure_contact(&contact.id);
         let _ = store.save_contact(&contact.id);
         let conversation = &mut app.conversations[index];
@@ -5469,6 +5844,17 @@ fn start_sync(
     );
     let account_dumps = store.account_dumps();
     let account_changes = store.pending_account_changes();
+    let known_senders: HashSet<String> = app
+        .approved
+        .iter()
+        .cloned()
+        .chain(
+            app.conversations
+                .iter()
+                .filter(|c| c.messages.iter().any(|m| m.outgoing))
+                .map(|c| c.id.clone()),
+        )
+        .collect();
     let client = Arc::clone(client);
     // Network bootstrap keeps ThreadRng across an await, making the future
     // !Send, so it runs on a dedicated current-thread runtime.
@@ -5481,6 +5867,7 @@ fn start_sync(
                 local_groups,
                 account_dumps,
                 account_changes,
+                known_senders,
             ),
         )
         .await
@@ -5494,7 +5881,44 @@ fn start_sync(
     }));
 }
 
+/// Carry out a confirmed `/delete` or `/remove`; returns the status line.
+fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) -> String {
+    let Some(index) = app.conversations.iter().position(|c| c.id == id) else {
+        return "CHAT NOT FOUND".into();
+    };
+    let removed = app.conversations.remove(index);
+    for message in &removed.messages {
+        let _ = store.delete_message(id, message);
+    }
+    let _ = store.delete_empty_contact(id);
+    if app.selected > index || app.selected >= app.conversations.len() {
+        app.selected = app.selected.saturating_sub(1);
+    }
+    let one_to_one = id.starts_with("05") && id != app.local_id;
+    match action {
+        ChatAction::Remove => {
+            app.approved.remove(id);
+            store.queue_account_change(session_tui_account::AccountChange::RemoveContact {
+                id: id.to_owned(),
+            });
+            "CONTACT REMOVED · NEW MESSAGES FROM THEM ARRIVE AS A REQUEST".into()
+        }
+        ChatAction::Delete if one_to_one => {
+            store.queue_account_change(session_tui_account::AccountChange::HideContact {
+                id: id.to_owned(),
+            });
+            "CHAT DELETED".into()
+        }
+        ChatAction::Delete if id.starts_with("03") => {
+            "GROUP HISTORY DELETED · THE GROUP STAYS UNTIL YOU LEAVE IT".into()
+        }
+        ChatAction::Delete => "CHAT DELETED".into(),
+    }
+}
+
 fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> Option<(String, Vec<u64>)> {
+    // Opening a message request must not tell the stranger it was read.
+    let is_request = app.is_request(app.conversations.get(app.selected)?);
     let conversation = app.conversations.get_mut(app.selected)?;
     let peer = conversation.id.clone();
     let mut timestamps = Vec::new();
@@ -5518,7 +5942,7 @@ fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> Option<(
             timestamp_ms: *latest as i64,
         });
     }
-    (!timestamps.is_empty()).then_some((peer, timestamps))
+    (!timestamps.is_empty() && !is_request).then_some((peer, timestamps))
 }
 
 fn start_read_receipt(
@@ -5978,6 +6402,33 @@ fn format_time(timestamp_ms: u64) -> String {
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+    let image_area = draw_screen(frame, app);
+    sanitize_buffer(frame.buffer_mut(), image_area);
+}
+
+/// Remove control characters from what is about to be written to the
+/// terminal. Names, messages, file names and link titles come from other
+/// people; written raw, ESC/OSC sequences in them could clear or fake the
+/// screen, retitle the window or overwrite the clipboard (OSC 52). The
+/// image viewer's own escape sequences (`image_area`) are left alone.
+fn sanitize_buffer(buffer: &mut ratatui::buffer::Buffer, image_area: Option<Rect>) {
+    let area = buffer.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if image_area.is_some_and(|r| x >= r.x && x < r.right() && y >= r.y && y < r.bottom()) {
+                continue;
+            }
+            let cell = &mut buffer[(x, y)];
+            if cell.symbol().chars().any(char::is_control) {
+                let clean: String = cell.symbol().chars().filter(|c| !c.is_control()).collect();
+                cell.set_symbol(if clean.is_empty() { " " } else { &clean });
+            }
+        }
+    }
+}
+
+fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
+    let mut image_area = None;
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
     let root = Layout::default()
@@ -6019,11 +6470,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             .style(Style::default().bg(PANEL)),
     );
     frame.render_widget(header, root[0]);
+    app.header_area = Some(root[0]);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(30)])
+        .constraints([
+            Constraint::Length(clamp_sidebar_width(app.sidebar_width, root[1].width)),
+            Constraint::Min(0),
+        ])
         .split(root[1]);
+    app.sidebar_width = columns[0].width;
+    app.divider = Some(Rect {
+        x: columns[0].right().saturating_sub(1),
+        width: 1,
+        ..columns[0]
+    });
     draw_conversations(frame, columns[0], app);
     draw_chat(frame, columns[1], app);
 
@@ -6074,6 +6535,41 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             Paragraph::new(Line::from(Span::styled(text, Style::default().fg(TEXT)))).block(
                 Block::default()
                     .title(" Delete message ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .style(Style::default().bg(PANEL)),
+            ),
+            popup,
+        );
+    }
+    if let Some((action, id)) = &app.chat_prompt {
+        let name = app
+            .conversations
+            .iter()
+            .find(|c| c.id == *id)
+            .map_or("", |c| c.title(&app.local_id));
+        let (title, text) = match action {
+            ChatAction::Delete => (
+                " Delete chat ",
+                format!("  Delete the chat with {name} and all its messages?    Y yes    Esc no"),
+            ),
+            ChatAction::Remove => (
+                " Remove contact ",
+                format!("  Remove {name} from your contacts and delete the chat?    Y yes    Esc no"),
+            ),
+        };
+        let width = (text.chars().count() as u16 + 4).min(area.width);
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(6),
+            width,
+            height: 3.min(area.height),
+        };
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(TEXT)))).block(
+                Block::default()
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Red))
                     .style(Style::default().bg(PANEL)),
@@ -6149,7 +6645,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         frame.render_widget(block, popup);
         let image = StatefulImage::new(None).resize(Resize::Fit(Some(FilterType::Lanczos3)));
         frame.render_stateful_widget(image, inner, &mut viewer.protocol);
+        image_area = Some(inner);
     }
+    image_area
 }
 
 fn focus_name(focus: FocusArea) -> &'static str {
@@ -6177,7 +6675,10 @@ fn draw_recovery_seed(frame: &mut ratatui::Frame<'_>, area: Rect, seed: &str) {
             "Anyone with this seed can access your account.",
             Style::default().fg(Color::Red),
         )),
-        Line::from("Press Enter when saved"),
+        Line::from(Span::styled(
+            "Press C or click to copy · Enter when saved",
+            Style::default().fg(TEAL),
+        )),
     ])
     .block(
         Block::default()
@@ -6190,8 +6691,17 @@ fn draw_recovery_seed(frame: &mut ratatui::Frame<'_>, area: Rect, seed: &str) {
     frame.render_widget(panel, popup);
 }
 
+/// Keep the chat list wide enough to read and the chat window usable.
+fn clamp_sidebar_width(width: u16, total: u16) -> u16 {
+    let max = total.saturating_sub(MIN_CHAT_WIDTH).max(MIN_SIDEBAR_WIDTH);
+    width.clamp(MIN_SIDEBAR_WIDTH, max).min(total)
+}
+
 fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let active = app.focus == FocusArea::Contacts;
+    // Room for text: minus the marker, padding and the right border.
+    let text_width = (area.width as usize).saturating_sub(4);
+    let requests = app.conversations.iter().filter(|c| app.is_request(c)).count();
     let focus_border = if active {
         Style::default().fg(TEAL)
     } else {
@@ -6215,7 +6725,15 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
                 Style::default().fg(MUTED).add_modifier(Modifier::BOLD)
             },
         ),
-        Span::styled("            Ctrl+N +", Style::default().fg(TEAL)),
+        Span::styled(
+            if requests > 0 {
+                format!("  {requests} request{}", if requests == 1 { "" } else { "s" })
+            } else {
+                String::new()
+            },
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("  Ctrl+N +", Style::default().fg(TEAL)),
     ]))
     .block(
         Block::default()
@@ -6236,6 +6754,7 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
             } else {
                 MUTED
             };
+            let request = app.is_request(c);
             let unread_count = c.unread();
             let unread = if unread_count > 0 {
                 format!("  ●{unread_count}")
@@ -6260,10 +6779,20 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
                     ),
                     Span::styled(unread, Style::default().fg(BLUE)),
                 ]),
-                Line::from(Span::styled(
-                    format!("   {}", c.preview.chars().take(23).collect::<String>()),
-                    Style::default().fg(MUTED),
-                )),
+                if request {
+                    Line::from(Span::styled(
+                        "   REQUEST · /accept /decline",
+                        Style::default().fg(Color::Yellow),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        format!(
+                            "   {}",
+                            c.preview.chars().take(text_width.saturating_sub(1)).collect::<String>()
+                        ),
+                        Style::default().fg(MUTED),
+                    ))
+                },
                 Line::from(" "),
             ]))
         })
@@ -6278,6 +6807,210 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
     state.select(Some(app.selected));
     frame.render_stateful_widget(list, inner[1], &mut state);
     app.contact_list_offset = state.offset();
+}
+
+/// Every Line is exactly one screen row: text is wrapped here, so scroll
+/// positions and click targets are exact.
+fn push_wrapped(lines: &mut Vec<Line<'static>>, width: usize, indent: &str, text: &str, style: Style) {
+    let (rows, _) = session_tui_input::wrap(text, 0, width.saturating_sub(indent.len()).max(4));
+    for row in rows {
+        lines.push(Line::from(Span::styled(format!("{indent}{row}"), style)));
+    }
+}
+
+/// Everything that decides how many rows a message takes at `width`.
+/// Selection, ticks and timers only change the content of a row.
+fn message_layout_key(app: &App, message: &Message, width: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hasher);
+    message.system.hash(&mut hasher);
+    message.body.hash(&mut hasher);
+    message.timestamp_ms.hash(&mut hasher);
+    if let Some(quote) = &message.quote {
+        app.sender_label(&quote.author).hash(&mut hasher);
+        quote.text.lines().next().hash(&mut hasher);
+    }
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        attachment.file_name.hash(&mut hasher);
+        attachment.content_type.hash(&mut hasher);
+        message
+            .image_previews
+            .get(index)
+            .map(|p| p.as_ref().map(|p| p.rows.len()))
+            .hash(&mut hasher);
+    }
+    message.links.hash(&mut hasher);
+    for reaction in &message.reactions {
+        reaction.emoji.hash(&mut hasher);
+        reaction.authors.len().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Rows of one message, and its attachments' row ranges within them.
+#[allow(clippy::type_complexity)]
+fn message_lines(
+    app: &App,
+    c: &Conversation,
+    message_index: usize,
+    text_width: usize,
+    message_active: bool,
+    last_sent: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<(usize, usize, usize)>) {
+    let message = &c.messages[message_index];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut attachment_ranges = Vec::new();
+    let push_wrapped = |lines: &mut Vec<Line<'static>>, indent: &str, text: &str, style: Style| {
+        push_wrapped(lines, text_width, indent, text, style)
+    };
+    let selected_message = message_index == c.selected_message;
+    let marker = if selected_message && message_active {
+        "▸"
+    } else {
+        " "
+    };
+    if message.system {
+        push_wrapped(
+            &mut lines,
+            "",
+            &format!(
+                " {marker}  ── {} · {} ──",
+                format_time(message.timestamp_ms),
+                message.body
+            ),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+        );
+        lines.push(Line::from(" "));
+        return (lines, attachment_ranges);
+    }
+    let (tag, color) = if message.outgoing {
+        ("YOU".to_owned(), TEAL)
+    } else if let Some(sender) = message.sender.as_deref() {
+        (app.sender_label(sender), BLUE)
+    } else {
+        (c.title(&app.local_id).to_owned(), BLUE)
+    };
+    let mut metadata = vec![
+        Span::styled(
+            format!(" {marker} {tag}  "),
+            Style::default()
+                .fg(if selected_message && !message_active {
+                    MUTED
+                } else {
+                    color
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format_time(message.timestamp_ms), Style::default().fg(MUTED)),
+    ];
+    if message.outgoing {
+        // Like the official apps, delivery/read ticks are shown only on
+        // the latest sent message; sending/failed show everywhere.
+        let ticks = match (message.send_state, message.receipt_status) {
+            (SendState::Sending, _) => Some((" ⋯ sending", MUTED)),
+            (SendState::Failed, _) => Some((" ✗ failed · /retry", Color::Red)),
+            _ if Some(message_index) != last_sent => None,
+            (_, 2) => Some((" ✓✓", TEAL)),
+            (_, 1) => Some((" ✓✓", MUTED)),
+            _ => Some((" ✓", MUTED)),
+        };
+        if let Some((ticks, tick_color)) = ticks {
+            metadata.push(Span::styled(
+                ticks,
+                Style::default().fg(tick_color).add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    if let Some(expires_at) = message.expires_at {
+        let left = expires_at.saturating_sub(now_ms()) / 1000;
+        metadata.push(Span::styled(
+            format!("  ⏱ {}", format_duration(left.max(1) as u32)),
+            Style::default().fg(MUTED),
+        ));
+    } else if message.expiration.is_some() {
+        metadata.push(Span::styled("  ⏱", Style::default().fg(MUTED)));
+    }
+    lines.push(Line::from(metadata));
+    if let Some(quote) = message.quote.as_ref() {
+        push_wrapped(
+            &mut lines,
+            "    ┃ ",
+            &format!(
+                "↪ {}: {}",
+                app.sender_label(&quote.author),
+                quote.text.lines().next().unwrap_or_default()
+            ),
+            Style::default().fg(MUTED),
+        );
+    }
+    let total = message.attachments.len();
+    for (attachment_index, attachment) in message.attachments.iter().enumerate() {
+        let attachment_start = lines.len();
+        let numbering = if total > 1 {
+            format!("{}/{total} ", attachment_index + 1)
+        } else {
+            String::new()
+        };
+        let pending = message
+            .image_previews
+            .get(attachment_index)
+            .is_none_or(Option::is_none)
+            && attachment.content_type.starts_with("image/");
+        push_wrapped(
+            &mut lines,
+            "    ",
+            &format!(
+                "{numbering}{}{}",
+                attachment_label(attachment),
+                if pending { "  (loading…)" } else { "" }
+            ),
+            Style::default().fg(TEXT),
+        );
+        if let Some(Some(preview)) = message.image_previews.get(attachment_index) {
+            for pixels in &preview.rows {
+                let mut spans = vec![Span::raw("    ")];
+                spans.extend(pixels.iter().map(|(top, bottom)| {
+                    Span::styled(
+                        "▀",
+                        Style::default()
+                            .fg(Color::Rgb(top[0], top[1], top[2]))
+                            .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
+                    )
+                }));
+                lines.push(Line::from(spans));
+            }
+        }
+        attachment_ranges.push((attachment_start, lines.len(), attachment_index));
+    }
+    for text_line in message.body.lines() {
+        push_wrapped(&mut lines, "    ", text_line, Style::default().fg(TEXT));
+    }
+    for (url, title) in &message.links {
+        let text = match title {
+            Some(title) if !title.is_empty() => format!("🔗 {title} · {url}"),
+            _ => format!("🔗 {url}"),
+        };
+        push_wrapped(&mut lines, "    ", &text, Style::default().fg(BLUE));
+    }
+    if !message.reactions.is_empty() {
+        let mut spans = vec![Span::raw("    ")];
+        for reaction in &message.reactions {
+            let mine = reaction.authors.iter().any(|a| *a == app.local_id);
+            spans.push(Span::styled(
+                format!(" {} {} ", reaction.emoji, reaction.authors.len()),
+                if mine {
+                    Style::default().fg(BG).bg(TEAL)
+                } else {
+                    Style::default().fg(TEXT).bg(PANEL)
+                },
+            ));
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(" "));
+    (lines, attachment_ranges)
 }
 
 fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -6298,9 +7031,19 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let title_name = selected
         .map(|c| c.title(&app.local_id))
         .unwrap_or("No conversation selected");
+    // The full ID is never on screen (screenshots, onlookers): a short form,
+    // or nothing when the name already is that short form. Double-click
+    // copies the full ID.
     let title_id = selected
-        .map(|c| c.id.as_str())
-        .unwrap_or("Ctrl+N to add a contact");
+        .map(|c| {
+            let short = short_id(&c.id);
+            if title_name == short {
+                "· double-click to copy ID".to_owned()
+            } else {
+                format!("{short} · double-click to copy")
+            }
+        })
+        .unwrap_or_else(|| "Ctrl+N to add a contact".to_owned());
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {}", title_name),
@@ -6340,6 +7083,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             .style(Style::default().bg(PANEL)),
     );
     frame.render_widget(title, rows[0]);
+    app.chat_title_area = Some(rows[0]);
 
     let message_active = app.focus == FocusArea::Messages;
     let transcript_block = Block::default()
@@ -6357,187 +7101,40 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         .style(Style::default().bg(BG));
     let transcript_area = transcript_block.inner(rows[1]);
     let text_width = transcript_area.width.max(8) as usize;
-    // Every Line is exactly one screen row: text is wrapped here, so scroll
-    // positions and click targets are exact.
-    let push_wrapped = |lines: &mut Vec<Line<'static>>, indent: &str, text: &str, style: Style| {
-        let (rows, _) = session_tui_input::wrap(text, 0, text_width.saturating_sub(indent.len()).max(4));
-        for row in rows {
-            lines.push(Line::from(Span::styled(format!("{indent}{row}"), style)));
-        }
-    };
-    let mut lines: Vec<Line<'static>> = vec![Line::from(" ")];
+    // Only the messages on screen are laid out; the rest are measured from
+    // a cache of row counts, so long chats cost the same as short ones.
+    let mut heights = std::mem::take(&mut app.layout_heights);
     let mut message_ranges = Vec::new();
-    let mut attachment_ranges = Vec::new();
+    let mut total = 1; // blank first row
+    let mut last_sent = None;
     if let Some(c) = selected {
-        let last_sent = c
+        if heights.0 != c.id {
+            heights = (c.id.clone(), HashMap::new());
+        }
+        last_sent = c
             .messages
             .iter()
             .rposition(|m| m.outgoing && !m.system && m.send_state == SendState::Sent);
+        let mut live = HashMap::with_capacity(c.messages.len());
         for (message_index, message) in c.messages.iter().enumerate() {
-            let message_start = lines.len();
-            let selected_message = message_index == c.selected_message;
-            let marker = if selected_message && message_active {
-                "▸"
-            } else {
-                " "
+            let key = message_layout_key(app, message, text_width);
+            let height = match heights.1.get(&key) {
+                Some(&height) => height,
+                None => {
+                    message_lines(app, c, message_index, text_width, message_active, last_sent)
+                        .0
+                        .len()
+                }
             };
-            if message.system {
-                push_wrapped(
-                    &mut lines,
-                    "",
-                    &format!(
-                        " {marker}  ── {} · {} ──",
-                        format_time(message.timestamp_ms),
-                        message.body
-                    ),
-                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-                );
-                lines.push(Line::from(" "));
-                message_ranges.push((message_start, lines.len(), message_index));
-                continue;
-            }
-            let (tag, color) = if message.outgoing {
-                ("YOU".to_owned(), TEAL)
-            } else if let Some(sender) = message.sender.as_deref() {
-                (app.sender_label(sender), BLUE)
-            } else {
-                (c.title(&app.local_id).to_owned(), BLUE)
-            };
-            let mut metadata = vec![
-                Span::styled(
-                    format!(" {marker} {tag}  "),
-                    Style::default()
-                        .fg(if selected_message && !message_active {
-                            MUTED
-                        } else {
-                            color
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format_time(message.timestamp_ms), Style::default().fg(MUTED)),
-            ];
-            if message.outgoing {
-                // Like the official apps, delivery/read ticks are shown only on
-                // the latest sent message; sending/failed show everywhere.
-                let ticks = match (message.send_state, message.receipt_status) {
-                    (SendState::Sending, _) => Some((" ⋯ sending", MUTED)),
-                    (SendState::Failed, _) => Some((" ✗ failed · /retry", Color::Red)),
-                    _ if Some(message_index) != last_sent => None,
-                    (_, 2) => Some((" ✓✓", TEAL)),
-                    (_, 1) => Some((" ✓✓", MUTED)),
-                    _ => Some((" ✓", MUTED)),
-                };
-                if let Some((ticks, tick_color)) = ticks {
-                    metadata.push(Span::styled(
-                        ticks,
-                        Style::default().fg(tick_color).add_modifier(Modifier::BOLD),
-                    ));
-                }
-            }
-            if let Some(expires_at) = message.expires_at {
-                let left = expires_at.saturating_sub(now_ms()) / 1000;
-                metadata.push(Span::styled(
-                    format!("  ⏱ {}", format_duration(left.max(1) as u32)),
-                    Style::default().fg(MUTED),
-                ));
-            } else if message.expiration.is_some() {
-                metadata.push(Span::styled("  ⏱", Style::default().fg(MUTED)));
-            }
-            lines.push(Line::from(metadata));
-            if let Some(quote) = message.quote.as_ref() {
-                push_wrapped(
-                    &mut lines,
-                    "    ┃ ",
-                    &format!(
-                        "↪ {}: {}",
-                        app.sender_label(&quote.author),
-                        quote.text.lines().next().unwrap_or_default()
-                    ),
-                    Style::default().fg(MUTED),
-                );
-            }
-            let total = message.attachments.len();
-            for (attachment_index, attachment) in message.attachments.iter().enumerate() {
-                let attachment_start = lines.len();
-                let numbering = if total > 1 {
-                    format!("{}/{total} ", attachment_index + 1)
-                } else {
-                    String::new()
-                };
-                let pending = message
-                    .image_previews
-                    .get(attachment_index)
-                    .is_none_or(Option::is_none)
-                    && attachment.content_type.starts_with("image/");
-                push_wrapped(
-                    &mut lines,
-                    "    ",
-                    &format!(
-                        "{numbering}{}{}",
-                        attachment_label(attachment),
-                        if pending { "  (loading…)" } else { "" }
-                    ),
-                    Style::default().fg(TEXT),
-                );
-                if let Some(Some(preview)) = message.image_previews.get(attachment_index) {
-                    for pixels in &preview.rows {
-                        let mut spans = vec![Span::raw("    ")];
-                        spans.extend(pixels.iter().map(|(top, bottom)| {
-                            Span::styled(
-                                "▀",
-                                Style::default()
-                                    .fg(Color::Rgb(top[0], top[1], top[2]))
-                                    .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
-                            )
-                        }));
-                        lines.push(Line::from(spans));
-                    }
-                }
-                attachment_ranges.push((
-                    attachment_start,
-                    lines.len(),
-                    message_index,
-                    attachment_index,
-                ));
-            }
-            for text_line in message.body.lines() {
-                push_wrapped(&mut lines, "    ", text_line, Style::default().fg(TEXT));
-            }
-            for (url, title) in &message.links {
-                let text = match title {
-                    Some(title) if !title.is_empty() => format!("🔗 {title} · {url}"),
-                    _ => format!("🔗 {url}"),
-                };
-                push_wrapped(&mut lines, "    ", &text, Style::default().fg(BLUE));
-            }
-            if !message.reactions.is_empty() {
-                let mut spans = vec![Span::raw("    ")];
-                for reaction in &message.reactions {
-                    let mine = reaction.authors.iter().any(|a| *a == app.local_id);
-                    spans.push(Span::styled(
-                        format!(" {} {} ", reaction.emoji, reaction.authors.len()),
-                        if mine {
-                            Style::default().fg(BG).bg(TEAL)
-                        } else {
-                            Style::default().fg(TEXT).bg(PANEL)
-                        },
-                    ));
-                    spans.push(Span::raw(" "));
-                }
-                lines.push(Line::from(spans));
-            }
-            lines.push(Line::from(" "));
-            message_ranges.push((message_start, lines.len(), message_index));
+            live.insert(key, height);
+            message_ranges.push((total, total + height, message_index));
+            total += height;
         }
-    } else {
-        lines.push(Line::from(Span::styled(
-            "  Add a contact with Ctrl+N. Use /rsync to sync the inbox.",
-            Style::default().fg(MUTED),
-        )));
+        heights.1 = live;
     }
     app.message_viewport = Some(transcript_area);
     let visible_height = transcript_area.height as usize;
-    let max_scroll = lines.len().saturating_sub(visible_height);
+    let max_scroll = total.saturating_sub(visible_height);
     let manual_scroll = selected.and_then(|c| c.scroll);
     let scroll = if let Some(top) = manual_scroll {
         // Mouse wheel scrolled the view freely.
@@ -6568,17 +7165,50 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     };
     app.transcript_scroll = (scroll, max_scroll);
     app.transcript_conversation = app.selected;
-    app.message_hitboxes.clear();
     let visible_end = scroll.saturating_add(visible_height);
-    let ranges = message_ranges
-        .iter()
-        .map(|&(start, end, message)| (start, end, message, None))
-        .chain(
-            attachment_ranges
-                .iter()
-                .map(|&(start, end, message, attachment)| (start, end, message, Some(attachment))),
-        );
-    for (start, end, message_index, attachment_index) in ranges {
+    // Lay out the visible messages; `first_row` is the transcript row of
+    // `lines[0]`.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut first_row = 0;
+    let mut hitboxes = Vec::new();
+    match selected {
+        Some(c) => {
+            if scroll == 0 {
+                lines.push(Line::from(" "));
+            } else {
+                first_row = message_ranges
+                    .iter()
+                    .find(|(_, end, _)| *end > scroll)
+                    .map_or(total, |(start, _, _)| *start);
+            }
+            for &(start, end, message_index) in &message_ranges {
+                if end <= scroll || start >= visible_end {
+                    continue;
+                }
+                let (message_lines, attachments) =
+                    message_lines(app, c, message_index, text_width, message_active, last_sent);
+                let base = first_row + lines.len();
+                hitboxes.push((base, base + message_lines.len(), message_index, None));
+                for (a_start, a_end, attachment) in attachments {
+                    hitboxes.push((base + a_start, base + a_end, message_index, Some(attachment)));
+                }
+                lines.extend(message_lines);
+            }
+        }
+        None => {
+            lines.push(Line::from(" "));
+            lines.push(Line::from(Span::styled(
+                "  Add a contact with Ctrl+N. Use /rsync to sync the inbox.",
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+    app.layout_heights = heights;
+    // Attachment hitboxes come after their message's, as click handling expects.
+    app.message_hitboxes.clear();
+    let mut ordered: Vec<_> = hitboxes.iter().filter(|h| h.3.is_none()).copied().collect();
+    ordered.extend(hitboxes.iter().filter(|h| h.3.is_some()).copied());
+    for (start, end, message_index, attachment_index) in ordered {
         if end <= scroll || start >= visible_end {
             continue;
         }
@@ -6589,7 +7219,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             .push((y_start, y_end, message_index, attachment_index));
     }
     let transcript = Paragraph::new(lines)
-        .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+        .scroll(((scroll - first_row.min(scroll)).min(u16::MAX as usize) as u16, 0))
         .style(Style::default().bg(BG))
         .block(transcript_block);
     frame.render_widget(transcript, rows[1]);
@@ -6638,6 +7268,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         && !app.show_emoji
         && !app.reaction_picker
         && app.delete_prompt.is_none()
+        && app.chat_prompt.is_none()
         && app.recovery_seed.is_none()
     {
         frame.set_cursor_position((
@@ -6719,7 +7350,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+N", "Start a chat with a Session ID"),
             ("/disappear off | read 12h | send 1d", "Disappearing messages for this 1:1 chat"),
-            ("/accept", "Join the group you were invited to"),
+            ("/accept", "Accept a message request, or join the group you were invited to"),
+            ("/decline", "Decline a message request (deletes it)"),
+            ("/delete", "Delete this chat and its messages (the contact stays)"),
+            ("/remove", "Remove this contact from your account and delete the chat"),
             ("/block · /unblock", "Block / unblock this 1:1 contact on all your devices"),
             ("/rsync", "Fetch messages now (also automatic)"),
         ],
@@ -7070,6 +7704,83 @@ mod scroll_tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.transcript_scroll.0, app.transcript_scroll.1);
     }
+    #[test]
+    fn partial_layout_matches_full_layout_at_every_scroll() {
+        let local = "05".to_owned() + &"11".repeat(32);
+        let peer = "05".to_owned() + &"22".repeat(32);
+        let mut app = App::new(local);
+        let index = app.ensure_contact(&peer);
+        for i in 0..120u64 {
+            let body = if i % 5 == 0 {
+                format!("{i} wraps over rows ").repeat(9)
+            } else {
+                format!("message {i}\nsecond line")
+            };
+            app.conversations[index].messages.push(Message::new(body, 1_000 + i, i % 3 == 0));
+        }
+        app.selected = index;
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.message_viewport.unwrap();
+        let width = area.width.max(8) as usize;
+        let row_text = |line: &Line<'_>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        };
+        let conversation = &app.conversations[index];
+        let last_sent = conversation.messages.iter().rposition(|m| m.outgoing);
+        let mut full = vec![" ".to_owned()];
+        for i in 0..conversation.messages.len() {
+            full.extend(
+                message_lines(&app, conversation, i, width, false, last_sent)
+                    .0
+                    .iter()
+                    .map(row_text),
+            );
+        }
+        let max_scroll = app.transcript_scroll.1;
+        assert_eq!(max_scroll, full.len() - area.height as usize);
+        for top in [0, 1, 2, 7, 33, max_scroll / 2, max_scroll - 1, max_scroll] {
+            app.conversations[index].scroll = Some(top);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for row in 0..area.height {
+                let shown: String = (0..area.width)
+                    .map(|x| buffer[(area.x + x, area.y + row)].symbol().to_owned())
+                    .collect();
+                let expected = full.get(top + row as usize).cloned().unwrap_or_default();
+                assert_eq!(shown.trim_end(), expected.trim_end(), "scroll {top} row {row}");
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod control_char_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn control_characters_from_others_never_reach_the_terminal() {
+        let mut app = App::new("05".to_owned() + &"11".repeat(32));
+        let i = app.ensure_contact(&("05".to_owned() + &"22".repeat(32)));
+        app.conversations[i].name = "evil\x1b]0;title\x07name".into();
+        let mut message = Message::new("hi\x1b[2J\x1b]52;c;ZXZpbA==\x07there\r\x08x".into(), 1, false);
+        message.quote = Some(QuoteRef { id: 0, author: "x".into(), text: "\x1b[31mred".into() });
+        app.conversations[i].messages.push(message);
+        app.conversations[i].refresh_preview();
+        app.selected = i;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let control = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .filter(|cell| cell.symbol().chars().any(char::is_control))
+            .count();
+        assert_eq!(control, 0);
+    }
 }
 
 #[cfg(test)]
@@ -7150,3 +7861,4 @@ mod delete_prompt_tests {
         assert!(theirs.contains("Delete on this device only"));
     }
 }
+

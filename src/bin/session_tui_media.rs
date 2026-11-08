@@ -39,10 +39,67 @@ pub struct AttachmentMeta {
     pub height: Option<u32>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImagePreview {
     /// Each terminal cell is the top and bottom pixel of a half-block glyph.
     pub rows: Vec<Vec<([u8; 3], [u8; 3])>>,
+}
+
+/// Stored as `"<width>:<base64 of top,bottom RGB per cell>"`, about a third
+/// the size of the original `{"rows":[[[[r,g,b],[r,g,b]],…]]}` JSON (which
+/// is still read) and much faster to parse.
+impl Serialize for ImagePreview {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        let width = self.rows.first().map_or(0, Vec::len);
+        let mut bytes = Vec::with_capacity(self.rows.len() * width * 6);
+        for row in &self.rows {
+            for (top, bottom) in row {
+                bytes.extend_from_slice(top);
+                bytes.extend_from_slice(bottom);
+            }
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        serializer.serialize_str(&format!("{width}:{encoded}"))
+    }
+}
+
+impl<'de> Deserialize<'de> for ImagePreview {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use base64::Engine as _;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Compact(String),
+            Legacy { rows: Vec<Vec<([u8; 3], [u8; 3])>> },
+        }
+        match Stored::deserialize(deserializer)? {
+            Stored::Legacy { rows } => Ok(Self { rows }),
+            Stored::Compact(text) => {
+                let invalid = || serde::de::Error::custom("invalid image preview");
+                let (width, data) = text.split_once(':').ok_or_else(invalid)?;
+                let width: usize = width.parse().map_err(|_| invalid())?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| invalid())?;
+                if width == 0 {
+                    return Ok(Self::default());
+                }
+                if bytes.len() % (width * 6) != 0 {
+                    return Err(invalid());
+                }
+                let rows = bytes
+                    .chunks(width * 6)
+                    .map(|row| {
+                        row.chunks(6)
+                            .map(|c| ([c[0], c[1], c[2]], [c[3], c[4], c[5]]))
+                            .collect()
+                    })
+                    .collect();
+                Ok(Self { rows })
+            }
+        }
+    }
 }
 
 /// Cache path of one attachment of a message. Index 0 keeps the original
@@ -190,6 +247,20 @@ pub fn image_preview(data: &[u8]) -> Option<ImagePreview> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previews_round_trip_compact_and_read_legacy() {
+        let preview = ImagePreview {
+            rows: vec![vec![([1, 2, 3], [4, 5, 6]), ([7, 8, 9], [10, 11, 12])]; 3],
+        };
+        let json = serde_json::to_string(&preview).unwrap();
+        assert!(json.starts_with("\"2:"), "{json}");
+        assert_eq!(serde_json::from_str::<ImagePreview>(&json).unwrap(), preview);
+        let legacy = r#"{"rows":[[[[1,2,3],[4,5,6]],[[7,8,9],[10,11,12]]]]}"#;
+        assert_eq!(serde_json::from_str::<ImagePreview>(legacy).unwrap().rows, preview.rows[..1]);
+        let empty = serde_json::to_string(&ImagePreview::default()).unwrap();
+        assert_eq!(serde_json::from_str::<ImagePreview>(&empty).unwrap(), ImagePreview::default());
+    }
 
     #[test]
     fn old_previews_shrink_to_thumbnail_size() {
