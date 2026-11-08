@@ -1,6 +1,6 @@
 [package]
 name = "libsession"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2024"
 rust-version = "1.93"
 license = "GPL-3.0-only"
@@ -80,3 +80,7 @@ tokio = { version = "1.51.1", features = ["test-util", "macros"] }
 [[bin]]
 name = "session-tui"
 path = "src/bin/session_tui.rs"
+
+[profile.release]
+# Drop symbol tables from release binaries (about 10 MB on Windows).
+strip = true
