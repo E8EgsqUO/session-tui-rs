@@ -112,6 +112,23 @@ impl OnionRequestRouter {
         endpoint: &str,
         body_json: &[u8],
     ) -> Result<DecryptedResponse, OnionRouteError> {
+        let prepared = self.prepare(pool, paths, category, destination, endpoint, body_json)?;
+        let result = transport.send_request(&prepared.request).await;
+        prepared.finish(result, |guard| paths.record_failure(category, guard))
+    }
+
+    /// The part of [`send`](Self::send) that needs the path manager and
+    /// pool: pick (or build) a path and build the onion request. The caller
+    /// can then release its locks for the network round trip.
+    pub fn prepare(
+        &self,
+        pool: &SnodePool,
+        paths: &mut PathManager,
+        category: PathCategory,
+        destination: &NetworkDestination,
+        endpoint: &str,
+        body_json: &[u8],
+    ) -> Result<PreparedRequest, OnionRouteError> {
         // 1. Pick or build a path.
         let path = match paths.pick_path(category) {
             Some(p) => p,
@@ -140,25 +157,45 @@ impl OnionRequestRouter {
             accept_invalid_certs: true,
         };
 
-        let resp = match transport.send_request(&req).await {
+        let parser = ResponseParser::from_builder(&builder)?;
+        Ok(PreparedRequest {
+            request: req,
+            guard: guard.ed25519_pubkey,
+            parser,
+        })
+    }
+}
+
+/// An onion request ready to send, from [`OnionRequestRouter::prepare`].
+pub struct PreparedRequest {
+    pub request: TransportRequest,
+    guard: crate::network::key_types::Ed25519Pubkey,
+    parser: ResponseParser,
+}
+
+impl PreparedRequest {
+    /// Check and decrypt the response. `record_failure` is called with the
+    /// guard node when the path failed (the caller takes its lock for it).
+    pub fn finish<E: Into<OnionRouteError>>(
+        self,
+        result: Result<crate::network::transport::TransportResponse, E>,
+        record_failure: impl FnOnce(&crate::network::key_types::Ed25519Pubkey),
+    ) -> Result<DecryptedResponse, OnionRouteError> {
+        let resp = match result {
             Ok(r) => r,
             Err(e) => {
-                paths.record_failure(category, &guard.ed25519_pubkey);
+                record_failure(&self.guard);
                 return Err(e.into());
             }
         };
-
         if resp.status_code < 200 || resp.status_code >= 300 {
-            paths.record_failure(category, &guard.ed25519_pubkey);
+            record_failure(&self.guard);
             let body = String::from_utf8_lossy(&resp.body);
             let detail: String = body.chars().take(512).collect();
             return Err(OnionRouteError::BadStatus(resp.status_code, detail));
         }
-
         // 4. Decrypt the response.
-        let parser = ResponseParser::from_builder(&builder)?;
-        let decrypted = parser.decrypted_response_bytes(&resp.body)?;
-        Ok(decrypted)
+        Ok(self.parser.decrypted_response_bytes(&resp.body)?)
     }
 }
 

@@ -17,6 +17,7 @@ This repository includes the Session Rust core modules used by the client, so it
 - Emoji shortcodes such as `:joy:`, `:haha:` or `:+1:` are converted when sending.
 - Replies (`r` on a message), reactions (`+` or `/react EMOJI`), disappearing messages (`/disappear off | read 12h | send 1d`), typing indicators, link previews, and notices for screenshots, missed calls and group changes.
 - Delete or unsend messages, with read receipts (delivery receipts are not sent, as in the official apps).
+- Disappear-after-read messages are also shortened on the network when read, and a deadline set on another device is respected, as in the official apps (1:1 chats).
 - Account data syncs with your other Session devices: profile name, contacts (approved and blocked), per-chat disappearing settings, read state, and joined groups.
 - Local history is stored in an SQLCipher-encrypted database.
 - Use `https_proxy` or `HTTPS_PROXY` for HTTPS connections.

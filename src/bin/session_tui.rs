@@ -136,9 +136,13 @@ struct Message {
     /// Hashes of our own copies of this message in this account's swarm
     /// (1:1 sync copies), deleted from the swarm when the message is unsent.
     swarm_hashes: Vec<String>,
-    /// Hash of a group message in the group's swarm; group "delete content"
-    /// commands name messages by it.
-    group_hash: Option<String>,
+    /// Hash of a received message in the swarm it was fetched from (ours
+    /// for 1:1, the group's for groups): group "delete content" commands
+    /// and swarm expiry updates name messages by it.
+    server_hash: Option<String>,
+    /// When the swarm will drop it (from `retrieve`): tells whether another
+    /// device already shortened a disappear-after-read message.
+    swarm_expiry: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
@@ -246,7 +250,8 @@ impl Message {
             system: false,
             send_state: SendState::Sent,
             swarm_hashes: Vec::new(),
-            group_hash: None,
+            server_hash: None,
+            swarm_expiry: None,
         }
     }
 
@@ -316,8 +321,10 @@ struct StoredMessage {
     system: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     swarm_hashes: Vec<String>,
+    #[serde(default, alias = "group_hash", skip_serializing_if = "Option::is_none")]
+    server_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    group_hash: Option<String>,
+    swarm_expiry: Option<u64>,
     /// Not written for sent messages (old rows read as sent).
     #[serde(default, skip_serializing_if = "is_sent")]
     send_state: SendState,
@@ -784,6 +791,19 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
 /// for 1:1 chats and our own messages.
 fn sender_key(message: &Message) -> &str {
     message.sender.as_deref().unwrap_or("")
+}
+
+/// A message's expiry in a `get_expiries` reply: `{"expiries": {hash: ms}}`,
+/// possibly per swarm node under `"swarm"`. Missing means already expired.
+fn parse_expiry(body: &Value, hash: &str) -> Option<u64> {
+    let direct = body.get("expiries").and_then(|e| e.get(hash)).and_then(Value::as_u64);
+    direct.or_else(|| {
+        body.get("swarm")?
+            .as_object()?
+            .values()
+            .filter_map(|node| node.get("expiries")?.get(hash)?.as_u64())
+            .min()
+    })
 }
 
 /// Short description of what a Content carries, for the debug log.
@@ -1291,6 +1311,8 @@ struct Identity {
 
 struct IncomingMessage {
     hash: String,
+    /// The swarm's expiry for it (`expiration` in the retrieve response).
+    swarm_expiry: Option<u64>,
     sender_id: String,
     contact_id: String,
     outgoing: bool,
@@ -1335,6 +1357,7 @@ impl IncomingMessage {
     fn control(hash: String, sender_id: String, contact_id: String, timestamp_ms: u64) -> Self {
         Self {
             hash,
+            swarm_expiry: None,
             sender_id,
             contact_id,
             outgoing: false,
@@ -2065,7 +2088,8 @@ impl LocalStore {
                 message.links = payload.links;
                 message.system = payload.system;
                 message.swarm_hashes = payload.swarm_hashes;
-                message.group_hash = payload.group_hash;
+                message.server_hash = payload.server_hash;
+                message.swarm_expiry = payload.swarm_expiry;
                 message.send_state = payload.send_state;
                 message.attachments = payload.attachments;
                 message.image_previews = payload.image_previews;
@@ -2335,7 +2359,8 @@ impl LocalStore {
             links: message.links.clone(),
             system: message.system,
             swarm_hashes: message.swarm_hashes.clone(),
-            group_hash: message.group_hash.clone(),
+            server_hash: message.server_hash.clone(),
+            swarm_expiry: message.swarm_expiry,
             send_state: message.send_state,
         })
         .map_err(|e| e.to_string())?;
@@ -2662,14 +2687,17 @@ impl LocalStore {
 
     /// Delete one stored message and its cached attachment files.
     fn delete_message(&self, peer: &str, message: &Message) -> Result<(), String> {
-        if message.outgoing {
-            // A deleted message is never sent (or synced) later.
-            self.exec(
-                "DELETE FROM outbox WHERE peer = ?1 AND timestamp_ms = ?2 AND kind IN ('text', 'sync_copy')",
-                params![peer, message.timestamp_ms as i64],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        // A deleted message is never sent, synced or expired later.
+        let kinds = if message.outgoing {
+            "('text', 'sync_copy')"
+        } else {
+            "('expire_read', 'fetch_expiry')"
+        };
+        self.exec(
+            &format!("DELETE FROM outbox WHERE peer = ?1 AND timestamp_ms = ?2 AND kind IN {kinds}"),
+            params![peer, message.timestamp_ms as i64],
+        )
+        .map_err(|e| e.to_string())?;
         self.exec(
                 "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3 AND sender = ?4",
                 params![peer, message.timestamp_ms as i64, message.outgoing, sender_key(message)],
@@ -3579,6 +3607,60 @@ impl SessionClient {
             .await)
     }
 
+    /// Shorten how long our swarm keeps a received message, to `expiry_ms`
+    /// (a disappear-after-read message we have read), as the official
+    /// clients do; other devices and new installs then see the deadline.
+    async fn expire_shorten(&self, hash: &str, expiry_ms: u64) -> Result<(), String> {
+        // "expire" || "shorten" || expiry || messages[0] || … || messages[N]
+        let signed = format!("expire{}{expiry_ms}{hash}", "shorten");
+        let signature = ed25519::sign(&self.identity.ed_secret, signed.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let params = serde_json::json!({
+            "pubkey": self.identity.session_id,
+            "pubkey_ed25519": hex::encode(self.identity.ed_public),
+            "signature": STANDARD.encode(signature),
+            "messages": [hash],
+            "expiry": expiry_ms,
+            "shorten": true,
+        });
+        let response = self
+            .network
+            .send_rpc("expire", params, Some(&self.identity.session_id))
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status_code != 200 {
+            return Err(format!("expire returned HTTP {}", response.status_code));
+        }
+        Ok(())
+    }
+
+    /// When our swarm will drop a message (`None`: it is already gone).
+    async fn swarm_expiry_of(&self, hash: &str) -> Result<Option<u64>, String> {
+        let timestamp = now_ms();
+        // "get_expiries" || timestamp || messages[0] || … || messages[N]
+        let signed = format!("get_expiries{timestamp}{hash}");
+        let signature = ed25519::sign(&self.identity.ed_secret, signed.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let params = serde_json::json!({
+            "pubkey": self.identity.session_id,
+            "pubkey_ed25519": hex::encode_upper(self.identity.ed_public),
+            "signature": STANDARD.encode(signature),
+            "messages": [hash],
+            "timestamp": timestamp,
+        });
+        let response = self
+            .network
+            .send_rpc("get_expiries", params, Some(&self.identity.session_id))
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status_code != 200 {
+            return Err(format!("get_expiries returned HTTP {}", response.status_code));
+        }
+        let body: Value = serde_json::from_str(response.body.as_deref().unwrap_or(""))
+            .map_err(|e| format!("get_expiries: {e}"))?;
+        Ok(parse_expiry(&body, hash))
+    }
+
     /// Send a DataMessage to its chat only (the sync copy is a separate
     /// outbox step).
     async fn send_to_chat(
@@ -4347,7 +4429,7 @@ impl SessionClient {
                 .and_then(Value::as_str)
                 .unwrap_or(data)
                 .to_owned();
-            let Some(message) = parse_content(
+            let Some(mut message) = parse_content(
                 &self.identity.session_id,
                 hash,
                 sender_id.clone(),
@@ -4357,6 +4439,7 @@ impl SessionClient {
             ) else {
                 continue;
             };
+            message.swarm_expiry = item.get("expiration").and_then(Value::as_u64);
             debug_log(
                 "message.route",
                 &format!(
@@ -6400,7 +6483,11 @@ fn start_outbox(
     let peer = entry.peer.clone();
     // Blocked since it was queued, or we may no longer post in the group:
     // don't send; it fails (and is kept for /retry once that changes).
-    let refused = if app.blocked.contains(&entry.peer) {
+    let expiry_work = matches!(entry.kind, OutboxKind::ExpireRead | OutboxKind::FetchExpiry);
+    // (Expiry updates only touch our own swarm, so they always go ahead.)
+    let refused = if expiry_work {
+        None
+    } else if app.blocked.contains(&entry.peer) {
         Some("contact is blocked")
     } else if app
         .conversations
@@ -6459,17 +6546,42 @@ fn start_outbox(
                 task_client.send_receipt(&peer, 1, timestamps).await.map(|()| None)
             }))
         }
+        OutboxKind::ExpireRead | OutboxKind::FetchExpiry => {
+            let message = outbox_message(app, entry)?;
+            let hash = message.server_hash.clone()?;
+            if entry.kind == OutboxKind::ExpireRead {
+                let expiry = message.expires_at?;
+                Some(spawn_network(move || async move {
+                    task_client.expire_shorten(&hash, expiry).await.map(|()| None)
+                }))
+            } else {
+                // Some(deadline), or None when the swarm no longer has it.
+                Some(spawn_network(move || async move {
+                    task_client
+                        .swarm_expiry_of(&hash)
+                        .await
+                        .map(|expiry| Some(expiry.unwrap_or(0).to_string()))
+                }))
+            }
+        }
     }
 }
 
-/// The outgoing message an outbox item belongs to.
+/// The message an outbox item belongs to: our outgoing message, or (for
+/// expiry work) the received 1:1 message.
 fn outbox_message<'a>(app: &'a mut App, entry: &OutboxEntry) -> Option<&'a mut Message> {
+    let incoming = matches!(entry.kind, OutboxKind::ExpireRead | OutboxKind::FetchExpiry);
     app.conversations
         .iter_mut()
         .find(|c| c.id == entry.peer)?
         .messages
         .iter_mut()
-        .find(|m| m.outgoing && !m.system && m.timestamp_ms == entry.timestamp_ms)
+        .find(|m| {
+            m.outgoing != incoming
+                && !m.system
+                && m.timestamp_ms == entry.timestamp_ms
+                && (!incoming || m.sender.is_none())
+        })
 }
 
 /// Record the outcome of one outbox item: done (and the next step queued),
@@ -6508,6 +6620,22 @@ fn finish_outbox(
                     let _ = store.update_message(&entry.peer, message);
                     None
                 }
+                (OutboxKind::FetchExpiry, Some(message)) => {
+                    // The deadline another device set (0: already gone).
+                    // Never later than ours, as in the official clients.
+                    let fetched = hash
+                        .as_deref()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|ms| if ms == 0 { now_ms() } else { ms });
+                    if let Some(fetched) = fetched {
+                        let deadline = message.expires_at.map_or(fetched, |ours| ours.min(fetched));
+                        if message.expires_at != Some(deadline) {
+                            message.expires_at = Some(deadline);
+                            let _ = store.update_message(&entry.peer, message);
+                        }
+                    }
+                    None
+                }
                 _ => None,
             };
         }
@@ -6518,7 +6646,12 @@ fn finish_outbox(
                 "outbox.failed",
                 &format!("kind={} attempt={attempts} parked={parked} error={error}", entry.kind.as_str()),
             );
-            if parked && entry.kind == OutboxKind::ReadReceipt {
+            if parked
+                && matches!(
+                    entry.kind,
+                    OutboxKind::ReadReceipt | OutboxKind::ExpireRead | OutboxKind::FetchExpiry
+                )
+            {
                 // Receipts are only a courtesy: give up.
                 let _ = store.outbox_done(entry.id);
             } else {
@@ -6776,7 +6909,23 @@ fn apply_account_state(
             if !message.outgoing && !message.is_read && message.timestamp_ms as i64 <= *last_read {
                 message.is_read = true;
                 let _ = store.mark_message_read(&peer, message);
-                if message.expiration.is_some() {
+                if expires_after_read_on_our_swarm(&peer, message) {
+                    // Read on another device. If that device already
+                    // shortened the swarm copy, its deadline is the real
+                    // one; else start now, shorten it ourselves and ask the
+                    // swarm (the earlier deadline wins), as the official
+                    // clients do.
+                    let timer = message.expiration.map_or(0, |e| u64::from(e.seconds) * 1000);
+                    match message.swarm_expiry.filter(|at| *at <= now + timer) {
+                        Some(deadline) => message.expires_at = Some(deadline),
+                        None => {
+                            message.start_expiry(Some(now));
+                            let _ = store.outbox_add(OutboxKind::ExpireRead, &peer, message.timestamp_ms, &[]);
+                            let _ = store.outbox_add(OutboxKind::FetchExpiry, &peer, message.timestamp_ms, &[]);
+                        }
+                    }
+                    let _ = store.update_message(&peer, message);
+                } else if message.expiration.is_some() {
                     message.start_expiry(Some(now));
                     let _ = store.update_message(&peer, message);
                 }
@@ -6919,6 +7068,10 @@ fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> bool {
         if message.expiration.is_some() {
             let _ = store.update_message(&peer, message);
         }
+        if expires_after_read_on_our_swarm(&peer, message) {
+            // Tell our swarm too, so other devices see the same deadline.
+            let _ = store.outbox_add(OutboxKind::ExpireRead, &peer, message.timestamp_ms, &[]);
+        }
     }
     if let Some(latest) = timestamps.iter().max() {
         store.queue_account_change(session_tui_account::AccountChange::ReadUpTo {
@@ -6939,6 +7092,16 @@ fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> bool {
         conversation.messages[index] = message;
     }
     wants_receipt
+}
+
+/// A received 1:1 message that disappears after being read and lives in our
+/// own swarm, whose expiry we can update there.
+fn expires_after_read_on_our_swarm(peer: &str, message: &Message) -> bool {
+    !message.outgoing
+        && message.sender.is_none()
+        && peer.starts_with("05")
+        && message.server_hash.is_some()
+        && message.expiration.is_some_and(|e| e.kind == 1 && e.seconds > 0)
 }
 
 /// Which messages a group "delete content" command removes.
@@ -6964,7 +7127,7 @@ impl DeleteContent<'_> {
             message.sender.as_deref()
         };
         let by_hash = message
-            .group_hash
+            .server_hash
             .as_ref()
             .is_some_and(|hash| self.hashes.contains(hash));
         if self.admin {
@@ -7064,6 +7227,11 @@ enum OutboxKind {
     SyncCopy,
     /// Read receipt; payload is the JSON list of message timestamps.
     ReadReceipt,
+    /// We read a received disappear-after-read message: shorten its life
+    /// on our swarm to the local deadline.
+    ExpireRead,
+    /// It was read on another device: fetch the deadline that device set.
+    FetchExpiry,
 }
 
 impl OutboxKind {
@@ -7072,6 +7240,8 @@ impl OutboxKind {
             Self::Text => "text",
             Self::SyncCopy => "sync_copy",
             Self::ReadReceipt => "read_receipt",
+            Self::ExpireRead => "expire_read",
+            Self::FetchExpiry => "fetch_expiry",
         }
     }
 
@@ -7080,6 +7250,8 @@ impl OutboxKind {
             "text" => Some(Self::Text),
             "sync_copy" => Some(Self::SyncCopy),
             "read_receipt" => Some(Self::ReadReceipt),
+            "expire_read" => Some(Self::ExpireRead),
+            "fetch_expiry" => Some(Self::FetchExpiry),
             _ => None,
         }
     }
@@ -7088,7 +7260,7 @@ impl OutboxKind {
     fn max_attempts(self) -> u32 {
         match self {
             Self::Text | Self::SyncCopy => 10,
-            Self::ReadReceipt => 6,
+            Self::ReadReceipt | Self::ExpireRead | Self::FetchExpiry => 6,
         }
     }
 }
@@ -7507,8 +7679,8 @@ fn finish_sync(
                 existing.swarm_hashes.push(message.hash.clone());
                 let _ = store.update_message(&message.contact_id, existing);
             }
-            if is_group && existing.group_hash.is_none() {
-                existing.group_hash = Some(message.hash.clone());
+            if is_group && existing.server_hash.is_none() {
+                existing.server_hash = Some(message.hash.clone());
                 let _ = store.update_message(&message.contact_id, existing);
             }
             continue;
@@ -7522,8 +7694,11 @@ fn finish_sync(
             // Sent from another of our devices: this is its copy in our swarm.
             local_message.swarm_hashes.push(message.hash.clone());
         }
-        if is_group {
-            local_message.group_hash = Some(message.hash.clone());
+        if is_group || !message.outgoing {
+            local_message.server_hash = Some(message.hash.clone());
+        }
+        if !is_group && !message.outgoing {
+            local_message.swarm_expiry = message.swarm_expiry;
         }
         local_message.quote = message.quote.take();
         local_message.links = std::mem::take(&mut message.links);
@@ -9311,6 +9486,79 @@ mod history_key_tests {
         assert_eq!(left, 0);
     }
 
+    fn after_read(peer_hash: &str, timestamp_ms: u64, seconds: u32) -> Message {
+        let mut message = Message::new("vanishing".into(), timestamp_ms, false);
+        message.is_read = false;
+        message.server_hash = Some(peer_hash.into());
+        message.expiration = Some(Expiration { kind: 1, seconds });
+        message
+    }
+
+    #[test]
+    fn reading_an_after_read_message_shortens_it_on_our_swarm() {
+        let (_guard, identity, store) = test_store(0x6c);
+        let peer = "05".to_owned() + &"2c".repeat(32);
+        let mut app = App::new(identity.session_id.clone());
+        app.approved.insert(peer.clone());
+        store.save_message(&peer, &after_read("h-dar", 11_000, 60)).unwrap();
+        let mut plain = Message::new("stays".into(), 11_001, false);
+        plain.is_read = false;
+        plain.server_hash = Some("h-plain".into());
+        store.save_message(&peer, &plain).unwrap();
+        store.load(&mut app).unwrap();
+        app.selected = app.conversations.iter().position(|c| c.id == peer).unwrap();
+        mark_current_conversation_read(&mut app, &store);
+        let due = store.outbox_due(now_ms());
+        let expire: Vec<_> = due.iter().filter(|e| e.kind == OutboxKind::ExpireRead).collect();
+        assert_eq!(expire.len(), 1, "only the after-read message");
+        assert_eq!(expire[0].timestamp_ms, 11_000);
+        let message = outbox_message(&mut app, expire[0]).unwrap();
+        let deadline = message.expires_at.unwrap();
+        assert!(deadline > now_ms() + 55_000 && deadline <= now_ms() + 60_000);
+    }
+
+    #[test]
+    fn a_message_read_on_another_device_keeps_that_devices_deadline() {
+        let (_guard, identity, store) = test_store(0x6d);
+        let peer = "05".to_owned() + &"2d".repeat(32);
+        let mut app = App::new(identity.session_id.clone());
+        let now = now_ms();
+        // Already shortened by the other device: 20 s left of a 60 s timer.
+        let mut shortened = after_read("h-1", 12_000, 60);
+        shortened.swarm_expiry = Some(now + 20_000);
+        // Not shortened yet: the swarm still has the original 14 days.
+        let mut original = after_read("h-2", 12_001, 60);
+        original.swarm_expiry = Some(now + 14 * 24 * 3_600_000);
+        store.save_message(&peer, &shortened).unwrap();
+        store.save_message(&peer, &original).unwrap();
+        store.load(&mut app).unwrap();
+        let state = session_tui_account::AccountState {
+            last_read: vec![(peer.clone(), 12_001)],
+            ..Default::default()
+        };
+        apply_account_state(&mut app, &store, &state);
+        let messages = &app.conversations.iter().find(|c| c.id == peer).unwrap().messages;
+        assert_eq!(messages[0].expires_at, Some(now + 20_000));
+        assert!(messages[1].expires_at.unwrap() <= now_ms() + 60_000);
+        let due = store.outbox_due(now_ms());
+        assert!(due.iter().all(|e| e.timestamp_ms == 12_001), "nothing to do for the first");
+        assert!(due.iter().any(|e| e.kind == OutboxKind::ExpireRead));
+        let fetch = due.iter().find(|e| e.kind == OutboxKind::FetchExpiry).unwrap().clone();
+        // The swarm reports an earlier deadline (set by the other device): adopted.
+        finish_outbox(&mut app, &store, &fetch, Ok(Some((now + 5_000).to_string())));
+        let messages = &app.conversations.iter().find(|c| c.id == peer).unwrap().messages;
+        assert_eq!(messages[1].expires_at, Some(now + 5_000));
+    }
+
+    #[test]
+    fn expiry_replies_are_read_in_both_shapes() {
+        let direct = serde_json::json!({"expiries": {"h": 42}});
+        assert_eq!(parse_expiry(&direct, "h"), Some(42));
+        let swarm = serde_json::json!({"swarm": {"a": {"expiries": {"h": 50}}, "b": {"expiries": {"h": 40}}}});
+        assert_eq!(parse_expiry(&swarm, "h"), Some(40));
+        assert_eq!(parse_expiry(&direct, "gone"), None);
+    }
+
     #[test]
     fn receipts_are_dropped_after_their_attempts_and_backoff_is_capped() {
         let (_guard, identity, store) = test_store(0x66);
@@ -9518,7 +9766,7 @@ mod delete_content_tests {
     fn message(sender: &str, timestamp: u64, hash: &str) -> Message {
         let mut message = Message::new("x".into(), timestamp, false);
         message.sender = Some(sender.into());
-        message.group_hash = Some(hash.into());
+        message.server_hash = Some(hash.into());
         message
     }
 
@@ -9542,7 +9790,7 @@ mod delete_content_tests {
         assert!(admin.matches(&old_bb, me) && admin.matches(&other_bb, me) && admin.matches(&cc, me));
         assert!(!admin.matches(&new_bb, me), "sent after the command");
         let mut mine = Message::new("mine".into(), 100, true);
-        mine.group_hash = Some("h-mine".into());
+        mine.server_hash = Some("h-mine".into());
         assert!(!admin.matches(&mine, me));
         let admin_me = DeleteContent { admin: true, author: "05ad", ids: &[me.to_owned()], hashes: &[], before_ms: 150 };
         assert!(admin_me.matches(&mine, me));

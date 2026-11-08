@@ -187,7 +187,7 @@ pub async fn fetch_swarm<T: Transport>(
 /// Accepts both shapes seen in the wild:
 /// * `{"snodes": [...]}` — direct shape used by snodes
 /// * `{"result": {"snodes": [...]}}` — wrapped shape from some paths
-fn parse_swarm_response(body: &[u8]) -> Result<Vec<ServiceNode>, SwarmFetchError> {
+pub(crate) fn parse_swarm_response(body: &[u8]) -> Result<Vec<ServiceNode>, SwarmFetchError> {
     let v: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| SwarmFetchError::Parse(format!("json: {e}")))?;
 

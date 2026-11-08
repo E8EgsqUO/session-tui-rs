@@ -332,20 +332,38 @@ impl<T: Transport + Clone + 'static> Network<T> {
 
         // Route the `get_snodes_for_pubkey` call over a 3-hop onion path so
         // the answering snode never sees the caller's IP.
-        let snodes = {
+        // Same steps as `swarm::fetch_swarm_via_onion`, but without holding
+        // the locks during the round trip (see `send_with_retry`).
+        use crate::network::swarm::SwarmFetchError;
+        let params = rpc::build_get_swarm_params(pubkey_hex);
+        let body = serde_json::to_vec(&params)
+            .map_err(|e| NetworkError::Swarm(SwarmFetchError::Parse(format!("encode: {e}"))))?;
+        let prepared = {
             let mut paths = self.paths.lock().await;
             let pool = self.pool.lock().await;
-            crate::network::swarm::fetch_swarm_via_onion(
-                &self.router,
-                &self.transport,
-                &pool,
-                &mut paths,
-                pubkey_hex,
-            )
-            .await?
+            let destination = pool
+                .get_unused_nodes(1, &[])
+                .pop()
+                .map(NetworkDestination::ServiceNode)
+                .ok_or(NetworkError::Swarm(SwarmFetchError::PoolEmpty))?;
+            self.router
+                .prepare(&pool, &mut paths, PathCategory::Standard, &destination, rpc::METHOD_GET_SWARM, &body)
+                .map_err(|e| NetworkError::Swarm(SwarmFetchError::Onion(Box::new(e))))?
         };
-
-        Ok(snodes)
+        let response = self.transport.send_request(&prepared.request).await;
+        let mut failed_guard = None;
+        let response = prepared.finish(response, |guard| failed_guard = Some(*guard));
+        if let Some(guard) = failed_guard {
+            self.paths.lock().await.record_failure(PathCategory::Standard, &guard);
+        }
+        let response = response.map_err(|e| NetworkError::Swarm(SwarmFetchError::Onion(Box::new(e))))?;
+        if response.status_code < 200 || response.status_code >= 300 {
+            return Err(NetworkError::Swarm(SwarmFetchError::BadStatus(
+                response.status_code.max(0) as u16,
+            )));
+        }
+        crate::network::swarm::parse_swarm_response(response.body.as_deref().unwrap_or("").as_bytes())
+            .map_err(NetworkError::Swarm)
     }
 
     async fn any_snode_destination(&self) -> Result<NetworkDestination, NetworkError> {
@@ -377,20 +395,27 @@ impl<T: Transport + Clone + 'static> Network<T> {
                 let _ = paths.build_up_to_target(category, &pool);
             }
 
-            let result = {
+            // Locks only for choosing the path and building the request, and
+            // again for recording a failure: never across the network round
+            // trip, so one slow request (e.g. a download) doesn't hold up
+            // syncs, sends and receipts.
+            let prepared = {
                 let mut paths = self.paths.lock().await;
                 let pool = self.pool.lock().await;
                 self.router
-                    .send(
-                        &self.transport,
-                        &pool,
-                        &mut paths,
-                        category,
-                        &current_dest,
-                        endpoint,
-                        body,
-                    )
-                    .await
+                    .prepare(&pool, &mut paths, category, &current_dest, endpoint, body)
+            };
+            let result = match prepared {
+                Ok(prepared) => {
+                    let response = self.transport.send_request(&prepared.request).await;
+                    let mut failed_guard = None;
+                    let result = prepared.finish(response, |guard| failed_guard = Some(*guard));
+                    if let Some(guard) = failed_guard {
+                        self.paths.lock().await.record_failure(category, &guard);
+                    }
+                    result
+                }
+                Err(error) => Err(error),
             };
 
             match result {
