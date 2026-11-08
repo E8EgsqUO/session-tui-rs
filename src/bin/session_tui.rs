@@ -8297,6 +8297,32 @@ fn message_layout_key(app: &App, message: &Message, width: usize) -> u64 {
 
 /// Rows of one message, and its attachments' row ranges within them.
 #[allow(clippy::type_complexity)]
+/// One-line excerpt of the quoted message. Some clients send the quote
+/// without its text, so fall back to the original in local history
+/// (the quote id is the original's timestamp).
+fn quote_preview(c: &Conversation, quote: &QuoteRef) -> String {
+    const MAX: usize = 40;
+    let mut text = quote.text.trim().to_string();
+    if text.is_empty() {
+        if let Some(original) = c.messages.iter().find(|m| m.timestamp_ms == quote.id) {
+            text = original.body.trim().to_string();
+            if text.is_empty() {
+                if let Some(a) = original.attachments.first() {
+                    text = format!("[{}]", a.file_name);
+                }
+            }
+        }
+    }
+    let line = text.lines().next().unwrap_or_default();
+    if line.chars().count() > MAX {
+        format!("{}…", line.chars().take(MAX).collect::<String>())
+    } else if text.lines().nth(1).is_some() {
+        format!("{line} …")
+    } else {
+        line.to_string()
+    }
+}
+
 fn message_lines(
     app: &App,
     c: &Conversation,
@@ -8386,7 +8412,7 @@ fn message_lines(
             &format!(
                 "↪ {}: {}",
                 app.sender_label(&quote.author),
-                quote.text.lines().next().unwrap_or_default()
+                quote_preview(c, quote)
             ),
             Style::default().fg(MUTED),
         );
