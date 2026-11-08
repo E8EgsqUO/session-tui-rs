@@ -66,6 +66,9 @@ rusqlite = { version = "0.32.1", features = ["bundled-sqlcipher-vendored-openssl
 tracing = "0.1.44"
 thiserror = "2.0.18"
 
+# System clipboard images for /paste
+arboard = { version = "3.4.1", default-features = false, features = ["image-data", "wayland-data-control"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 

@@ -759,6 +759,48 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
     Ok(())
 }
 
+/// Folder for `/paste` images between reading the clipboard and uploading.
+fn paste_dir() -> Result<std::path::PathBuf, String> {
+    Ok(session_data_dir()?.join("paste"))
+}
+
+fn is_pasted_image(path: &std::path::Path) -> bool {
+    paste_dir().is_ok_and(|dir| path.parent() == Some(dir.as_path()))
+}
+
+/// Delete pasted images left behind (e.g. the program was closed mid-upload).
+fn clean_paste_dir() {
+    if let Ok(dir) = paste_dir()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Save the image on the system clipboard as a PNG in [`paste_dir`].
+fn save_clipboard_image() -> Result<std::path::PathBuf, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|_| "NO CLIPBOARD (REMOTE/SSH SESSION?)".to_owned())?;
+    let image = clipboard
+        .get_image()
+        .map_err(|_| "NO IMAGE ON THE CLIPBOARD".to_owned())?;
+    let buffer = image::RgbaImage::from_raw(
+        image.width as u32,
+        image.height as u32,
+        image.bytes.into_owned(),
+    )
+    .ok_or("UNREADABLE CLIPBOARD IMAGE")?;
+    let dir = paste_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("screenshot-{}.png", now_ms()));
+    buffer
+        .save_with_format(&path, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Put `text` on the clipboard: OSC 52 for terminals that support it
 /// (Windows Terminal, most others, also over SSH), plus the desktop's own
 /// clipboard tool where there is one (VTE terminals ignore OSC 52).
@@ -4168,6 +4210,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let client = Arc::new(SessionClient::new(identity)?);
     let store = LocalStore::open(&client.identity)?;
+    clean_paste_dir();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
@@ -4986,7 +5029,24 @@ async fn run(
                 }
             }
             KeyCode::Enter => {
-                let input = app.input.clone();
+                let mut input = app.input.clone();
+                // `/paste [-- caption]`: the clipboard image becomes a
+                // temporary file sent through `/attach`, which deletes it.
+                if input.trim() == "/paste" || input.trim_start().starts_with("/paste ") {
+                    let caption = input
+                        .split_once(" -- ")
+                        .map(|(_, caption)| format!(" -- {caption}"))
+                        .unwrap_or_default();
+                    match save_clipboard_image() {
+                        Ok(path) => input = format!("/attach \"{}\"{caption}", path.display()),
+                        Err(error) => {
+                            app.input.clear();
+                            app.cursor = 0;
+                            app.status = format!("PASTE FAILED · {error}");
+                            continue;
+                        }
+                    }
+                }
                 let (command, rest) = input
                     .split_once(char::is_whitespace)
                     .map_or((input.as_str(), ""), |(c, r)| (c, r.trim()));
@@ -5057,9 +5117,11 @@ async fn run(
                             .and_then(|c| c.disappearing);
                         let paths: Vec<std::path::PathBuf> =
                             paths.into_iter().map(std::path::PathBuf::from).collect();
+                        let pasted: Vec<std::path::PathBuf> =
+                            paths.iter().filter(|p| is_pasted_image(p)).cloned().collect();
                         attachment_task = Some((
                             spawn_network(move || async move {
-                                task_client
+                                let result = task_client
                                     .send_attachments(
                                         &task_peer,
                                         &paths,
@@ -5068,7 +5130,14 @@ async fn run(
                                         quote,
                                         expiration,
                                     )
-                                    .await
+                                    .await;
+                                // Pasted screenshots are temporary: gone once
+                                // sent (or failed); the sent copy is cached
+                                // encrypted like any attachment.
+                                for path in &pasted {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                                result
                             }),
                             recipient,
                             pending_timestamp,
@@ -7342,6 +7411,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("/attach P1 [P2…] [-- caption]", "Send files as one message (max 32; quote paths with spaces)"),
             ("/view [N]", "Open image N of the selected message; ←/→ next/previous"),
+            ("/paste [-- caption]", "Send the image on the clipboard (e.g. a screenshot)"),
             ("/save [N] [PATH]", "Save attachment N, or all, to PATH or the current folder"),
         ],
     ),

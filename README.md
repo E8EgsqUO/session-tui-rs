@@ -12,6 +12,7 @@ This repository includes the Session Rust core modules used by the client, so it
 - Chat management: `/delete` deletes a chat and its messages (hidden on your other devices too; the contact stays), `/remove` removes a contact from your account and deletes the chat. Both ask for confirmation.
 - Messages are sent in the background; failed ones can be resent with `/retry`.
 - Send and receive text, images, audio and other files. Several files can go in one message (`/attach a.jpg b.jpg -- caption`), and albums are shown as one message.
+- Send a screenshot or other image straight from the clipboard with `/paste [-- caption]`. The image is saved briefly to a private temporary file, which is deleted once the upload finishes. This doesn't work over SSH, where the local clipboard isn't reachable.
 - View images with `/view N` or a mouse click, and use ←/→ to step through the images in a message. Save attachments with `/save [N] [PATH]`.
 - Emoji shortcodes such as `:joy:`, `:haha:` or `:+1:` are converted when sending.
 - Replies (`r` on a message), reactions (`+` or `/react EMOJI`), disappearing messages (`/disappear off | read 12h | send 1d`), typing indicators, link previews, and notices for screenshots, missed calls and group changes.
