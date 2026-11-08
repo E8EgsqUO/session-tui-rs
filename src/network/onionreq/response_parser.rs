@@ -290,10 +290,10 @@ fn parse_bencode_list(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             .map_err(|_| "Invalid length number in bencode string")?;
 
         let str_start = colon_pos + 1;
-        let str_end = str_start + len;
-        if str_end > data.len() {
-            return Err("Bencode string extends past data".into());
-        }
+        let str_end = str_start
+            .checked_add(len)
+            .filter(|end| *end <= data.len())
+            .ok_or("Bencode string extends past data")?;
 
         items.push(data[str_start..str_end].to_vec());
         pos = str_end;

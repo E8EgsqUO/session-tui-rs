@@ -29,6 +29,7 @@ use libsession::{
     network::{
         HttpTransport, Network, NetworkConfig,
         rpc::{self, RetrieveParams, StoreParams},
+        service_node::ServiceNode,
     },
     proto::{
         session_protos::{
@@ -135,9 +136,12 @@ struct Message {
     /// Hashes of our own copies of this message in this account's swarm
     /// (1:1 sync copies), deleted from the swarm when the message is unsent.
     swarm_hashes: Vec<String>,
+    /// Hash of a group message in the group's swarm; group "delete content"
+    /// commands name messages by it.
+    group_hash: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
 enum SendState {
     #[default]
     Sent,
@@ -242,6 +246,7 @@ impl Message {
             system: false,
             send_state: SendState::Sent,
             swarm_hashes: Vec::new(),
+            group_hash: None,
         }
     }
 
@@ -311,6 +316,15 @@ struct StoredMessage {
     system: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     swarm_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_hash: Option<String>,
+    /// Not written for sent messages (old rows read as sent).
+    #[serde(default, skip_serializing_if = "is_sent")]
+    send_state: SendState,
+}
+
+fn is_sent(state: &SendState) -> bool {
+    *state == SendState::Sent
 }
 
 /// Session's default quick reactions (the reaction bar in the apps).
@@ -378,6 +392,7 @@ const MIN_SIDEBAR_WIDTH: u16 = 20;
 /// Narrowest the chat window may get when the chat list is widened.
 const MIN_CHAT_WIDTH: u16 = 30;
 
+#[derive(Clone)]
 struct Conversation {
     name: String,
     id: String,
@@ -508,10 +523,11 @@ struct App {
     dragging_divider: bool,
     /// Last left click (time, column, row), to detect double-clicks.
     last_click: Option<(Instant, u16, u16)>,
+    /// Newest timestamp given to a message we send (see
+    /// [`next_outgoing_timestamp`]).
+    last_outgoing_ms: u64,
     /// Row count of each message in the open chat, by layout key.
     layout_heights: (String, HashMap<u64, usize>),
-    /// `/exit` was refused once because a message was still sending.
-    exit_warned: bool,
     /// Text waiting to be put on the system clipboard.
     clipboard: Option<String>,
     /// Top header (shows our own ID) and the chat's title bar.
@@ -557,8 +573,8 @@ impl App {
             dragging_divider: false,
             last_click: None,
             clipboard: None,
-            exit_warned: false,
             layout_heights: (String::new(), HashMap::new()),
+            last_outgoing_ms: 0,
             header_area: None,
             chat_title_area: None,
         }
@@ -616,6 +632,11 @@ impl App {
     fn selected_message(&self) -> Option<&Message> {
         let conversation = self.conversations.get(self.selected)?;
         conversation.messages.get(conversation.selected_message)
+    }
+
+    fn selected_message_mut(&mut self) -> Option<&mut Message> {
+        let conversation = self.conversations.get_mut(self.selected)?;
+        conversation.messages.get_mut(conversation.selected_message)
     }
 
     fn remove_selected_message(&mut self) -> Option<Message> {
@@ -699,7 +720,7 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
             return Err("selected attachment is not an image".into());
         }
         (
-            conversation.id.clone(),
+            message_blob_owner(&conversation.id, message),
             message.timestamp_ms,
             attachment_index,
             metadata,
@@ -716,7 +737,7 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
         &metadata.digest,
         metadata.deterministic,
     )?;
-    let image = image::load_from_memory(&plaintext).map_err(|e| format!("decode image: {e}"))?;
+    let image = session_tui_media::decode_image(&plaintext).map_err(|e| format!("decode image: {e}"))?;
 
     let mut picker = Picker::from_fontsize((8, 16));
     let protocol = std::env::var("SESSION_TUI_IMAGE_PROTOCOL")
@@ -759,6 +780,69 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
     Ok(())
 }
 
+/// Database key part for a message's author: the member in groups, empty
+/// for 1:1 chats and our own messages.
+fn sender_key(message: &Message) -> &str {
+    message.sender.as_deref().unwrap_or("")
+}
+
+/// Short description of what a Content carries, for the debug log.
+fn content_kind(content: &Content) -> String {
+    if let Some(receipt) = &content.receipt_message {
+        return format!("receipt:{}", if receipt.r#type == 0 { "delivery" } else { "read" });
+    }
+    if content.typing_message.is_some() {
+        return "typing".into();
+    }
+    if let Some(data) = &content.data_message {
+        if data.sync_target.is_some() {
+            return "sync_copy".into();
+        }
+        if data.reaction.is_some() {
+            return "reaction".into();
+        }
+        if data.group_update_message.is_some() {
+            return "group_update".into();
+        }
+        return "message".into();
+    }
+    if content.unsend_request.is_some() {
+        return "unsend".into();
+    }
+    if content.data_extraction_notification.is_some() {
+        return "screenshot_notice".into();
+    }
+    "other".into()
+}
+
+/// Our Session ID, so the attachment cache keeps accounts apart.
+static BLOB_ACCOUNT: OnceLock<String> = OnceLock::new();
+
+/// Name under which a message's attachments are cached: account, chat,
+/// author (group member) and direction, i.e. everything that tells apart
+/// two messages with the same timestamp in the database.
+fn blob_owner(peer: &str, sender: Option<&str>, outgoing: bool) -> String {
+    format!(
+        "v2|{}|{peer}|{}|{}",
+        BLOB_ACCOUNT.get().map_or("", String::as_str),
+        sender.unwrap_or(""),
+        if outgoing { "out" } else { "in" }
+    )
+}
+
+fn message_blob_owner(peer: &str, message: &Message) -> String {
+    blob_owner(peer, message.sender.as_deref(), message.outgoing)
+}
+
+/// Write an attachment's encrypted blob to the local cache.
+fn write_attachment_blob(owner: &str, timestamp: u64, index: usize, bytes: &[u8]) -> Result<(), String> {
+    let root = session_data_dir()?;
+    let path = session_tui_media::attachment_blob_path(&root, owner, timestamp, index);
+    let parent = path.parent().ok_or("invalid attachment cache path")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
 /// Folder for `/paste` images between reading the clipboard and uploading.
 fn paste_dir() -> Result<std::path::PathBuf, String> {
     Ok(session_data_dir()?.join("paste"))
@@ -792,12 +876,26 @@ fn save_clipboard_image() -> Result<std::path::PathBuf, String> {
         image.bytes.into_owned(),
     )
     .ok_or("UNREADABLE CLIPBOARD IMAGE")?;
+    let mut png = Vec::new();
+    buffer
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
     let dir = paste_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("screenshot-{}.png", now_ms()));
-    buffer
-        .save_with_format(&path, image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
+    // Screenshots are private: only this user may read the folder and file
+    // (Windows: %APPDATA% is already private to the user).
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|e| e.to_string())?;
+    file.write_all(&png).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -1225,7 +1323,12 @@ enum ChatEvent {
     /// Group invite received in a 1:1 chat.
     Invite(LocalGroup),
     /// An admin removed everything these members posted.
-    DeleteMemberContent(Vec<String>),
+    /// Member IDs, message hashes and the admin signature over them.
+    DeleteMemberContent {
+        ids: Vec<String>,
+        hashes: Vec<String>,
+        signature: Option<Vec<u8>>,
+    },
 }
 
 impl IncomingMessage {
@@ -1371,7 +1474,11 @@ fn parse_content(
         } else {
             update
                 .delete_member_content
-                .map(|delete| ChatEvent::DeleteMemberContent(delete.member_session_ids))
+                .map(|delete| ChatEvent::DeleteMemberContent {
+                    ids: delete.member_session_ids,
+                    hashes: delete.message_hashes,
+                    signature: delete.admin_signature,
+                })
         };
         return message.event.is_some().then_some(message);
     }
@@ -1450,6 +1557,8 @@ struct RetrieveResult {
     groups: Vec<DiscoveredGroup>,
     /// Updated per-group message cursors (group id → last hash).
     group_cursors: HashMap<String, String>,
+    /// All per-node cursors after this sync (saved with it).
+    node_cursors: Vec<(String, String)>,
     /// Joined groups we have now sent the invite acceptance to.
     invite_responses: Vec<String>,
     account: Option<AccountSyncResult>,
@@ -1459,10 +1568,26 @@ struct RetrieveResult {
 #[derive(Clone)]
 struct PendingDownload {
     peer: String,
+    /// Group member who sent it (`Message::sender`).
+    sender: Option<String>,
     timestamp_ms: u64,
     outgoing: bool,
     index: usize,
     meta: AttachmentMeta,
+}
+
+impl PendingDownload {
+    /// This job's message and attachment (same message key as the database,
+    /// and the attachment itself unchanged).
+    fn is_for(&self, message: &Message) -> bool {
+        message.timestamp_ms == self.timestamp_ms
+            && message.outgoing == self.outgoing
+            && message.sender == self.sender
+            && message
+                .attachments
+                .get(self.index)
+                .is_some_and(|meta| meta.digest == self.meta.digest)
+    }
 }
 
 struct DownloadedAttachment {
@@ -1532,6 +1657,22 @@ struct SessionClient {
     identity: Identity,
     network: Network<HttpTransport>,
     groups: Mutex<HashMap<String, GroupRuntime>>,
+    /// Swarm member we keep polling per account/group, while it answers.
+    poll_nodes: Mutex<HashMap<String, ServiceNode>>,
+    /// Message cursors per (swarm key, namespace, node), as the official
+    /// clients keep them: a node is only asked for what is new since we
+    /// last fetched from that same node, so a node that doesn't know
+    /// another node's newest hash can't make us download everything again.
+    /// Only cursors whose messages were committed to the database.
+    node_cursors: Mutex<HashMap<String, String>>,
+    /// Cursors reached by the sync in progress. They become `node_cursors`
+    /// only once `finish_sync` has committed that sync's messages, so a
+    /// failed write, rollback or timeout never moves the next start point.
+    pending_cursors: Mutex<HashMap<String, String>>,
+}
+
+fn node_cursor_key(pubkey: &str, namespace: i32, node: &ServiceNode) -> String {
+    format!("{pubkey}/{namespace}/{}", hex::encode(node.ed25519_pubkey.0))
 }
 
 /// Result of mirroring an outgoing message to this account's own swarm.
@@ -1569,7 +1710,17 @@ struct ImageViewer {
     index: usize,
 }
 
+#[derive(Default)]
+struct SyncBatch {
+    /// First failed write; the batch then rolls back.
+    error: Option<String>,
+    /// Attachment files of deleted messages, removed only after COMMIT.
+    deleted_files: Vec<std::path::PathBuf>,
+}
+
 struct LocalStore {
+    /// Open sync batch (see [`LocalStore::begin_batch`]).
+    batch: std::cell::RefCell<Option<SyncBatch>>,
     connection: Connection,
     key: [u8; 32],
 }
@@ -1605,10 +1756,31 @@ impl LocalStore {
                     body BLOB NOT NULL,
                     receipt_status INTEGER NOT NULL DEFAULT 0,
                     is_read INTEGER NOT NULL DEFAULT 1,
-                    UNIQUE(peer_id, timestamp_ms, outgoing)
+                    sender TEXT NOT NULL DEFAULT '',
+                    UNIQUE(peer_id, timestamp_ms, outgoing, sender)
                  );
                  CREATE TABLE IF NOT EXISTS seen_hashes (hash TEXT PRIMARY KEY);
                  CREATE TABLE IF NOT EXISTS sync_state (id INTEGER PRIMARY KEY CHECK(id = 1), last_hash TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS node_cursors (key TEXT PRIMARY KEY, hash TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    payload BLOB NOT NULL DEFAULT x'',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_ms INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE IF NOT EXISTS pending_receipts (
+                    peer TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    status INTEGER NOT NULL,
+                    received_ms INTEGER NOT NULL,
+                    PRIMARY KEY(peer, timestamp_ms)
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS outbox_once ON outbox(kind, peer, timestamp_ms)
+                    WHERE kind != 'read_receipt';
                  CREATE TABLE IF NOT EXISTS profiles (session_id TEXT PRIMARY KEY, display_name TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS config_dumps (slot INTEGER PRIMARY KEY, dump BLOB NOT NULL);
                  CREATE TABLE IF NOT EXISTS group_invites (
@@ -1662,7 +1834,92 @@ impl LocalStore {
                 [],
             ).map_err(|e| e.to_string())?;
         }
-        Ok(Self { connection, key })
+        let store = Self {
+            connection,
+            key,
+            batch: std::cell::RefCell::new(None),
+        };
+        store.add_sender_to_message_key()?;
+        Ok(store)
+    }
+
+    /// Older databases keyed messages on (chat, timestamp, outgoing), so two
+    /// group members posting in the same millisecond collided and one was
+    /// silently dropped. Rebuild the table with the author in the key (read
+    /// from each encrypted row) once.
+    fn add_sender_to_message_key(&self) -> Result<(), String> {
+        let table_sql: String = self
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if table_sql.contains("sender") {
+            return Ok(());
+        }
+        debug_log("history.migrate", "step=message_sender_key");
+        let migrate = || -> Result<(), String> {
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE messages_v2 (
+                        peer_id TEXT NOT NULL,
+                        timestamp_ms INTEGER NOT NULL,
+                        outgoing INTEGER NOT NULL,
+                        body BLOB NOT NULL,
+                        receipt_status INTEGER NOT NULL DEFAULT 0,
+                        is_read INTEGER NOT NULL DEFAULT 1,
+                        sender TEXT NOT NULL DEFAULT '',
+                        UNIQUE(peer_id, timestamp_ms, outgoing, sender)
+                     );",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut select = self
+                .connection
+                .prepare("SELECT peer_id, timestamp_ms, outgoing, body, receipt_status, is_read FROM messages")
+                .map_err(|e| e.to_string())?;
+            let mut rows = select.query([]).map_err(|e| e.to_string())?;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                let body: Vec<u8> = row.get(3).map_err(|e| e.to_string())?;
+                let sender = self
+                    .decrypt_body(&body)
+                    .ok()
+                    .and_then(|plain| {
+                        let json = plain.strip_prefix(STORED_MESSAGE_PREFIX)?.to_owned();
+                        serde_json::from_str::<StoredMessage>(&json).ok()?.sender
+                    })
+                    .unwrap_or_default();
+                self.connection
+                    .execute(
+                        "INSERT OR IGNORE INTO messages_v2(peer_id, timestamp_ms, outgoing, body, receipt_status, is_read, sender)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            row.get::<_, String>(0).map_err(|e| e.to_string())?,
+                            row.get::<_, i64>(1).map_err(|e| e.to_string())?,
+                            row.get::<_, bool>(2).map_err(|e| e.to_string())?,
+                            body,
+                            row.get::<_, u8>(4).map_err(|e| e.to_string())?,
+                            row.get::<_, bool>(5).map_err(|e| e.to_string())?,
+                            sender
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            drop(rows);
+            drop(select);
+            self.connection
+                .execute_batch(
+                    "DROP TABLE messages;
+                     ALTER TABLE messages_v2 RENAME TO messages;
+                     COMMIT;",
+                )
+                .map_err(|e| e.to_string())
+        };
+        migrate().inspect_err(|_| {
+            let _ = self.connection.execute_batch("ROLLBACK");
+        })
     }
 
     fn encrypt_body(&self, body: &str) -> Result<Vec<u8>, String> {
@@ -1672,6 +1929,58 @@ impl LocalStore {
             .encrypt(XNonce::from_slice(&nonce), body.as_bytes())
             .map_err(|_| "could not encrypt local message".to_string())?;
         Ok([nonce, encrypted].concat())
+    }
+
+    /// Run a write. Inside a sync batch, any failure is remembered so the
+    /// whole batch rolls back, even where the caller ignores the result.
+    fn exec<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        let result = self.connection.execute(sql, params);
+        if let Err(error) = &result
+            && let Some(batch) = self.batch.borrow_mut().as_mut()
+        {
+            batch.error.get_or_insert_with(|| error.to_string());
+        }
+        result
+    }
+
+    /// Start a sync batch: one transaction for everything a sync writes.
+    fn begin_batch(&self) -> Result<(), String> {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        *self.batch.borrow_mut() = Some(SyncBatch::default());
+        Ok(())
+    }
+
+    /// File to delete once the batch commits (kept if it rolls back).
+    fn delete_file_after_commit(&self, path: std::path::PathBuf) {
+        match self.batch.borrow_mut().as_mut() {
+            Some(batch) => batch.deleted_files.push(path),
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Commit the batch if every write succeeded, else roll it back.
+    fn end_batch(&self) -> Result<(), String> {
+        let batch = self.batch.borrow_mut().take().unwrap_or_default();
+        let result = match batch.error {
+            Some(error) => Err(error),
+            None => self.connection.execute_batch("COMMIT").map_err(|e| e.to_string()),
+        };
+        match result {
+            Ok(()) => {
+                for path in batch.deleted_files {
+                    let _ = std::fs::remove_file(path);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn decrypt_body(&self, encrypted: &[u8]) -> Result<String, String> {
@@ -1756,6 +2065,8 @@ impl LocalStore {
                 message.links = payload.links;
                 message.system = payload.system;
                 message.swarm_hashes = payload.swarm_hashes;
+                message.group_hash = payload.group_hash;
+                message.send_state = payload.send_state;
                 message.attachments = payload.attachments;
                 message.image_previews = payload.image_previews;
                 if let Some(legacy) = payload.attachment {
@@ -1776,6 +2087,48 @@ impl LocalStore {
                 shrunk |= preview.rows.len() != before;
             }
             needs_resave |= shrunk;
+            // Older builds cached attachments under the chat alone (and, for
+            // a while, chat + author). Move a file over only if it is this
+            // message's (its digest and MAC check out), so an old collision
+            // between messages with the same timestamp can't hand one
+            // message's file to another.
+            if let Some(root) = root.as_deref() {
+                let mut old_owners = vec![peer.clone()];
+                if let Some(sender) = message.sender.as_deref() {
+                    old_owners.push(format!("{peer}:{sender}"));
+                }
+                for (index, meta) in message.attachments.iter().enumerate() {
+                    let new_path = session_tui_media::attachment_blob_path(
+                        root,
+                        &message_blob_owner(&peer, &message),
+                        timestamp_ms,
+                        index,
+                    );
+                    if new_path.exists() {
+                        continue;
+                    }
+                    for old_owner in &old_owners {
+                    let old_path =
+                        session_tui_media::attachment_blob_path(root, old_owner, timestamp_ms, index);
+                    if !old_path.exists() {
+                        continue;
+                    }
+                    let belongs = std::fs::read(&old_path).is_ok_and(|blob| {
+                        session_tui_media::decrypt_attachment(
+                            &blob,
+                            &meta.key,
+                            &meta.digest,
+                            meta.deterministic,
+                        )
+                        .is_ok()
+                    });
+                    if belongs {
+                        let _ = std::fs::rename(&old_path, &new_path);
+                        break;
+                    }
+                    }
+                }
+            }
             // Rebuild missing previews from cached image blobs.
             for (index, meta) in message.attachments.iter().enumerate() {
                 if message.image_previews[index].is_some()
@@ -1784,8 +2137,12 @@ impl LocalStore {
                     continue;
                 }
                 let Some(root) = root.as_deref() else { break };
-                let path =
-                    session_tui_media::attachment_blob_path(root, &peer, timestamp_ms, index);
+                let path = session_tui_media::attachment_blob_path(
+                    root,
+                    &message_blob_owner(&peer, &message),
+                    timestamp_ms,
+                    index,
+                );
                 let Ok(blob) = std::fs::read(path) else { continue };
                 // Saved, so this decrypt + decode happens once, not every start.
                 // An image that can't be decoded gets an empty preview.
@@ -1890,7 +2247,7 @@ impl LocalStore {
     }
 
     fn save_account_dump(&self, slot: usize, dump: &[u8]) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "INSERT INTO config_dumps(slot, dump) VALUES (?1, ?2) ON CONFLICT(slot) DO UPDATE SET dump=excluded.dump",
             params![slot as i64, dump],
         ).map_err(|e| e.to_string())?;
@@ -1931,7 +2288,7 @@ impl LocalStore {
     }
 
     fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, value],
         ).map_err(|e| e.to_string())?;
@@ -1939,7 +2296,7 @@ impl LocalStore {
     }
 
     fn save_profile_name(&self, name: &str) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "INSERT INTO settings(key, value) VALUES ('profile_name', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [name],
         ).map_err(|e| e.to_string())?;
@@ -1947,7 +2304,7 @@ impl LocalStore {
     }
 
     fn save_contact_name(&self, id: &str, name: &str) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "INSERT INTO contacts(session_id, display_name) VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET display_name=excluded.display_name",
             params![id, name],
         ).map_err(|e| e.to_string())?;
@@ -1955,8 +2312,7 @@ impl LocalStore {
     }
 
     fn save_contact(&self, id: &str) -> Result<(), String> {
-        self.connection
-            .execute(
+        self.exec(
                 "INSERT OR IGNORE INTO contacts(session_id) VALUES (?1)",
                 [id],
             )
@@ -1979,16 +2335,28 @@ impl LocalStore {
             links: message.links.clone(),
             system: message.system,
             swarm_hashes: message.swarm_hashes.clone(),
+            group_hash: message.group_hash.clone(),
+            send_state: message.send_state,
         })
         .map_err(|e| e.to_string())?;
         self.encrypt_body(&format!("{STORED_MESSAGE_PREFIX}{payload}"))
     }
 
+    /// Store a message we just created; fails if that key already exists.
+    fn insert_new_message(&self, peer: &str, message: &Message) -> Result<(), String> {
+        let body = self.encrypted_payload(message)?;
+        self.exec(
+            "INSERT INTO messages(peer_id, timestamp_ms, outgoing, body, receipt_status, is_read, sender) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![peer, message.timestamp_ms as i64, message.outgoing, body, message.receipt_status, message.is_read, sender_key(message)],
+        ).map_err(|e| e.to_string())?;
+        self.save_contact(peer)
+    }
+
     fn save_message(&self, peer: &str, message: &Message) -> Result<(), String> {
         let body = self.encrypted_payload(message)?;
-        self.connection.execute(
-            "INSERT OR IGNORE INTO messages(peer_id, timestamp_ms, outgoing, body, receipt_status, is_read) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![peer, message.timestamp_ms as i64, message.outgoing, body, message.receipt_status, message.is_read],
+        self.exec(
+            "INSERT OR IGNORE INTO messages(peer_id, timestamp_ms, outgoing, body, receipt_status, is_read, sender) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![peer, message.timestamp_ms as i64, message.outgoing, body, message.receipt_status, message.is_read, sender_key(message)],
         ).map_err(|e| e.to_string())?;
         self.save_contact(peer)
     }
@@ -1996,15 +2364,15 @@ impl LocalStore {
     /// Rewrite the stored payload (e.g. after an attachment preview arrives).
     fn update_message(&self, peer: &str, message: &Message) -> Result<(), String> {
         let body = self.encrypted_payload(message)?;
-        self.connection.execute(
-            "UPDATE messages SET body = ?4 WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3",
-            params![peer, message.timestamp_ms as i64, message.outgoing, body],
+        self.exec(
+            "UPDATE messages SET body = ?4 WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3 AND sender = ?5",
+            params![peer, message.timestamp_ms as i64, message.outgoing, body, sender_key(message)],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn save_display_name(&self, id: &str, name: &str) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "INSERT INTO profiles(session_id, display_name) VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET display_name=excluded.display_name",
             params![id, name],
         ).map_err(|e| e.to_string())?;
@@ -2018,15 +2386,11 @@ impl LocalStore {
         index: usize,
         bytes: &[u8],
     ) -> Result<(), String> {
-        let root = session_data_dir()?;
-        let path = session_tui_media::attachment_blob_path(&root, peer, timestamp, index);
-        let parent = path.parent().ok_or("invalid attachment cache path")?;
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        std::fs::write(path, bytes).map_err(|e| e.to_string())
+        write_attachment_blob(peer, timestamp, index, bytes)
     }
 
     fn save_invite(&self, group: &LocalGroup, inviter: &str) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "INSERT INTO group_invites(group_id, name, auth_data, inviter) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(group_id) DO UPDATE SET name=excluded.name, auth_data=excluded.auth_data, inviter=excluded.inviter",
             params![group.id, group.name, group.auth_data, inviter],
@@ -2060,15 +2424,13 @@ impl LocalStore {
     }
 
     fn set_group_joined(&self, group_id: &str) -> Result<(), String> {
-        self.connection
-            .execute("UPDATE group_invites SET joined = 1 WHERE group_id = ?1", [group_id])
+        self.exec("UPDATE group_invites SET joined = 1 WHERE group_id = ?1", [group_id])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn set_group_responded(&self, group_id: &str) -> Result<(), String> {
-        self.connection
-            .execute("UPDATE group_invites SET responded = 1 WHERE group_id = ?1", [group_id])
+        self.exec("UPDATE group_invites SET responded = 1 WHERE group_id = ?1", [group_id])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -2076,13 +2438,9 @@ impl LocalStore {
     fn set_disappearing(&self, peer: &str, setting: Option<Expiration>) -> Result<(), String> {
         let key = format!("disappearing:{peer}");
         match setting {
-            None => self
-                .connection
-                .execute("DELETE FROM settings WHERE key = ?1", [key])
+            None => self.exec("DELETE FROM settings WHERE key = ?1", [key])
                 .map(|_| ()),
-            Some(setting) => self
-                .connection
-                .execute(
+            Some(setting) => self.exec(
                     "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     params![key, serde_json::to_string(&setting).unwrap_or_default()],
                 )
@@ -2112,7 +2470,7 @@ impl LocalStore {
     }
 
     fn set_group_cursor(&self, group: &str, hash: &str) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![format!("group_cursor:{group}"), hash],
         ).map_err(|e| e.to_string())?;
@@ -2120,30 +2478,160 @@ impl LocalStore {
     }
 
     fn update_receipt_status(&self, peer: &str, timestamp: u64, status: u8) -> Result<(), String> {
-        self.connection.execute(
-            "UPDATE messages SET receipt_status = MAX(receipt_status, ?3) WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = 1",
+        self.exec(
+            "UPDATE messages SET receipt_status = MAX(receipt_status, ?3) WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = 1 AND sender = ''",
             params![peer, timestamp as i64, status],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    fn mark_message_read(&self, peer: &str, timestamp: u64) -> Result<(), String> {
-        self.connection.execute(
-            "UPDATE messages SET is_read = 1 WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = 0",
-            params![peer, timestamp as i64],
+    fn mark_message_read(&self, peer: &str, message: &Message) -> Result<(), String> {
+        self.exec(
+            "UPDATE messages SET is_read = 1 WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = 0 AND sender = ?3",
+            params![peer, message.timestamp_ms as i64, sender_key(message)],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn mark_seen(&self, hash: &str) -> Result<bool, String> {
-        let inserted = self
-            .connection
-            .execute(
+        let inserted = self.exec(
                 "INSERT OR IGNORE INTO seen_hashes(hash) VALUES (?1)",
                 [hash],
             )
             .map_err(|e| e.to_string())?;
         Ok(inserted > 0)
+    }
+
+    /// Queue network work that must survive a restart (see [`OutboxKind`]).
+    fn outbox_add(&self, kind: OutboxKind, peer: &str, timestamp_ms: u64, payload: &[u8]) -> Result<(), String> {
+        // Each step of a message is queued once (unique index); queuing it
+        // again is a no-op.
+        self.exec(
+            "INSERT OR IGNORE INTO outbox(kind, peer, timestamp_ms, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![kind.as_str(), peer, timestamp_ms as i64, payload],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Entries due at `now_ms`, oldest first.
+    fn outbox_due(&self, now_ms: u64) -> Vec<OutboxEntry> {
+        let Ok(mut statement) = self.connection.prepare(
+            "SELECT id, kind, peer, timestamp_ms, payload, attempts FROM outbox
+             WHERE next_attempt_ms <= ?1 ORDER BY id LIMIT 32",
+        ) else {
+            return Vec::new();
+        };
+        statement
+            .query_map([now_ms as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, u32>(5)?,
+                ))
+            })
+            .map(|rows| {
+                rows.flatten()
+                    .filter_map(|(id, kind, peer, timestamp_ms, payload, attempts)| {
+                        Some(OutboxEntry {
+                            id,
+                            kind: OutboxKind::parse(&kind)?,
+                            peer,
+                            timestamp_ms: timestamp_ms as u64,
+                            payload,
+                            attempts,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn outbox_done(&self, id: i64) -> Result<(), String> {
+        self.exec("DELETE FROM outbox WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn outbox_failed(&self, id: i64, attempts: u32, next_attempt_ms: u64, error: &str) -> Result<(), String> {
+        self.exec(
+            "UPDATE outbox SET attempts = ?2, next_attempt_ms = ?3, last_error = ?4 WHERE id = ?1",
+            params![id, attempts, next_attempt_ms.min(i64::MAX as u64) as i64, error],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// `/retry`: send this message's queued work now, with a fresh budget.
+    /// Returns false when nothing was queued for it.
+    fn outbox_retry_now(&self, peer: &str, timestamp_ms: u64) -> Result<bool, String> {
+        let changed = self
+            .exec(
+                "UPDATE outbox SET attempts = 0, next_attempt_ms = 0
+                 WHERE peer = ?1 AND timestamp_ms = ?2 AND kind IN ('text', 'sync_copy')",
+                params![peer, timestamp_ms as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed > 0)
+    }
+
+    /// Keep a receipt whose message hasn't arrived yet (highest status wins).
+    fn save_pending_receipt(&self, peer: &str, timestamp_ms: u64, status: u8) -> Result<(), String> {
+        self.exec(
+            "INSERT INTO pending_receipts(peer, timestamp_ms, status, received_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(peer, timestamp_ms) DO UPDATE SET status = MAX(status, excluded.status)",
+            params![peer, timestamp_ms as i64, status, now_ms() as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The waiting receipt status for this message, removed once applied.
+    fn take_pending_receipt(&self, peer: &str, timestamp_ms: u64) -> Option<u8> {
+        let status: u8 = self
+            .connection
+            .query_row(
+                "SELECT status FROM pending_receipts WHERE peer = ?1 AND timestamp_ms = ?2",
+                params![peer, timestamp_ms as i64],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let _ = self.exec(
+            "DELETE FROM pending_receipts WHERE peer = ?1 AND timestamp_ms = ?2",
+            params![peer, timestamp_ms as i64],
+        );
+        Some(status)
+    }
+
+    /// Receipts whose message never arrived are kept for 14 days.
+    fn prune_pending_receipts(&self) {
+        let _ = self.exec(
+            "DELETE FROM pending_receipts WHERE received_ms < ?1",
+            [now_ms().saturating_sub(14 * 24 * 3_600_000) as i64],
+        );
+    }
+
+    /// Per-node message cursors, see `SessionClient::node_cursors`.
+    fn node_cursors(&self) -> HashMap<String, String> {
+        let Ok(mut statement) = self.connection.prepare("SELECT key, hash FROM node_cursors") else {
+            return HashMap::new();
+        };
+        statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    fn set_node_cursor(&self, key: &str, hash: &str) -> Result<(), String> {
+        self.exec(
+            "INSERT INTO node_cursors(key, hash) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET hash = excluded.hash",
+            params![key, hash],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn get_last_hash(&self) -> Result<Option<String>, String> {
@@ -2156,8 +2644,7 @@ impl LocalStore {
     }
 
     fn set_last_hash(&self, hash: &str) -> Result<(), String> {
-        self.connection
-            .execute(
+        self.exec(
                 "INSERT INTO sync_state(id, last_hash) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET last_hash = excluded.last_hash",
                 [hash],
             )
@@ -2166,7 +2653,7 @@ impl LocalStore {
     }
 
     fn delete_empty_contact(&self, peer: &str) -> Result<(), String> {
-        self.connection.execute(
+        self.exec(
             "DELETE FROM contacts WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE peer_id = ?1)",
             [peer],
         ).map_err(|e| e.to_string())?;
@@ -2175,17 +2662,24 @@ impl LocalStore {
 
     /// Delete one stored message and its cached attachment files.
     fn delete_message(&self, peer: &str, message: &Message) -> Result<(), String> {
-        self.connection
-            .execute(
-                "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3",
-                params![peer, message.timestamp_ms as i64, message.outgoing],
+        if message.outgoing {
+            // A deleted message is never sent (or synced) later.
+            self.exec(
+                "DELETE FROM outbox WHERE peer = ?1 AND timestamp_ms = ?2 AND kind IN ('text', 'sync_copy')",
+                params![peer, message.timestamp_ms as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        self.exec(
+                "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3 AND sender = ?4",
+                params![peer, message.timestamp_ms as i64, message.outgoing, sender_key(message)],
             )
             .map_err(|e| e.to_string())?;
         if let Ok(root) = session_data_dir() {
             for index in 0..message.attachments.len() {
-                let _ = std::fs::remove_file(session_tui_media::attachment_blob_path(
+                self.delete_file_after_commit(session_tui_media::attachment_blob_path(
                     &root,
-                    peer,
+                    &message_blob_owner(peer, message),
                     message.timestamp_ms,
                     index,
                 ));
@@ -2358,6 +2852,9 @@ impl SessionClient {
             identity,
             network: Network::new(NetworkConfig::default(), transport),
             groups: Mutex::new(HashMap::new()),
+            poll_nodes: Mutex::new(HashMap::new()),
+            node_cursors: Mutex::new(HashMap::new()),
+            pending_cursors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2405,13 +2902,61 @@ impl SessionClient {
         Ok(params)
     }
 
+    /// The swarm member to poll for `pubkey`: the same one as last time
+    /// while it is still in the swarm, else a random member.
+    async fn poll_node(&self, pubkey: &str) -> Result<ServiceNode, String> {
+        let swarm = self
+            .network
+            .swarm_nodes(pubkey)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut chosen = self.poll_nodes.lock().map_err(|_| "poll node lock")?;
+        if let Some(node) = chosen.get(pubkey)
+            && swarm.iter().any(|n| n.ed25519_pubkey == node.ed25519_pubkey)
+        {
+            return Ok(node.clone());
+        }
+        let node = swarm[rand::random::<u32>() as usize % swarm.len()].clone();
+        chosen.insert(pubkey.to_owned(), node.clone());
+        Ok(node)
+    }
+
+    /// The polled node failed or said "wrong swarm" (421): pick again next time.
+    async fn drop_poll_node(&self, pubkey: &str) {
+        if let Ok(mut chosen) = self.poll_nodes.lock() {
+            chosen.remove(pubkey);
+        }
+        self.network.forget_swarm(pubkey).await;
+    }
+
+    fn cursor_for(&self, key: &str) -> Option<String> {
+        self.node_cursors.lock().ok()?.get(key).cloned()
+    }
+
+    /// Record a candidate cursor for the sync in progress (see
+    /// `pending_cursors`); `cursor_for` keeps returning the committed one.
+    fn set_cursor(&self, key: String, hash: String) {
+        if let Ok(mut cursors) = self.pending_cursors.lock() {
+            cursors.insert(key, hash);
+        }
+    }
+
+    /// The candidate cursors of this sync, handed to `finish_sync` with its
+    /// messages.
+    fn take_pending_cursors(&self) -> Vec<(String, String)> {
+        self.pending_cursors
+            .lock()
+            .map(|mut c| c.drain().collect())
+            .unwrap_or_default()
+    }
+
     async fn retrieve_namespace_raw(
         &self,
         pubkey: &str,
         namespace: i32,
         auth: &SwarmAuth<'_>,
     ) -> Result<Vec<(String, Vec<u8>)>, String> {
-        self.retrieve_namespace_since(pubkey, namespace, auth, None)
+        self.retrieve_namespace_since(pubkey, namespace, auth, None, false)
             .await
             .map(|(messages, _)| messages)
     }
@@ -2424,13 +2969,35 @@ impl SessionClient {
         namespace: i32,
         auth: &SwarmAuth<'_>,
         cursor: Option<&str>,
+        per_node: bool,
     ) -> Result<(Vec<(String, Vec<u8>)>, Option<String>), String> {
+        // `per_node`: poll one sticky node with its own cursor; `cursor` is
+        // only the fallback for a node we have never polled.
+        let (node, key) = if per_node {
+            let node = self.poll_node(pubkey).await?;
+            let key = node_cursor_key(pubkey, namespace, &node);
+            (Some(node), Some(key))
+        } else {
+            (None, None)
+        };
         let mut all = Vec::new();
-        let mut last_hash = cursor.map(str::to_owned);
+        let mut last_hash = key
+            .as_deref()
+            .and_then(|key| self.cursor_for(key))
+            .or_else(|| cursor.map(str::to_owned));
         for _ in 0..MAX_RETRIEVE_PAGES {
-            let (page, more) = self
-                .retrieve_namespace_page(pubkey, namespace, auth, last_hash.as_deref())
-                .await?;
+            let page = self
+                .retrieve_namespace_page(pubkey, namespace, auth, last_hash.as_deref(), node.as_ref())
+                .await;
+            let (page, more) = match page {
+                Ok(page) => page,
+                Err(error) => {
+                    if per_node {
+                        self.drop_poll_node(pubkey).await;
+                    }
+                    return Err(error);
+                }
+            };
             let empty = page.is_empty();
             if let Some((hash, _)) = page.last() {
                 last_hash = Some(hash.clone());
@@ -2439,6 +3006,9 @@ impl SessionClient {
             if !more || empty {
                 break;
             }
+        }
+        if let (Some(key), Some(hash)) = (key, last_hash.clone()) {
+            self.set_cursor(key, hash);
         }
         Ok((all, last_hash))
     }
@@ -2449,6 +3019,7 @@ impl SessionClient {
         namespace: i32,
         auth: &SwarmAuth<'_>,
         last_hash: Option<&str>,
+        node: Option<&ServiceNode>,
     ) -> Result<(Vec<(String, Vec<u8>)>, bool), String> {
         let pubkey_ed25519 = hex::encode(self.identity.ed_public);
         let response = if let SwarmAuth::Group(group_auth) = auth {
@@ -2461,23 +3032,26 @@ impl SessionClient {
             if let Some(last_hash) = last_hash {
                 params.insert("last_hash".to_owned(), Value::String(last_hash.to_owned()));
             }
-            self.network
-                .send_rpc("retrieve", Value::Object(params), Some(pubkey))
-                .await
-                .map_err(|error| error.to_string())?
+            match node {
+                Some(node) => self.network.send_rpc_to(node, "retrieve", Value::Object(params)).await,
+                None => self.network.send_rpc("retrieve", Value::Object(params), Some(pubkey)).await,
+            }
+            .map_err(|error| error.to_string())?
         } else {
-            self.network
-                .send_retrieve(&RetrieveParams {
-                    pubkey,
-                    pubkey_ed25519: &pubkey_ed25519,
-                    namespace,
-                    timestamp_ms: now_ms(),
-                    last_hash,
-                    max_size: Some(1_000_000),
-                    signing_key: &self.identity.ed_secret,
-                })
-                .await
-                .map_err(|error| error.to_string())?
+            let params = RetrieveParams {
+                pubkey,
+                pubkey_ed25519: &pubkey_ed25519,
+                namespace,
+                timestamp_ms: now_ms(),
+                last_hash,
+                max_size: Some(1_000_000),
+                signing_key: &self.identity.ed_secret,
+            };
+            match node {
+                Some(node) => self.network.send_retrieve_to(node, &params).await,
+                None => self.network.send_retrieve(&params).await,
+            }
+            .map_err(|error| error.to_string())?
         };
         if response.status_code != 200 {
             let detail = response
@@ -2948,7 +3522,7 @@ impl SessionClient {
         cursor: Option<&str>,
     ) -> Result<(Vec<IncomingMessage>, Option<String>), String> {
         let (raw_messages, last_hash) = self
-            .retrieve_namespace_since(&group.id, 11, &SwarmAuth::Group(&group.auth), cursor)
+            .retrieve_namespace_since(&group.id, 11, &SwarmAuth::Group(&group.auth), cursor, true)
             .await?;
         let key_refs: Vec<&[u8]> = group.keys.iter().map(|key| key.as_slice()).collect();
         let decode_keys = DecodeEnvelopeKey {
@@ -3005,6 +3579,25 @@ impl SessionClient {
             .await)
     }
 
+    /// Send a DataMessage to its chat only (the sync copy is a separate
+    /// outbox step).
+    async fn send_to_chat(
+        &self,
+        recipient_id: &str,
+        data_message: DataMessage,
+        expiration: Option<Expiration>,
+    ) -> Result<(), String> {
+        let timestamp_ms = data_message.timestamp.ok_or("message has no timestamp")?;
+        let content = Content {
+            data_message: Some(data_message),
+            sig_timestamp: Some(timestamp_ms),
+            expiration_type: expiration.map(|e| e.kind),
+            expiration_timer: expiration.map(|e| e.seconds),
+            ..Default::default()
+        };
+        self.send_content(recipient_id, content, timestamp_ms).await.map(|_| ())
+    }
+
     /// Typing indicator for a 1:1 chat (Session does not send them to groups).
     async fn send_typing(&self, recipient_id: &str, started: bool) -> Result<(), String> {
         use libsession::proto::session_protos::{TypingMessage, typing_message::Action};
@@ -3047,10 +3640,35 @@ impl SessionClient {
         path: &std::path::Path,
     ) -> Result<(AttachmentPointer, AttachmentMeta, Vec<u8>, Option<ImagePreview>), String> {
         debug_log("attachment.begin", "reading local file");
-        let plaintext = std::fs::read(path).map_err(|e| {
-            debug_log("attachment.read_failed", &format!("error={e}"));
-            format!("read {}: {e}", path.display())
-        })?;
+        // Refuse oversized files before reading and encrypting them (the
+        // encrypted size is checked again below; it is slightly larger).
+        let limit = libsession::network::backends::file_server::default_config().max_file_size;
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > limit) {
+            return Err(format!(
+                "{} exceeds Session's {} MB file limit",
+                path.display(),
+                limit / 1_000_000
+            ));
+        }
+        // Read at most limit + 1 bytes: the file may grow after the check
+        // above, or be a device/pipe without a real size.
+        let plaintext = File::open(path)
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(limit + 1).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })
+            .map_err(|e| {
+                debug_log("attachment.read_failed", &format!("error={e}"));
+                format!("read {}: {e}", path.display())
+            })?;
+        if plaintext.len() as u64 > limit {
+            return Err(format!(
+                "{} exceeds Session's {} MB file limit",
+                path.display(),
+                limit / 1_000_000
+            ));
+        }
         if plaintext.is_empty() {
             debug_log("attachment.read_failed", "reason=empty_file");
             return Err(format!("{} is empty", path.display()));
@@ -3151,6 +3769,7 @@ impl SessionClient {
         profile_name: &str,
         quote: Option<DataQuote>,
         expiration: Option<Expiration>,
+        timestamp_ms: u64,
     ) -> Result<SentAttachments, String> {
         if paths.is_empty() {
             return Err("no files given".into());
@@ -3165,7 +3784,6 @@ impl SessionClient {
             pointers.push(pointer);
             files.push((metadata, encrypted, preview));
         }
-        let timestamp_ms = now_ms();
         let caption = caption.trim().to_owned();
         let data_message = DataMessage {
             body: (!caption.is_empty()).then(|| caption.clone()),
@@ -3409,8 +4027,9 @@ impl SessionClient {
         debug_log(
             "send.begin",
             &format!(
-                "recipient_prefix={} envelope_timestamp={} content_bytes={}",
+                "recipient_prefix={} kind={} envelope_timestamp={} content_bytes={}",
                 &recipient_id[..recipient_id.len().min(8)],
+                content_kind(&content),
                 timestamp_ms,
                 content.encoded_len()
             ),
@@ -3570,29 +4189,57 @@ impl SessionClient {
         local_groups: Vec<LocalGroup>,
         account_dumps: [Option<Vec<u8>>; 4],
         account_changes: Vec<session_tui_account::AccountChange>,
-        known_senders: HashSet<String>,
     ) -> Result<RetrieveResult, String> {
         debug_log(
             "retrieve.begin",
             &format!("cursor_present={}", last_hash.is_some()),
         );
+        // Candidates left by a sync that failed or timed out are dropped.
+        let _ = self.take_pending_cursors();
         let pubkey_ed25519 = hex::encode(self.identity.ed_public);
         let mut items: Vec<Value> = Vec::new();
-        let mut cursor = last_hash.map(str::to_owned);
+        // One sticky node with its own cursor (see `node_cursors`); the
+        // global cursor is only the starting point for a new node.
+        let node = self.poll_node(&self.identity.session_id).await?;
+        let node_key = node_cursor_key(&self.identity.session_id, 0, &node);
+        let mut cursor = self
+            .cursor_for(&node_key)
+            .or_else(|| last_hash.map(str::to_owned));
+        debug_log(
+            "retrieve.node",
+            &format!(
+                "node_prefix={} node_cursor={}",
+                &hex::encode(node.ed25519_pubkey.0)[..8],
+                self.cursor_for(&node_key).is_some()
+            ),
+        );
         for _ in 0..MAX_RETRIEVE_PAGES {
-            let response = self
+            let response = match self
                 .network
-                .send_retrieve(&RetrieveParams {
-                    pubkey: &self.identity.session_id,
-                    pubkey_ed25519: &pubkey_ed25519,
-                    namespace: 0,
-                    timestamp_ms: now_ms(),
-                    last_hash: cursor.as_deref(),
-                    max_size: Some(1_000_000),
-                    signing_key: &self.identity.ed_secret,
-                })
+                .send_retrieve_to(
+                    &node,
+                    &RetrieveParams {
+                        pubkey: &self.identity.session_id,
+                        pubkey_ed25519: &pubkey_ed25519,
+                        namespace: 0,
+                        timestamp_ms: now_ms(),
+                        last_hash: cursor.as_deref(),
+                        max_size: Some(1_000_000),
+                        signing_key: &self.identity.ed_secret,
+                    },
+                )
                 .await
-                .map_err(|e| e.to_string())?;
+            {
+                Ok(response) if response.status_code == 200 => response,
+                Ok(response) => {
+                    self.drop_poll_node(&self.identity.session_id).await;
+                    return Err(format!("Session retrieve returned HTTP {}", response.status_code));
+                }
+                Err(error) => {
+                    self.drop_poll_node(&self.identity.session_id).await;
+                    return Err(error.to_string());
+                }
+            };
             debug_log(
                 "retrieve.response",
                 &format!(
@@ -3630,13 +4277,15 @@ impl SessionClient {
                 break;
             }
         }
+        if let Some(hash) = cursor.clone() {
+            self.set_cursor(node_key, hash);
+        }
         let messages = &items;
         let last_hash = cursor.filter(|hash| Some(hash.as_str()) != last_hash);
         let mut incoming = Vec::new();
         let mut undecryptable = 0;
         let mut bad_envelope = 0;
         let mut bad_content = 0;
-        let mut delivery_receipts: HashMap<String, Vec<u64>> = HashMap::new();
         for item in messages {
             let Some(data) = item.get("data").and_then(Value::as_str) else {
                 continue;
@@ -3718,18 +4367,10 @@ impl SessionClient {
                     message.attachments.len(),
                 ),
             );
-            // Session acknowledges visible messages with a delivery receipt.
-            // Strangers (message requests) get none, so they can't tell the
-            // account is online.
-            if !message.outgoing
-                && message.body.is_some()
-                && known_senders.contains(&sender_id)
-            {
-                delivery_receipts
-                    .entry(sender_id)
-                    .or_default()
-                    .push(message.timestamp_ms);
-            }
+            // No delivery receipts: current Session clients don't send them,
+            // phones show them as empty "new message" notifications, and a
+            // swarm node that doesn't know our cursor returns the whole
+            // history, which re-acknowledged every old message.
             incoming.push(message);
         }
         let account = match self.sync_account(account_dumps, account_changes).await {
@@ -3784,13 +4425,6 @@ impl SessionClient {
                 invite_responses.push(local.id.clone());
             }
         }
-        for (sender, timestamps) in delivery_receipts {
-            if self.send_receipt(&sender, 0, timestamps).await.is_ok() {
-                debug_log("receipt.delivery.sent", "batched=true");
-            } else {
-                debug_log("receipt.delivery.failed", "send_failed=true");
-            }
-        }
         incoming.sort_by_key(|m| m.timestamp_ms);
         debug_log(
             "retrieve.parsed",
@@ -3812,6 +4446,7 @@ impl SessionClient {
             last_hash,
             groups,
             group_cursors: new_group_cursors,
+            node_cursors: self.take_pending_cursors(),
             invite_responses,
             account,
         })
@@ -4209,7 +4844,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     let client = Arc::new(SessionClient::new(identity)?);
+    let _ = BLOB_ACCOUNT.set(client.identity.session_id.clone());
     let store = LocalStore::open(&client.identity)?;
+    store.prune_pending_receipts();
+    if let Ok(mut cursors) = client.node_cursors.lock() {
+        *cursors = store.node_cursors();
+    }
     clean_paste_dir();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -4232,6 +4872,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = store.load(&mut app) {
         app.status = format!("LOCAL HISTORY ERROR · {error}");
     }
+    app.last_outgoing_ms = app
+        .conversations
+        .iter()
+        .flat_map(|c| &c.messages)
+        .filter(|m| m.outgoing)
+        .map(|m| m.timestamp_ms)
+        .max()
+        .unwrap_or(0);
     // Account state from the last sync, before the network is reached.
     if let Ok(configs) =
         session_tui_account::AccountConfigs::new(&client.identity.ed_secret, &store.account_dumps())
@@ -4331,6 +4979,29 @@ fn split_args(input: &str) -> Vec<String> {
 }
 
 /// `path`, or `name (1).ext`, `name (2).ext`… if it already exists.
+/// Write `bytes` to `path` via a temporary file in the same folder, renamed
+/// into place only when complete: a full disk or a crash never leaves a
+/// half-written file under the final name.
+fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid file name")?;
+    let temporary = path.with_file_name(format!(".{name}.{}.part", now_ms()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 fn unique_path(path: std::path::PathBuf) -> std::path::PathBuf {
     if !path.exists() {
         return path;
@@ -4390,13 +5061,14 @@ fn enqueue_missing_downloads(
                 }
                 let path = session_tui_media::attachment_blob_path(
                     &root,
-                    &conversation.id,
+                    &message_blob_owner(&conversation.id, message),
                     message.timestamp_ms,
                     index,
                 );
                 if !path.exists() {
                     queue.push_back(PendingDownload {
                         peer: conversation.id.clone(),
+                        sender: message.sender.clone(),
                         timestamp_ms: message.timestamp_ms,
                         outgoing: message.outgoing,
                         index,
@@ -4450,22 +5122,24 @@ fn finish_download(
         }
     };
     let job = &downloaded.job;
-    if let Err(error) =
-        store.save_attachment_blob(&job.peer, job.timestamp_ms, job.index, &downloaded.encrypted)
-    {
-        debug_log("attachment.cache.failed", &format!("error={error}"));
-        return;
-    }
+    // The message may have been deleted, unsent or expired meanwhile: then
+    // the file must not be written (nothing would ever clean it up).
     let Some(conversation) = app.conversations.iter_mut().find(|c| c.id == job.peer) else {
         return;
     };
-    let Some(message) = conversation
-        .messages
-        .iter_mut()
-        .find(|m| m.timestamp_ms == job.timestamp_ms && m.outgoing == job.outgoing)
-    else {
+    let Some(message) = conversation.messages.iter_mut().find(|m| job.is_for(m)) else {
+        debug_log("attachment.download.orphan", "message_gone=true discarded=true");
         return;
     };
+    if let Err(error) = store.save_attachment_blob(
+        &blob_owner(&job.peer, job.sender.as_deref(), job.outgoing),
+        job.timestamp_ms,
+        job.index,
+        &downloaded.encrypted,
+    ) {
+        debug_log("attachment.cache.failed", &format!("error={error}"));
+        return;
+    }
     if message.image_previews.len() < message.attachments.len() {
         message.image_previews.resize(message.attachments.len(), None);
     }
@@ -4485,20 +5159,21 @@ async fn run(
 ) -> io::Result<()> {
     let mut last_sync = Instant::now() - Duration::from_secs(30);
     let mut sync_task: Option<SyncTask> = None;
-    let mut read_receipt_task: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
     let mut attachment_task: Option<(
         tokio::task::JoinHandle<Result<SentAttachments, String>>,
         String,
         u64,
     )> = None;
     let mut download_task: Option<DownloadTask> = None;
+    let mut save_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut download_queue = std::collections::VecDeque::new();
     enqueue_missing_downloads(app, &mut download_queue);
-    let mut pending_read_receipts: std::collections::VecDeque<(String, Vec<u64>)> =
-        std::collections::VecDeque::new();
     // Outgoing text/reaction/timer sends: (task, chat, message timestamp).
-    let mut send_tasks: Vec<(tokio::task::JoinHandle<Result<SyncCopy, String>>, String, u64)> =
+    // Outbox work in flight (see `OutboxKind`), at most OUTBOX_PARALLEL.
+    let mut outbox_tasks: Vec<(tokio::task::JoinHandle<Result<Option<String>, String>>, OutboxEntry)> =
         Vec::new();
+    let mut last_outbox_check: Option<Instant> = None;
+    let mut exit_warned = false;
     let mut background_tasks: Vec<(tokio::task::JoinHandle<Result<(), String>>, &'static str)> =
         Vec::new();
     let mut last_typing: Option<(String, Instant)> = None;
@@ -4507,42 +5182,38 @@ async fn run(
     let mut redraw = true;
     let mut last_draw = Instant::now();
     loop {
-        // Finished text sends.
+        // Outbox: finished work.
         let mut index = 0;
-        while index < send_tasks.len() {
-            if !send_tasks[index].0.is_finished() {
+        while index < outbox_tasks.len() {
+            if !outbox_tasks[index].0.is_finished() {
                 index += 1;
                 continue;
             }
-            let (task, peer, timestamp) = send_tasks.swap_remove(index);
+            let (task, entry) = outbox_tasks.swap_remove(index);
             let result = task
                 .await
                 .unwrap_or_else(|error| Err(format!("send task failed: {error}")));
-            let Some(conversation) = app.conversations.iter_mut().find(|c| c.id == peer) else {
-                continue;
-            };
-            let Some(message) = conversation
-                .messages
-                .iter_mut()
-                .find(|m| m.outgoing && m.timestamp_ms == timestamp)
-            else {
-                continue;
-            };
-            match result {
-                Ok(sync_copy) => {
-                    message.send_state = SendState::Sent;
-                    message.swarm_hashes.extend(sync_copy.hash);
-                    let sync_copy_sent = sync_copy.sent;
-                    let saved = store.save_message(&peer, message);
-                    app.status = match saved {
-                        Err(error) => format!("SENT · LOCAL SAVE ERROR · {error}"),
-                        Ok(()) if sync_copy_sent => "SENT".into(),
-                        Ok(()) => "SENT · OTHER DEVICE SYNC COPY FAILED".into(),
-                    };
+            finish_outbox(app, store, &entry, result);
+        }
+        // Outbox: start what is due (looked up at most once a second, or
+        // right away after something was queued).
+        if last_outbox_check.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+            && outbox_tasks.len() < OUTBOX_PARALLEL
+        {
+            last_outbox_check = Some(Instant::now());
+            for entry in store.outbox_due(now_ms()) {
+                if outbox_tasks.len() >= OUTBOX_PARALLEL {
+                    break;
                 }
-                Err(error) => {
-                    message.send_state = SendState::Failed;
-                    app.status = format!("SEND FAILED · {error} · SELECT IT AND /retry");
+                if outbox_tasks.iter().any(|(_, running)| running.id == entry.id) {
+                    continue;
+                }
+                match start_outbox(client, app, &entry) {
+                    Some(task) => outbox_tasks.push((task, entry)),
+                    // Its message was deleted: nothing left to send.
+                    None => {
+                        let _ = store.outbox_done(entry.id);
+                    }
                 }
             }
         }
@@ -4565,15 +5236,14 @@ async fn run(
             last_expiry_sweep = Instant::now();
             remove_expired_messages(app, store);
         }
-        if read_receipt_task
-            .as_ref()
-            .is_some_and(|task| task.is_finished())
-            && let Some(task) = read_receipt_task.take()
+        if save_task.as_ref().is_some_and(|task| task.is_finished())
+            && let Some(task) = save_task.take()
         {
-            match task.await {
-                Ok(Ok(())) => debug_log("receipt.read.sent", "sent=true"),
-                _ => debug_log("receipt.read.failed", "send_failed=true"),
-            }
+            app.status = match task.await {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => format!("SAVE FAILED · {error}"),
+                Err(error) => format!("SAVE FAILED · {error}"),
+            };
         }
         if download_task.as_ref().is_some_and(|task| task.is_finished())
             && let Some(task) = download_task.take()
@@ -4588,12 +5258,11 @@ async fn run(
         {
             // Files from strangers are fetched (and images decoded) only
             // once the request is accepted; /accept queues them again.
-            let from_request = app
-                .conversations
-                .iter()
-                .find(|c| c.id == job.peer)
-                .is_some_and(|c| app.is_request(c));
-            if !from_request {
+            let conversation = app.conversations.iter().find(|c| c.id == job.peer);
+            let from_request = conversation.is_some_and(|c| app.is_request(c));
+            let still_there =
+                conversation.is_some_and(|c| c.messages.iter().any(|m| job.is_for(m)));
+            if !from_request && still_there {
                 download_task = Some(start_download(client, job));
             }
         }
@@ -4623,7 +5292,7 @@ async fn run(
                             sent.files.into_iter().enumerate()
                         {
                             let _ = store.save_attachment_blob(
-                                &peer,
+                                &blob_owner(&peer, None, true),
                                 sent.timestamp_ms,
                                 index,
                                 &encrypted,
@@ -4638,7 +5307,13 @@ async fn run(
                         app.status = if sent.sync_copy.sent {
                             "ATTACHMENT SENT · SYNCED TO YOUR OTHER DEVICES".into()
                         } else {
-                            "ATTACHMENT SENT · DEVICE SYNC COPY FAILED".into()
+                            // Retried from the outbox (rebuilt from the
+                            // stored message and its attachment pointers).
+                            if peer.starts_with("05") && peer != app.local_id {
+                                let _ = store.outbox_add(OutboxKind::SyncCopy, &peer, sent.timestamp_ms, &[]);
+                                last_outbox_check = None;
+                            }
+                            "ATTACHMENT SENT · DEVICE SYNC COPY WILL BE RETRIED".into()
                         };
                         app.sort_conversations();
                     }
@@ -4666,15 +5341,9 @@ async fn run(
         if app.recovery_seed.is_none()
             && !app.show_help
             && app.window_focused
-            && let Some(receipt) = mark_current_conversation_read(app, store)
-            && !receipt.0.starts_with("03")
+            && mark_current_conversation_read(app, store)
         {
-            pending_read_receipts.push_back(receipt);
-        }
-        if read_receipt_task.is_none()
-            && let Some((peer, timestamps)) = pending_read_receipts.pop_front()
-        {
-            read_receipt_task = Some(start_read_receipt(Arc::clone(client), peer, timestamps));
+            last_outbox_check = None;
         }
         if sync_task.as_ref().is_some_and(|task| task.is_finished())
             && let Some(task) = sync_task.take()
@@ -4689,6 +5358,7 @@ async fn run(
                 &client.identity.session_id,
                 result,
                 &mut download_queue,
+                Some(&client.node_cursors),
             );
             if new_messages > 0 && app.bell {
                 // BEL: Windows Terminal beeps and/or flashes the taskbar,
@@ -5050,6 +5720,33 @@ async fn run(
                 let (command, rest) = input
                     .split_once(char::is_whitespace)
                     .map_or((input.as_str(), ""), |(c, r)| (c, r.trim()));
+                // `/1`–`/9`: switch to that chat, numbered top to bottom
+                // as in the chat list.
+                if rest.is_empty()
+                    && let Some(number) = command
+                        .strip_prefix('/')
+                        .filter(|n| n.len() == 1)
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .filter(|n| *n >= 1)
+                {
+                    app.input.clear();
+                    app.cursor = 0;
+                    let count = app.conversations.len();
+                    if number <= count {
+                        app.selected = number - 1;
+                        app.status = format!(
+                            "CHAT {number} · {}",
+                            app.conversations[number - 1].title(&app.local_id)
+                        );
+                    } else {
+                        app.status = match count {
+                            0 => "NO CHATS YET · CTRL+N TO ADD ONE".into(),
+                            1 => "ONLY 1 CHAT · USE /1".into(),
+                            n => format!("ONLY {n} CHATS · USE /1–/{}", n.min(9)),
+                        };
+                    }
+                    continue;
+                }
                 match command {
                     "/attach" => {
                         app.input.clear();
@@ -5096,7 +5793,7 @@ async fn run(
                         } else {
                             format!("{} files", paths.len())
                         };
-                        let pending_timestamp = now_ms();
+                        let pending_timestamp = next_outgoing_timestamp(&mut app.last_outgoing_ms);
                         if let Some(conversation) = app.conversations.get_mut(app.selected) {
                             conversation.messages.push(Message::new(
                                 format!("Uploading · {label}"),
@@ -5129,6 +5826,7 @@ async fn run(
                                         &profile_name,
                                         quote,
                                         expiration,
+                                        pending_timestamp,
                                     )
                                     .await;
                                 // Pasted screenshots are temporary: gone once
@@ -5157,7 +5855,11 @@ async fn run(
                         let Some((peer, timestamp, attachments)) =
                             app.conversations.get(app.selected).and_then(|c| {
                                 let m = c.messages.get(c.selected_message)?;
-                                Some((c.id.clone(), m.timestamp_ms, m.attachments.clone()))
+                                Some((
+                                    message_blob_owner(&c.id, m),
+                                    m.timestamp_ms,
+                                    m.attachments.clone(),
+                                ))
                             })
                         else {
                             app.status = "SELECT AN ATTACHMENT WITH ↑/↓ FIRST".into();
@@ -5190,66 +5892,92 @@ async fn run(
                             app.status = format!("NOT A FOLDER · {}", dir.display());
                             continue;
                         }
-                        app.status = "SAVING ATTACHMENT…".into();
-                        terminal.draw(|frame| draw(frame, app))?;
-                        let mut saved = Vec::new();
-                        let mut failure = None;
-                        for index in selected {
-                            let metadata = &attachments[index];
-                            let destination = if into_dir {
-                                unique_path(
-                                    target_path
-                                        .clone()
-                                        .unwrap_or_else(|| cwd.clone())
-                                        .join(attachment_file_name(metadata)),
-                                )
-                            } else {
-                                target_path.clone().expect("single file target")
-                            };
-                            let result = async {
-                                let cache_path = session_tui_media::attachment_blob_path(
-                                    &session_data_dir()?,
-                                    &peer,
-                                    timestamp,
-                                    index,
-                                );
-                                let encrypted = match std::fs::read(&cache_path) {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => {
-                                        let pointer = attachment_pointer_from_meta(metadata);
-                                        let (_, bytes, _) =
-                                            client.download_attachment(&pointer).await?;
-                                        store.save_attachment_blob(&peer, timestamp, index, &bytes)?;
-                                        bytes
-                                    }
-                                };
-                                let plaintext = session_tui_media::decrypt_attachment(
-                                    &encrypted,
-                                    &metadata.key,
-                                    &metadata.digest,
-                                    metadata.deterministic,
-                                )?;
-                                std::fs::write(&destination, plaintext).map_err(|e| e.to_string())?;
-                                Ok::<(), String>(())
-                            }
-                            .await;
-                            match result {
-                                Ok(()) => saved.push(destination),
-                                Err(error) => {
-                                    failure = Some(format!("{} · {error}", metadata.file_name));
-                                    break;
-                                }
-                            }
+                        // Never overwrite an existing file silently.
+                        if !into_dir
+                            && let Some(file) = target_path.as_ref()
+                            && file.exists()
+                        {
+                            app.status = format!(
+                                "FILE EXISTS · {} · CHOOSE ANOTHER NAME OR A FOLDER",
+                                file.display()
+                            );
+                            continue;
                         }
-                        app.status = match (failure, saved.as_slice()) {
-                            (Some(error), _) => format!("SAVE FAILED · {error}"),
-                            (None, [one]) => format!("SAVED FILE · {}", one.display()),
-                            (None, many) => format!(
-                                "SAVED {} FILES · {}",
-                                many.len(),
-                                target_path.unwrap_or(cwd).display()
-                            ),
-                        };
+                        if save_task.is_some() {
+                            app.status = "A SAVE IS ALREADY RUNNING".into();
+                            continue;
+                        }
+                        app.status = "SAVING ATTACHMENT…".into();
+                        // Download (if not cached), decrypt and write on the
+                        // network thread, so the interface never waits.
+                        let task_client = Arc::clone(client);
+                        save_task = Some(spawn_network(move || async move {
+                            let mut saved = Vec::new();
+                            for index in selected {
+                                let metadata = &attachments[index];
+                                let destination = if into_dir {
+                                    unique_path(
+                                        target_path
+                                            .clone()
+                                            .unwrap_or_else(|| cwd.clone())
+                                            .join(attachment_file_name(metadata)),
+                                    )
+                                } else {
+                                    target_path.clone().expect("single file target")
+                                };
+                                let result = async {
+                                    let cache_path = session_tui_media::attachment_blob_path(
+                                        &session_data_dir()?,
+                                        &peer,
+                                        timestamp,
+                                        index,
+                                    );
+                                    let encrypted = match std::fs::read(&cache_path) {
+                                        Ok(bytes) => bytes,
+                                        Err(_) => {
+                                            let pointer = attachment_pointer_from_meta(metadata);
+                                            let (_, bytes, _) =
+                                                task_client.download_attachment(&pointer).await?;
+                                            write_attachment_blob(&peer, timestamp, index, &bytes)?;
+                                            bytes
+                                        }
+                                    };
+                                    // CPU and disk work on a blocking thread,
+                                    // not the shared network thread.
+                                    let (key, digest, deterministic, target) = (
+                                        metadata.key.clone(),
+                                        metadata.digest.clone(),
+                                        metadata.deterministic,
+                                        destination.clone(),
+                                    );
+                                    tokio::task::spawn_blocking(move || {
+                                        let plaintext = session_tui_media::decrypt_attachment(
+                                            &encrypted,
+                                            &key,
+                                            &digest,
+                                            deterministic,
+                                        )?;
+                                        write_file_atomically(&target, &plaintext)
+                                    })
+                                    .await
+                                    .map_err(|e| e.to_string())??;
+                                    Ok::<(), String>(())
+                                }
+                                .await;
+                                if let Err(error) = result {
+                                    return Err(format!("{} · {error}", metadata.file_name));
+                                }
+                                saved.push(destination);
+                            }
+                            Ok(match saved.as_slice() {
+                                [one] => format!("SAVED FILE · {}", one.display()),
+                                many => format!(
+                                    "SAVED {} FILES · {}",
+                                    many.len(),
+                                    target_path.unwrap_or(cwd).display()
+                                ),
+                            })
+                        }));
                     }
                     "/name" if rest.is_empty() => {
                         app.input.clear();
@@ -5275,17 +6003,14 @@ async fn run(
                         }
                     }
                     "/exit" if rest.is_empty() => {
-                        // Quitting no longer waits for network work, so
-                        // don't silently drop a message that is still going out.
-                        let sending = app
-                            .conversations
-                            .iter()
-                            .flat_map(|c| &c.messages)
-                            .any(|m| m.send_state == SendState::Sending);
-                        if sending && !app.exit_warned {
+                        // Unsent texts are in the outbox and go out on the
+                        // next start. An upload in progress is not resumed,
+                        // so say so once.
+                        if attachment_task.is_some() && !exit_warned {
                             app.input.clear();
-                            app.exit_warned = true;
-                            app.status = "STILL SENDING · /exit AGAIN TO QUIT ANYWAY".into();
+                            exit_warned = true;
+                            app.status =
+                                "AN ATTACHMENT IS STILL UPLOADING AND WON'T RESUME · /exit AGAIN TO QUIT".into();
                             continue;
                         }
                         return Ok(());
@@ -5391,20 +6116,43 @@ async fn run(
                     }
                     "/retry" => {
                         app.input.clear();
-                        let retry = app.conversations.get_mut(app.selected).and_then(|c| {
-                            let message = c.messages.get_mut(c.selected_message)?;
-                            (message.outgoing && message.send_state == SendState::Failed).then(|| {
-                                message.send_state = SendState::Sending;
-                                (c.id.clone(), message.clone())
-                            })
+                        // A failed message, or a sent one whose sync copy
+                        // for other devices ran out of attempts: retry what
+                        // is queued for it (a sent message is not resent).
+                        let selected = app.conversations.get(app.selected).and_then(|c| {
+                            let message = c.messages.get(c.selected_message)?;
+                            (message.outgoing && !message.system).then(|| (c.id.clone(), message.clone()))
                         });
-                        match retry {
-                            Some((peer, message)) => {
-                                send_tasks.push(spawn_text_send(client, app, &peer, &message));
-                                app.status = "RETRYING…".into();
-                            }
-                            None => app.status = "SELECT A FAILED MESSAGE TO RETRY".into(),
+                        let Some((peer, mut message)) = selected else {
+                            app.status = "SELECT ONE OF YOUR MESSAGES TO RETRY".into();
+                            continue;
+                        };
+                        let queued = store.outbox_retry_now(&peer, message.timestamp_ms).unwrap_or(false);
+                        if message.send_state == SendState::Failed {
+                            message.send_state = SendState::Sending;
+                            let saved = store.begin_batch().and_then(|()| {
+                                let _ = store.update_message(&peer, &message);
+                                if !queued {
+                                    // Failed in an older build: queue it now.
+                                    let _ = store.outbox_add(OutboxKind::Text, &peer, message.timestamp_ms, &[]);
+                                }
+                                store.end_batch()
+                            });
+                            app.status = match saved {
+                                Ok(()) => {
+                                    if let Some(m) = app.selected_message_mut() {
+                                        m.send_state = SendState::Sending;
+                                    }
+                                    "RETRYING…".into()
+                                }
+                                Err(error) => format!("RETRY NOT SAVED · {error}"),
+                            };
+                        } else if queued {
+                            app.status = "RETRYING THE OTHER-DEVICE SYNC COPY…".into();
+                        } else {
+                            app.status = "NOTHING TO RETRY FOR THIS MESSAGE".into();
                         }
+                        last_outbox_check = None;
                     }
                     "/react" => {
                         app.input.clear();
@@ -5572,17 +6320,26 @@ async fn run(
                                 },
                             );
                         }
-                        let mut message = Message::new(expand_shortcodes(&body), now_ms(), true);
+                        let timestamp = next_outgoing_timestamp(&mut app.last_outgoing_ms);
+                        let mut message = Message::new(expand_shortcodes(&body), timestamp, true);
                         message.send_state = SendState::Sending;
-                        message.quote = app.reply_to.take();
+                        message.quote = app.reply_to.clone();
                         message.expiration = conversation.disappearing;
                         message.start_expiry(None);
-                        conversation.messages.push(message.clone());
+                        // Saved (with its outbox entry) before the input is
+                        // cleared: if that fails, nothing is lost.
+                        if let Err(error) = queue_outgoing(store, &peer, &message) {
+                            app.status = format!("NOT SENT · LOCAL SAVE FAILED · {error}");
+                            continue;
+                        }
+                        app.reply_to = None;
+                        conversation.messages.push(message);
                         conversation.selected_message = conversation.messages.len() - 1;
                         conversation.refresh_preview();
                         app.input.clear();
+                        app.cursor = 0;
                         last_typing = None;
-                        send_tasks.push(spawn_text_send(client, app, &peer, &message));
+                        last_outbox_check = None;
                         app.sort_conversations();
                         app.status = "SENDING…".into();
                     }
@@ -5630,31 +6387,177 @@ fn data_quote(quote: QuoteRef) -> DataQuote {
 }
 
 /// Send a text message (already shown as "sending") in the background.
-fn spawn_text_send(
+/// At most this many outbox items are sent at once.
+const OUTBOX_PARALLEL: usize = 4;
+
+/// Start one outbox item; `None` when its message no longer exists.
+fn start_outbox(
     client: &Arc<SessionClient>,
-    app: &App,
-    peer: &str,
-    message: &Message,
-) -> (tokio::task::JoinHandle<Result<SyncCopy, String>>, String, u64) {
-    let data_message = DataMessage {
-        body: Some(message.body.clone()),
-        timestamp: Some(message.timestamp_ms),
-        profile: profile_for(&app.profile_name, message.timestamp_ms),
-        quote: message.quote.clone().map(data_quote),
-        ..Default::default()
-    };
-    let expiration = message.expiration;
+    app: &mut App,
+    entry: &OutboxEntry,
+) -> Option<tokio::task::JoinHandle<Result<Option<String>, String>>> {
     let task_client = Arc::clone(client);
-    let task_peer = peer.to_owned();
-    (
-        spawn_network(move || async move {
-            task_client
-                .send_data_message(&task_peer, data_message, expiration)
-                .await
-        }),
-        peer.to_owned(),
-        message.timestamp_ms,
-    )
+    let peer = entry.peer.clone();
+    // Blocked since it was queued, or we may no longer post in the group:
+    // don't send; it fails (and is kept for /retry once that changes).
+    let refused = if app.blocked.contains(&entry.peer) {
+        Some("contact is blocked")
+    } else if app
+        .conversations
+        .iter()
+        .any(|c| c.id == entry.peer && c.read_only)
+        && entry.kind == OutboxKind::Text
+    {
+        Some("you can no longer post in this group")
+    } else {
+        None
+    };
+    if let Some(reason) = refused {
+        return Some(tokio::spawn(async move { Err(reason.to_owned()) }));
+    }
+    match entry.kind {
+        OutboxKind::Text | OutboxKind::SyncCopy => {
+            let profile_name = app.profile_name.clone();
+            let message = app
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == entry.peer)?
+                .messages
+                .iter_mut()
+                .find(|m| m.outgoing && !m.system && m.timestamp_ms == entry.timestamp_ms)?;
+            // Gone by the time it would go out: expired, so nothing to send.
+            if message.expires_at.is_some_and(|at| at <= now_ms()) {
+                return None;
+            }
+            let data_message = outgoing_data_message(&profile_name, message);
+            let expiration = message.expiration;
+            let timestamp_ms = message.timestamp_ms;
+            if entry.kind == OutboxKind::Text {
+                message.send_state = SendState::Sending;
+                Some(spawn_network(move || async move {
+                    task_client
+                        .send_to_chat(&peer, data_message, expiration)
+                        .await
+                        .map(|()| None)
+                }))
+            } else {
+                Some(spawn_network(move || async move {
+                    let copy = task_client
+                        .send_sync_copy(&peer, data_message, timestamp_ms, expiration)
+                        .await;
+                    if copy.sent {
+                        Ok(copy.hash)
+                    } else {
+                        Err("sync copy failed".into())
+                    }
+                }))
+            }
+        }
+        OutboxKind::ReadReceipt => {
+            let timestamps: Vec<u64> = serde_json::from_slice(&entry.payload).ok()?;
+            Some(spawn_network(move || async move {
+                task_client.send_receipt(&peer, 1, timestamps).await.map(|()| None)
+            }))
+        }
+    }
+}
+
+/// The outgoing message an outbox item belongs to.
+fn outbox_message<'a>(app: &'a mut App, entry: &OutboxEntry) -> Option<&'a mut Message> {
+    app.conversations
+        .iter_mut()
+        .find(|c| c.id == entry.peer)?
+        .messages
+        .iter_mut()
+        .find(|m| m.outgoing && !m.system && m.timestamp_ms == entry.timestamp_ms)
+}
+
+/// Record the outcome of one outbox item: done (and the next step queued),
+/// or failed with a later retry. The database is updated first, in one
+/// transaction; the screen only changes once that has committed.
+fn finish_outbox(
+    app: &mut App,
+    store: &LocalStore,
+    entry: &OutboxEntry,
+    result: Result<Option<String>, String>,
+) {
+    let local_id = app.local_id.clone();
+    let mut updated = outbox_message(app, entry).map(|m| m.clone());
+    let status;
+    if let Err(error) = store.begin_batch() {
+        // Left in the outbox as it was: tried again later.
+        app.status = format!("SEND STATE NOT SAVED · {error}");
+        return;
+    }
+    match &result {
+        Ok(hash) => {
+            debug_log("outbox.done", &format!("kind={}", entry.kind.as_str()));
+            let _ = store.outbox_done(entry.id);
+            status = match (entry.kind, updated.as_mut()) {
+                (OutboxKind::Text, Some(message)) => {
+                    message.send_state = SendState::Sent;
+                    let _ = store.update_message(&entry.peer, message);
+                    // Then its copy for our other devices, as its own step.
+                    if entry.peer.starts_with("05") && entry.peer != local_id {
+                        let _ = store.outbox_add(OutboxKind::SyncCopy, &entry.peer, entry.timestamp_ms, &[]);
+                    }
+                    Some("SENT".to_owned())
+                }
+                (OutboxKind::SyncCopy, Some(message)) => {
+                    message.swarm_hashes.extend(hash.clone());
+                    let _ = store.update_message(&entry.peer, message);
+                    None
+                }
+                _ => None,
+            };
+        }
+        Err(error) => {
+            let attempts = entry.attempts + 1;
+            let parked = attempts >= entry.kind.max_attempts();
+            debug_log(
+                "outbox.failed",
+                &format!("kind={} attempt={attempts} parked={parked} error={error}", entry.kind.as_str()),
+            );
+            if parked && entry.kind == OutboxKind::ReadReceipt {
+                // Receipts are only a courtesy: give up.
+                let _ = store.outbox_done(entry.id);
+            } else {
+                // Out of automatic attempts: wait for /retry.
+                let next = if parked { u64::MAX } else { now_ms() + outbox_backoff_ms(attempts) };
+                let _ = store.outbox_failed(entry.id, attempts, next, error);
+            }
+            status = match (entry.kind, updated.as_mut()) {
+                (OutboxKind::Text, Some(message)) => {
+                    message.send_state = SendState::Failed;
+                    let _ = store.update_message(&entry.peer, message);
+                    Some(if parked {
+                        format!("SEND FAILED · {error} · SELECT IT AND /retry")
+                    } else {
+                        format!(
+                            "SEND FAILED · {error} · RETRYING IN {} S",
+                            outbox_backoff_ms(attempts) / 1000
+                        )
+                    })
+                }
+                (OutboxKind::SyncCopy, Some(_)) if parked => {
+                    Some("OTHER-DEVICE SYNC COPY FAILED · SELECT THE MESSAGE AND /retry".to_owned())
+                }
+                _ => None,
+            };
+        }
+    }
+    if let Err(error) = store.end_batch() {
+        // Nothing changed: the item is retried as it was.
+        debug_log("outbox.save_failed", &format!("error={error}"));
+        app.status = format!("SEND STATE NOT SAVED · {error}");
+        return;
+    }
+    if let (Some(updated), Some(message)) = (updated, outbox_message(app, entry)) {
+        *message = updated;
+    }
+    if let Some(status) = status {
+        app.status = status;
+    }
 }
 
 /// Add or remove (if already ours) a reaction on a message and record it.
@@ -5872,7 +6775,7 @@ fn apply_account_state(
         for message in &mut conversation.messages {
             if !message.outgoing && !message.is_read && message.timestamp_ms as i64 <= *last_read {
                 message.is_read = true;
-                let _ = store.mark_message_read(&peer, message.timestamp_ms);
+                let _ = store.mark_message_read(&peer, message);
                 if message.expiration.is_some() {
                     message.start_expiry(Some(now));
                     let _ = store.update_message(&peer, message);
@@ -5913,17 +6816,6 @@ fn start_sync(
     );
     let account_dumps = store.account_dumps();
     let account_changes = store.pending_account_changes();
-    let known_senders: HashSet<String> = app
-        .approved
-        .iter()
-        .cloned()
-        .chain(
-            app.conversations
-                .iter()
-                .filter(|c| c.messages.iter().any(|m| m.outgoing))
-                .map(|c| c.id.clone()),
-        )
-        .collect();
     let client = Arc::clone(client);
     // Network bootstrap keeps ThreadRng across an await, making the future
     // !Send, so it runs on a dedicated current-thread runtime.
@@ -5936,7 +6828,6 @@ fn start_sync(
                 local_groups,
                 account_dumps,
                 account_changes,
-                known_senders,
             ),
         )
         .await
@@ -5985,24 +6876,48 @@ fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) 
     }
 }
 
-fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> Option<(String, Vec<u64>)> {
-    // Opening a message request must not tell the stranger it was read.
-    let is_request = app.is_request(app.conversations.get(app.selected)?);
-    let conversation = app.conversations.get_mut(app.selected)?;
+/// Mark the open chat read. The read flags, disappear-after-read timers,
+/// the read state for other devices and the read receipt are written in one
+/// transaction and only then applied on screen: either all of it happens,
+/// or none of it and it is tried again on the next pass. Returns true when
+/// a read receipt was queued.
+fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> bool {
+    let Some(conversation) = app.conversations.get(app.selected) else {
+        return false;
+    };
+    // A message request must not tell the stranger it was read; groups and
+    // Note to Self get no receipts.
+    let wants_receipt = !app.is_request(conversation)
+        && conversation.id.starts_with("05")
+        && conversation.id != app.local_id;
     let peer = conversation.id.clone();
-    let mut timestamps = Vec::new();
     let now = now_ms();
-    for message in &mut conversation.messages {
-        if !message.outgoing && !message.is_read {
-            message.is_read = true;
-            timestamps.push(message.timestamp_ms);
-            if let Err(error) = store.mark_message_read(&peer, message.timestamp_ms) {
-                app.status = format!("READ STATE SAVE FAILED · {error}");
+    let updated: Vec<(usize, Message)> = conversation
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !m.outgoing && !m.is_read)
+        .map(|(index, m)| {
+            let mut m = m.clone();
+            m.is_read = true;
+            if m.expiration.is_some() {
+                m.start_expiry(Some(now));
             }
-            if message.expiration.is_some() {
-                message.start_expiry(Some(now));
-                let _ = store.update_message(&peer, message);
-            }
+            (index, m)
+        })
+        .collect();
+    if updated.is_empty() {
+        return false;
+    }
+    let timestamps: Vec<u64> = updated.iter().map(|(_, m)| m.timestamp_ms).collect();
+    if let Err(error) = store.begin_batch() {
+        app.status = format!("READ STATE SAVE FAILED · {error}");
+        return false;
+    }
+    for (_, message) in &updated {
+        let _ = store.mark_message_read(&peer, message);
+        if message.expiration.is_some() {
+            let _ = store.update_message(&peer, message);
         }
     }
     if let Some(latest) = timestamps.iter().max() {
@@ -6011,15 +6926,83 @@ fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> Option<(
             timestamp_ms: *latest as i64,
         });
     }
-    (!timestamps.is_empty() && !is_request).then_some((peer, timestamps))
+    if wants_receipt {
+        let payload = serde_json::to_vec(&timestamps).unwrap_or_default();
+        let _ = store.outbox_add(OutboxKind::ReadReceipt, &peer, 0, &payload);
+    }
+    if let Err(error) = store.end_batch() {
+        app.status = format!("READ STATE SAVE FAILED · {error}");
+        return false;
+    }
+    let conversation = &mut app.conversations[app.selected];
+    for (index, message) in updated {
+        conversation.messages[index] = message;
+    }
+    wants_receipt
 }
 
-fn start_read_receipt(
-    client: Arc<SessionClient>,
-    peer: String,
-    timestamps: Vec<u64>,
-) -> tokio::task::JoinHandle<Result<(), String>> {
-    spawn_network(move || async move { client.send_receipt(&peer, 1, timestamps).await })
+/// Which messages a group "delete content" command removes.
+struct DeleteContent<'a> {
+    /// Carries a valid admin signature.
+    admin: bool,
+    /// Who sent the command.
+    author: &'a str,
+    ids: &'a [String],
+    hashes: &'a [String],
+    /// Signature timestamp: later messages are never affected.
+    before_ms: u64,
+}
+
+impl DeleteContent<'_> {
+    fn matches(&self, message: &Message, local_id: &str) -> bool {
+        if message.system || message.timestamp_ms > self.before_ms {
+            return false;
+        }
+        let author = if message.outgoing {
+            Some(local_id)
+        } else {
+            message.sender.as_deref()
+        };
+        let by_hash = message
+            .group_hash
+            .as_ref()
+            .is_some_and(|hash| self.hashes.contains(hash));
+        if self.admin {
+            let by_member = author.is_some_and(|author| {
+                author.starts_with("05") && self.ids.iter().any(|id| id == author)
+            });
+            by_member || by_hash
+        } else {
+            by_hash && author == Some(self.author)
+        }
+    }
+}
+
+/// Check a `GroupUpdateDeleteMemberContentMessage` admin signature: Ed25519
+/// by the group key (the group ID without its `03` prefix) over
+/// `"DELETE_CONTENT" ‖ timestamp ‖ member IDs ‖ message hashes`, as the
+/// official clients sign it.
+fn verify_delete_content_signature(
+    group_id: &str,
+    timestamp_ms: u64,
+    ids: &[String],
+    hashes: &[String],
+    signature: &[u8],
+) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Some(key) = group_id
+        .strip_prefix("03")
+        .and_then(|hex_key| hex::decode(hex_key).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+    else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return false;
+    };
+    let signed = format!("DELETE_CONTENT{timestamp_ms}{}{}", ids.concat(), hashes.concat());
+    key.verify(signed.as_bytes(), &signature).is_ok()
 }
 
 /// Apply an UnsendRequest the way Session does: only the author may unsend,
@@ -6070,12 +7053,117 @@ fn apply_unsend(
     removed_any
 }
 
+/// Network work kept in the `outbox` table until it succeeds, so a restart,
+/// lost connection or crash doesn't lose it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutboxKind {
+    /// An outgoing message (the row in `messages`) to its chat.
+    Text,
+    /// Its copy for this account's other devices (1:1 chats), sent after
+    /// the message itself; retried on its own.
+    SyncCopy,
+    /// Read receipt; payload is the JSON list of message timestamps.
+    ReadReceipt,
+}
+
+impl OutboxKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::SyncCopy => "sync_copy",
+            Self::ReadReceipt => "read_receipt",
+        }
+    }
+
+    fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "text" => Some(Self::Text),
+            "sync_copy" => Some(Self::SyncCopy),
+            "read_receipt" => Some(Self::ReadReceipt),
+            _ => None,
+        }
+    }
+
+    /// Automatic attempts before giving up (a message then waits for /retry).
+    fn max_attempts(self) -> u32 {
+        match self {
+            Self::Text | Self::SyncCopy => 10,
+            Self::ReadReceipt => 6,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OutboxEntry {
+    id: i64,
+    kind: OutboxKind,
+    peer: String,
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+    attempts: u32,
+}
+
+/// Wait before automatic attempt `attempts + 1`: 5 s, 15 s, 45 s … up to
+/// 15 minutes, so a flaky connection is retried quickly and a dead one
+/// isn't hammered.
+fn outbox_backoff_ms(attempts: u32) -> u64 {
+    (5_000u64.saturating_mul(3u64.saturating_pow(attempts.saturating_sub(1)))).min(15 * 60 * 1000)
+}
+
+/// The DataMessage of a stored outgoing message, rebuilt for (re)sending:
+/// same timestamp, so a repeat is recognised as the same message.
+fn outgoing_data_message(profile_name: &str, message: &Message) -> DataMessage {
+    DataMessage {
+        body: (!message.body.is_empty() || message.attachments.is_empty())
+            .then(|| message.body.clone()),
+        timestamp: Some(message.timestamp_ms),
+        attachments: message.attachments.iter().map(attachment_pointer_from_meta).collect(),
+        profile: profile_for(profile_name, message.timestamp_ms),
+        quote: message.quote.clone().map(data_quote),
+        ..Default::default()
+    }
+}
+
+/// Timestamp for a new outgoing message: the current time, but always
+/// later than the previous one. The timestamp is the message's identity in
+/// the protocol and in the database, so two messages sent in the same
+/// millisecond must not share it.
+fn next_outgoing_timestamp(last: &mut u64) -> u64 {
+    let timestamp = now_ms().max(*last + 1);
+    *last = timestamp;
+    timestamp
+}
+
+/// Queue a new outgoing text: saved with its outbox entry in one
+/// transaction before anything is sent, so it survives a crash or restart.
+fn queue_outgoing(store: &LocalStore, peer: &str, message: &Message) -> Result<(), String> {
+    store.begin_batch()?;
+    // A new message must be a new row: a clash is an error, not "already
+    // known" as for messages fetched from the network.
+    let _ = store.insert_new_message(peer, message);
+    let _ = store.outbox_add(OutboxKind::Text, peer, message.timestamp_ms, &[]);
+    store.end_batch()
+}
+
+/// App state as it was before a sync was applied (restored on rollback).
+struct SyncSnapshot {
+    conversations: Vec<Conversation>,
+    display_names: HashMap<String, String>,
+    approved: HashSet<String>,
+    blocked: HashSet<String>,
+    profile_name: String,
+    seen_hashes: HashSet<String>,
+    selected: usize,
+    downloads: usize,
+}
+
 fn finish_sync(
     app: &mut App,
     store: &LocalStore,
     local_id: &str,
     result: Result<RetrieveResult, String>,
     download_queue: &mut std::collections::VecDeque<PendingDownload>,
+    committed_cursors: Option<&Mutex<HashMap<String, String>>>,
 ) -> usize {
     let result = match result {
         Ok(result) => result,
@@ -6087,6 +7175,31 @@ fn finish_sync(
     };
     let mut notify = 0usize;
     let mut result = result;
+    // Everything from this sync is written in one transaction, and the
+    // sync cursor and "seen" marks commit together with the messages. If any
+    // write fails, the database rolls back and the in-memory state is put
+    // back as it was, so the next sync fetches and saves the same messages
+    // again: "retry", never "skipped".
+    if let Err(error) = store.begin_batch() {
+        app.status = format!("SYNC SAVE ERROR · WILL RETRY · {error}");
+        return 0;
+    }
+    // Anything in the result that can change the in-memory state needs a
+    // snapshot to roll back to.
+    let changes_state = !result.messages.is_empty()
+        || result.account.is_some()
+        || !result.groups.is_empty()
+        || !result.invite_responses.is_empty();
+    let snapshot = changes_state.then(|| SyncSnapshot {
+        conversations: app.conversations.clone(),
+        display_names: app.display_names.clone(),
+        approved: app.approved.clone(),
+        blocked: app.blocked.clone(),
+        profile_name: app.profile_name.clone(),
+        seen_hashes: app.seen_hashes.clone(),
+        selected: app.selected,
+        downloads: download_queue.len(),
+    });
     if let Some(account) = result.account.take() {
         for (slot, dump) in account.dumps.iter().enumerate() {
             if let Some(dump) = dump {
@@ -6126,15 +7239,9 @@ fn finish_sync(
             result.bad_content
         ),
     );
-    if let Some(last_hash) = result.last_hash.as_deref()
-        && let Err(error) = store.set_last_hash(last_hash)
-    {
-        app.status = format!("SYNC CURSOR SAVE ERROR · {error}");
-        return 0;
-    }
-    for (group, hash) in &result.group_cursors {
-        let _ = store.set_group_cursor(group, hash);
-    }
+    let last_hash = result.last_hash.take();
+    let group_cursors = std::mem::take(&mut result.group_cursors);
+    let node_cursors = std::mem::take(&mut result.node_cursors);
     let mut added = 0;
     for mut message in result.messages {
         let is_new = store.mark_seen(&message.hash).unwrap_or(false);
@@ -6166,6 +7273,19 @@ fn finish_sync(
                         let _ = store.update_receipt_status(&message.sender_id, *timestamp, status);
                         matched += 1;
                     }
+                }
+            }
+            // A receipt can arrive before the message it confirms (e.g. the
+            // sync copy of something sent from the phone): keep it, and
+            // apply it when that message shows up.
+            for timestamp in &timestamps {
+                let known = app
+                    .conversations
+                    .iter()
+                    .find(|c| c.id == message.sender_id)
+                    .is_some_and(|c| c.messages.iter().any(|m| m.outgoing && m.timestamp_ms == *timestamp));
+                if !known {
+                    let _ = store.save_pending_receipt(&message.sender_id, *timestamp, status);
                 }
             }
             debug_log(
@@ -6274,15 +7394,49 @@ fn finish_sync(
                         group.name
                     )
                 }
-                ChatEvent::DeleteMemberContent(ids) => {
+                ChatEvent::DeleteMemberContent {
+                    ids,
+                    hashes,
+                    signature,
+                } => {
+                    // As the official clients: without an admin signature the
+                    // sender may delete only their own messages, by hash; a
+                    // valid admin signature (group key) allows deleting by
+                    // member and by hash; an invalid one drops the command.
+                    // Only messages sent up to the command's time count.
+                    let signature = signature.filter(|s| !s.is_empty());
+                    let admin = match signature.as_deref() {
+                        None => false,
+                        Some(signature) => {
+                            if !verify_delete_content_signature(
+                                &message.contact_id,
+                                message.timestamp_ms,
+                                &ids,
+                                &hashes,
+                                signature,
+                            ) {
+                                debug_log("group.delete_content", "invalid_signature=true dropped=true");
+                                continue;
+                            }
+                            true
+                        }
+                    };
+                    let rule = DeleteContent {
+                        admin,
+                        author: &message.sender_id,
+                        ids: &ids,
+                        hashes: &hashes,
+                        before_ms: message.timestamp_ms,
+                    };
+                    let mut removed = 0usize;
                     if let Some(conversation) =
                         app.conversations.iter_mut().find(|c| c.id == message.contact_id)
                     {
                         let peer = conversation.id.clone();
                         conversation.messages.retain(|m| {
-                            let remove = m.sender.as_ref().is_some_and(|sender| ids.contains(sender))
-                                || (m.outgoing && ids.iter().any(|id| id == local_id));
+                            let remove = rule.matches(m, local_id);
                             if remove {
+                                removed += 1;
                                 let _ = store.delete_message(&peer, m);
                             }
                             !remove
@@ -6290,7 +7444,10 @@ fn finish_sync(
                         conversation.clamp_selection();
                         conversation.refresh_preview();
                     }
-                    format!("{actor} removed messages from {} member(s)", ids.len())
+                    if removed == 0 {
+                        continue;
+                    }
+                    format!("{actor} removed {removed} message(s)")
                 }
             };
             let index = app.ensure_contact(&message.contact_id);
@@ -6350,6 +7507,10 @@ fn finish_sync(
                 existing.swarm_hashes.push(message.hash.clone());
                 let _ = store.update_message(&message.contact_id, existing);
             }
+            if is_group && existing.group_hash.is_none() {
+                existing.group_hash = Some(message.hash.clone());
+                let _ = store.update_message(&message.contact_id, existing);
+            }
             continue;
         }
         let mut local_message = Message::new(body, message.timestamp_ms, message.outgoing);
@@ -6361,14 +7522,23 @@ fn finish_sync(
             // Sent from another of our devices: this is its copy in our swarm.
             local_message.swarm_hashes.push(message.hash.clone());
         }
+        if is_group {
+            local_message.group_hash = Some(message.hash.clone());
+        }
         local_message.quote = message.quote.take();
         local_message.links = std::mem::take(&mut message.links);
         local_message.expiration = message.expiration;
         local_message.start_expiry(None);
         local_message.image_previews = vec![None; message.attachments.len()];
+        if local_message.outgoing
+            && let Some(status) = store.take_pending_receipt(&message.contact_id, message.timestamp_ms)
+        {
+            local_message.receipt_status = local_message.receipt_status.max(status);
+        }
         for (attachment_index, meta) in message.attachments.iter().enumerate() {
             download_queue.push_back(PendingDownload {
                 peer: message.contact_id.clone(),
+                sender: local_message.sender.clone(),
                 timestamp_ms: message.timestamp_ms,
                 outgoing: message.outgoing,
                 index: attachment_index,
@@ -6409,6 +7579,37 @@ fn finish_sync(
         app.selected = selected_id
             .and_then(|id| app.conversations.iter().position(|c| c.id == id))
             .unwrap_or(0);
+    }
+    // Cursors last, then commit only if every write of this sync worked.
+    if let Some(last_hash) = last_hash.as_deref() {
+        let _ = store.set_last_hash(last_hash);
+    }
+    for (group, hash) in &group_cursors {
+        let _ = store.set_group_cursor(group, hash);
+    }
+    for (key, hash) in &node_cursors {
+        let _ = store.set_node_cursor(key, hash);
+    }
+    if let Err(error) = store.end_batch() {
+        if let Some(snapshot) = snapshot {
+            app.conversations = snapshot.conversations;
+            app.display_names = snapshot.display_names;
+            app.approved = snapshot.approved;
+            app.blocked = snapshot.blocked;
+            app.profile_name = snapshot.profile_name;
+            app.seen_hashes = snapshot.seen_hashes;
+            app.selected = snapshot.selected;
+            download_queue.truncate(snapshot.downloads);
+        }
+        debug_log("sync.rollback", &format!("error={error}"));
+        app.status = format!("SYNC SAVE ERROR · WILL RETRY · {error}");
+        return 0;
+    }
+    // Committed: the next sync may start from these cursors.
+    if let Some(cursors) = committed_cursors
+        && let Ok(mut cursors) = cursors.lock()
+    {
+        cursors.extend(node_cursors);
     }
     if added > 0 {
         app.sort_conversations();
@@ -6838,7 +8039,9 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
                     ),
                     Span::styled(
                         format!(
-                            " {}{}",
+                            " {}{}{}",
+                            // The number `/N` switches to.
+                            if i < 9 { format!("{} ", i + 1) } else { "  ".to_owned() },
                             if c.id.starts_with("03") { "# " } else { "" },
                             c.title(&app.local_id)
                         ),
@@ -7420,6 +8623,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+N", "Start a chat with a Session ID"),
             ("/disappear off | read 12h | send 1d", "Disappearing messages for this 1:1 chat"),
+            ("/1 … /9", "Switch to chat N (the number shown in the chat list)"),
             ("/accept", "Accept a message request, or join the group you were invited to"),
             ("/decline", "Decline a message request (deletes it)"),
             ("/delete", "Delete this chat and its messages (the contact stays)"),
@@ -7824,6 +9028,526 @@ mod scroll_tests {
     }
 }
 
+
+#[cfg(test)]
+mod history_key_tests {
+    use super::*;
+
+    fn group_message(sender: &str, body: &str) -> Message {
+        let mut message = Message::new(body.into(), 5_000, false);
+        message.sender = Some(sender.into());
+        message
+    }
+
+    /// Tests with a real store share one data folder (set once) and run one
+    /// at a time; each uses its own account, so its own database file.
+    fn test_store(account: u8) -> (std::sync::MutexGuard<'static, ()>, Identity, LocalStore) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("stui-store-test-{}", std::process::id()));
+            // SAFETY: set once, before any store is opened, under LOCK.
+            unsafe {
+                std::env::remove_var("APPDATA");
+                std::env::set_var("XDG_DATA_HOME", &dir);
+            }
+            dir
+        });
+        let identity = Identity {
+            session_id: format!("05{}", format!("{account:02x}").repeat(32)),
+            ed_public: [account; 32],
+            ed_secret: [account; 64],
+            recovery_phrase: None,
+        };
+        let root = session_data_dir().unwrap();
+        let _ = std::fs::remove_file(root.join(format!("{}.sqlite3", identity.session_id)));
+        let store = LocalStore::open(&identity).unwrap();
+        (guard, identity, store)
+    }
+
+    fn incoming(peer: &str, hash: &str, timestamp_ms: u64) -> IncomingMessage {
+        let me = "05".to_owned() + &"11".repeat(32);
+        let content = Content {
+            data_message: Some(DataMessage {
+                body: Some(format!("hello {hash}")),
+                timestamp: Some(timestamp_ms),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        parse_content(&me, hash.into(), peer.into(), peer.into(), timestamp_ms, content).unwrap()
+    }
+
+    fn retrieved(messages: Vec<IncomingMessage>, cursor: &str) -> RetrieveResult {
+        RetrieveResult {
+            messages,
+            queued: 0,
+            undecryptable: 0,
+            bad_envelope: 0,
+            bad_content: 0,
+            last_hash: Some(cursor.into()),
+            groups: Vec::new(),
+            group_cursors: HashMap::new(),
+            node_cursors: Vec::new(),
+            invite_responses: Vec::new(),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_cursor_and_the_retry_saves_the_message() {
+        let (_guard, identity, store) = test_store(0x61);
+        let peer = "05".to_owned() + &"22".repeat(32);
+        let mut app = App::new(identity.session_id.clone());
+        let mut downloads = std::collections::VecDeque::new();
+        let count = |store: &LocalStore| -> i64 {
+            store.connection.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap()
+        };
+        // Inject a failing write, as a full disk would.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let first = retrieved(vec![incoming(&peer, "hash-1", 1_000)], "cursor-1");
+        assert_eq!(finish_sync(&mut app, &store, &identity.session_id, Ok(first), &mut downloads, None), 0);
+        assert_eq!(count(&store), 0);
+        assert_eq!(store.get_last_hash().unwrap(), None, "cursor must not advance");
+        assert!(app.conversations.iter().all(|c| c.messages.is_empty()), "memory rolled back");
+        assert!(app.status.contains("WILL RETRY"));
+
+        // Same messages again after the problem is gone: saved this time.
+        store.connection.execute_batch("DROP TRIGGER fail;").unwrap();
+        let retry = retrieved(vec![incoming(&peer, "hash-1", 1_000)], "cursor-1");
+        finish_sync(&mut app, &store, &identity.session_id, Ok(retry), &mut downloads, None);
+        assert_eq!(count(&store), 1);
+        assert_eq!(store.get_last_hash().unwrap().as_deref(), Some("cursor-1"));
+    }
+
+    #[test]
+    fn outbox_keeps_unsent_messages_across_a_restart_and_retries_with_backoff() {
+        let (_guard, identity, store) = test_store(0x65);
+        let peer = "05".to_owned() + &"25".repeat(32);
+        let group = "03".to_owned() + &"26".repeat(32);
+        let mut message = Message::new("hello".into(), 7_000, true);
+        message.send_state = SendState::Sending;
+        queue_outgoing(&store, &peer, &message).unwrap();
+        let mut in_group = Message::new("hi all".into(), 7_001, true);
+        in_group.send_state = SendState::Sending;
+        queue_outgoing(&store, &group, &in_group).unwrap();
+
+        // "Restart": everything comes back from the database.
+        let mut app = App::new(identity.session_id.clone());
+        store.load(&mut app).unwrap();
+        let state = |app: &App, peer: &str| {
+            app.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].send_state
+        };
+        assert_eq!(state(&app, &peer), SendState::Sending);
+        let due = store.outbox_due(now_ms());
+        assert_eq!(due.len(), 2);
+        let entry = due.iter().find(|e| e.peer == peer).unwrap().clone();
+        assert_eq!(entry.kind, OutboxKind::Text);
+
+        // A failure: marked failed, retried later, not right away.
+        finish_outbox(&mut app, &store, &entry, Err("offline".into()));
+        assert_eq!(state(&app, &peer), SendState::Failed);
+        assert!(store.outbox_due(now_ms()).iter().all(|e| e.id != entry.id));
+        assert!(store.outbox_due(now_ms() + outbox_backoff_ms(1)).iter().any(|e| e.id == entry.id));
+        assert!(app.status.contains("RETRYING IN 5 S"), "{}", app.status);
+
+        // Out of automatic attempts: parked until /retry.
+        let mut last = entry.clone();
+        last.attempts = OutboxKind::Text.max_attempts() - 1;
+        finish_outbox(&mut app, &store, &last, Err("offline".into()));
+        assert!(store.outbox_due(now_ms() + 10 * 365 * 24 * 3_600_000).iter().all(|e| e.id != entry.id));
+        assert!(app.status.contains("/retry"));
+        assert!(store.outbox_retry_now(&peer, 7_000).unwrap());
+        let retried = store.outbox_due(now_ms()).into_iter().find(|e| e.id == entry.id).unwrap();
+        assert_eq!(retried.attempts, 0);
+
+        // Success: sent, saved as sent, and the sync copy queued (1:1 only).
+        finish_outbox(&mut app, &store, &retried, Ok(None));
+        assert_eq!(state(&app, &peer), SendState::Sent);
+        let due = store.outbox_due(now_ms());
+        assert!(due.iter().any(|e| e.peer == peer && e.kind == OutboxKind::SyncCopy));
+        let group_entry = due.iter().find(|e| e.peer == group).unwrap().clone();
+        finish_outbox(&mut app, &store, &group_entry, Ok(None));
+        assert!(store.outbox_due(now_ms()).iter().all(|e| e.peer != group), "no sync copy for groups");
+        let mut reloaded = App::new(identity.session_id.clone());
+        store.load(&mut reloaded).unwrap();
+        assert_eq!(state(&reloaded, &peer), SendState::Sent);
+
+        // Deleting the message drops its remaining work.
+        let sent = reloaded.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].clone();
+        store.delete_message(&peer, &sent).unwrap();
+        assert!(store.outbox_due(now_ms()).iter().all(|e| e.peer != peer));
+    }
+
+    #[test]
+    fn a_parked_sync_copy_can_be_retried_without_resending_the_message() {
+        let (_guard, identity, store) = test_store(0x67);
+        let peer = "05".to_owned() + &"27".repeat(32);
+        let mut app = App::new(identity.session_id.clone());
+        let mut message = Message::new("done".into(), 8_000, true);
+        message.send_state = SendState::Sending;
+        queue_outgoing(&store, &peer, &message).unwrap();
+        store.load(&mut app).unwrap();
+        let text = store.outbox_due(now_ms()).pop().unwrap();
+        finish_outbox(&mut app, &store, &text, Ok(None));
+        let mut copy = store.outbox_due(now_ms()).pop().unwrap();
+        assert_eq!(copy.kind, OutboxKind::SyncCopy);
+        copy.attempts = OutboxKind::SyncCopy.max_attempts() - 1;
+        finish_outbox(&mut app, &store, &copy, Err("offline".into()));
+        assert!(app.status.contains("/retry"));
+        // Still sent; /retry reschedules only the copy.
+        let state = app.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].send_state;
+        assert_eq!(state, SendState::Sent);
+        assert!(store.outbox_retry_now(&peer, 8_000).unwrap());
+        let due = store.outbox_due(now_ms());
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, OutboxKind::SyncCopy);
+    }
+
+    #[test]
+    fn read_state_and_its_receipt_are_saved_together() {
+        let (_guard, identity, store) = test_store(0x68);
+        let peer = "05".to_owned() + &"28".repeat(32);
+        let mut app = App::new(identity.session_id.clone());
+        app.approved.insert(peer.clone());
+        let mut incoming = Message::new("hi".into(), 9_000, false);
+        incoming.is_read = false;
+        store.save_message(&peer, &incoming).unwrap();
+        store.load(&mut app).unwrap();
+        app.selected = app.conversations.iter().position(|c| c.id == peer).unwrap();
+        let read_in_db = |store: &LocalStore| -> bool {
+            store.connection.query_row("SELECT is_read FROM messages", [], |r| r.get(0)).unwrap()
+        };
+        store
+            .connection
+            .execute_batch("CREATE TRIGGER fail BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk full'); END;")
+            .unwrap();
+        assert!(!mark_current_conversation_read(&mut app, &store));
+        assert!(!read_in_db(&store), "no receipt queued, so not marked read either");
+        assert!(!app.conversations[app.selected].messages[0].is_read);
+        store.connection.execute_batch("DROP TRIGGER fail;").unwrap();
+        assert!(mark_current_conversation_read(&mut app, &store));
+        assert!(read_in_db(&store));
+        assert!(app.conversations[app.selected].messages[0].is_read);
+        assert_eq!(store.outbox_due(now_ms())[0].kind, OutboxKind::ReadReceipt);
+    }
+
+    #[test]
+    fn new_messages_never_share_a_timestamp() {
+        let (_guard, _identity, store) = test_store(0x69);
+        let mut last = now_ms() + 60_000; // e.g. a message sent "in the future"
+        let a = next_outgoing_timestamp(&mut last);
+        let b = next_outgoing_timestamp(&mut last);
+        assert!(b > a);
+        let peer = "05".to_owned() + &"29".repeat(32);
+        queue_outgoing(&store, &peer, &Message::new("one".into(), 123, true)).unwrap();
+        assert!(queue_outgoing(&store, &peer, &Message::new("two".into(), 123, true)).is_err());
+        assert_eq!(store.outbox_due(now_ms()).len(), 1, "the clash queued nothing");
+    }
+
+    #[test]
+    fn a_send_result_that_cannot_be_saved_changes_nothing() {
+        let (_guard, identity, store) = test_store(0x6a);
+        let peer = "05".to_owned() + &"2a".repeat(32);
+        let mut app = App::new(identity.session_id.clone());
+        let mut message = Message::new("x".into(), 10_000, true);
+        message.send_state = SendState::Sending;
+        queue_outgoing(&store, &peer, &message).unwrap();
+        store.load(&mut app).unwrap();
+        let entry = store.outbox_due(now_ms()).pop().unwrap();
+        store
+            .connection
+            .execute_batch("CREATE TRIGGER fail BEFORE UPDATE ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;")
+            .unwrap();
+        finish_outbox(&mut app, &store, &entry, Ok(None));
+        let state = app.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].send_state;
+        assert_eq!(state, SendState::Sending, "screen unchanged");
+        assert_eq!(store.outbox_due(now_ms()).len(), 1, "still queued");
+        assert!(app.status.contains("NOT SAVED"));
+    }
+
+    #[test]
+    fn a_receipt_that_arrives_before_its_message_is_applied_later() {
+        let (_guard, identity, store) = test_store(0x6b);
+        let me = identity.session_id.clone();
+        let peer = "05".to_owned() + &"2b".repeat(32);
+        let mut app = App::new(me.clone());
+        app.ensure_contact(&peer);
+        let mut downloads = std::collections::VecDeque::new();
+        // 1st sync: the peer's read receipt for our message 100 …
+        let mut receipt = IncomingMessage::control("r1".into(), peer.clone(), peer.clone(), 150);
+        receipt.receipt = Some((1, vec![100]));
+        finish_sync(&mut app, &store, &me, Ok(retrieved(vec![receipt], "c1")), &mut downloads, None);
+        // … a restart …
+        let mut app = App::new(me.clone());
+        store.load(&mut app).unwrap();
+        // … 2nd sync: the copy of message 100, sent from our phone.
+        let content = Content {
+            data_message: Some(DataMessage {
+                body: Some("from my phone".into()),
+                timestamp: Some(100),
+                sync_target: Some(peer.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let copy = parse_content(&me, "s1".into(), me.clone(), me.clone(), 100, content).unwrap();
+        finish_sync(&mut app, &store, &me, Ok(retrieved(vec![copy], "c2")), &mut downloads, None);
+        let status: u8 = store
+            .connection
+            .query_row("SELECT receipt_status FROM messages WHERE timestamp_ms = 100", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, 2, "read");
+        let left: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM pending_receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn receipts_are_dropped_after_their_attempts_and_backoff_is_capped() {
+        let (_guard, identity, store) = test_store(0x66);
+        let mut app = App::new(identity.session_id.clone());
+        store.outbox_add(OutboxKind::ReadReceipt, "05ab", 0, b"[1,2]").unwrap();
+        let mut entry = store.outbox_due(now_ms()).pop().unwrap();
+        entry.attempts = OutboxKind::ReadReceipt.max_attempts() - 1;
+        finish_outbox(&mut app, &store, &entry, Err("offline".into()));
+        assert!(store.outbox_due(now_ms() + 10 * 365 * 24 * 3_600_000).is_empty());
+        assert_eq!(outbox_backoff_ms(1), 5_000);
+        assert_eq!(outbox_backoff_ms(2), 15_000);
+        assert_eq!(outbox_backoff_ms(50), 15 * 60 * 1000);
+    }
+
+    #[test]
+    fn attachment_cache_keys_separate_direction_author_and_account() {
+        let root = std::path::Path::new("/cache");
+        let path = |owner: &str| session_tui_media::attachment_blob_path(root, owner, 7, 0);
+        let peer = "05ab";
+        assert_ne!(path(&blob_owner(peer, None, true)), path(&blob_owner(peer, None, false)));
+        assert_ne!(
+            path(&blob_owner(peer, Some("05x"), false)),
+            path(&blob_owner(peer, Some("05y"), false))
+        );
+        assert!(blob_owner(peer, None, false).contains(BLOB_ACCOUNT.get().map_or("", String::as_str)));
+    }
+
+    #[test]
+    fn a_download_for_a_deleted_message_writes_nothing() {
+        let (_guard, identity, store) = test_store(0x64);
+        let peer = "05".to_owned() + &"24".repeat(32);
+        let mut app = App::new(identity.session_id.clone());
+        app.ensure_contact(&peer);
+        let (encrypted, key, digest) = session_tui_media::encrypt_attachment(b"hello").unwrap();
+        let meta = AttachmentMeta {
+            file_name: "a.txt".into(),
+            content_type: "text/plain".into(),
+            url: "u".into(),
+            key,
+            digest,
+            size: 5,
+            deterministic: false,
+            width: None,
+            height: None,
+        };
+        let job = PendingDownload {
+            peer: peer.clone(),
+            sender: None,
+            timestamp_ms: 4_242,
+            outgoing: false,
+            index: 0,
+            meta,
+        };
+        let path = session_tui_media::attachment_blob_path(
+            &session_data_dir().unwrap(),
+            &blob_owner(&peer, None, false),
+            4_242,
+            0,
+        );
+        finish_download(&mut app, &store, Ok(DownloadedAttachment { job, encrypted, preview: None }));
+        assert!(!path.exists(), "no message, no cache file");
+    }
+
+    #[test]
+    fn saving_writes_complete_files_only() {
+        let dir = std::env::temp_dir().join(format!("stui-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        write_file_atomically(&target, b"complete").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"complete");
+        // Only the final file is left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_cursors_move_only_when_the_sync_commits() {
+        let (_guard, identity, store) = test_store(0x62);
+        let peer = "05".to_owned() + &"23".repeat(32);
+        let committed = Mutex::new(HashMap::from([("me/0/node".to_owned(), "old-hash".to_owned())]));
+        let mut app = App::new(identity.session_id.clone());
+        let mut downloads = std::collections::VecDeque::new();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let mut first = retrieved(vec![incoming(&peer, "hash-n1", 2_000)], "cursor-n1");
+        first.node_cursors = vec![("me/0/node".into(), "new-hash".into())];
+        finish_sync(&mut app, &store, &identity.session_id, Ok(first), &mut downloads, Some(&committed));
+        assert_eq!(committed.lock().unwrap()["me/0/node"], "old-hash", "failed sync keeps the start point");
+        assert!(store.node_cursors().is_empty());
+
+        store.connection.execute_batch("DROP TRIGGER fail;").unwrap();
+        let mut retry = retrieved(vec![incoming(&peer, "hash-n1", 2_000)], "cursor-n1");
+        retry.node_cursors = vec![("me/0/node".into(), "new-hash".into())];
+        finish_sync(&mut app, &store, &identity.session_id, Ok(retry), &mut downloads, Some(&committed));
+        assert_eq!(committed.lock().unwrap()["me/0/node"], "new-hash");
+        assert_eq!(store.node_cursors()["me/0/node"], "new-hash");
+    }
+
+    #[test]
+    fn a_failed_sync_that_only_found_a_group_leaves_no_trace() {
+        let (_guard, identity, store) = test_store(0x63);
+        let mut app = App::new(identity.session_id.clone());
+        let mut downloads = std::collections::VecDeque::new();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail BEFORE INSERT ON contacts BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let group = "03".to_owned() + &"55".repeat(32);
+        let mut result = retrieved(Vec::new(), "cursor-g");
+        result.groups = vec![DiscoveredGroup { id: group.clone(), name: "New group".into(), can_write: true }];
+        finish_sync(&mut app, &store, &identity.session_id, Ok(result), &mut downloads, None);
+        assert!(app.status.contains("WILL RETRY"), "{}", app.status);
+        assert!(app.conversations.iter().all(|c| c.id != group), "group rolled back in memory too");
+    }
+
+    #[test]
+    fn same_millisecond_group_messages_are_kept_apart_and_old_databases_migrate() {
+        let (_guard, identity, store) = test_store(0x44);
+        let group = "03".to_owned() + &"77".repeat(32);
+        let alice = group_message("05aa", "from alice");
+        let mut bob = group_message("05bb", "from bob");
+        store.save_message(&group, &alice).unwrap();
+        store.save_message(&group, &bob).unwrap();
+        bob.body = "bob edited".into();
+        store.update_message(&group, &bob).unwrap();
+        store.mark_message_read(&group, &alice).unwrap();
+        let load = |store: &LocalStore| {
+            let mut app = App::new(identity.session_id.clone());
+            store.load(&mut app).unwrap();
+            let index = app.conversations.iter().position(|c| c.id == group).unwrap();
+            let mut bodies: Vec<(String, bool)> = app.conversations[index]
+                .messages
+                .iter()
+                .map(|m| (m.body.clone(), m.is_read))
+                .collect();
+            bodies.sort();
+            bodies
+        };
+        assert_eq!(
+            load(&store),
+            vec![("bob edited".into(), false), ("from alice".into(), true)]
+        );
+        store.delete_message(&group, &bob).unwrap();
+        assert_eq!(load(&store), vec![("from alice".into(), true)]);
+
+        // An old-format table (no sender column) is rebuilt with the author
+        // read back from the encrypted rows.
+        let body = store.encrypted_payload(&group_message("05cc", "old row")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE messages;
+                 CREATE TABLE messages (peer_id TEXT NOT NULL, timestamp_ms INTEGER NOT NULL,
+                    outgoing INTEGER NOT NULL, body BLOB NOT NULL,
+                    receipt_status INTEGER NOT NULL DEFAULT 0, is_read INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(peer_id, timestamp_ms, outgoing));",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(peer_id, timestamp_ms, outgoing, body) VALUES (?1, 5000, 0, ?2)",
+                params![group, body],
+            )
+            .unwrap();
+        store.add_sender_to_message_key().unwrap();
+        let sender: String = store
+            .connection
+            .query_row("SELECT sender FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sender, "05cc");
+        store.save_message(&group, &group_message("05dd", "new row")).unwrap();
+        assert_eq!(load(&store).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod delete_content_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn only_a_group_key_signature_authorizes_deleting_others() {
+        let admin = SigningKey::from_bytes(&[9; 32]);
+        let group = format!("03{}", hex::encode(admin.verifying_key().to_bytes()));
+        let ids = vec!["05aa".to_owned(), "05bb".to_owned()];
+        let hashes = vec!["h1".to_owned()];
+        let signed = admin.sign(b"DELETE_CONTENT12305aa05bbh1").to_bytes();
+        assert!(verify_delete_content_signature(&group, 123, &ids, &hashes, &signed));
+        // Different timestamp, members, or a member's own key: rejected.
+        assert!(!verify_delete_content_signature(&group, 124, &ids, &hashes, &signed));
+        assert!(!verify_delete_content_signature(&group, 123, &ids[..1], &hashes, &signed));
+        let member = SigningKey::from_bytes(&[3; 32]);
+        let forged = member.sign(b"DELETE_CONTENT12305aa05bbh1").to_bytes();
+        assert!(!verify_delete_content_signature(&group, 123, &ids, &hashes, &forged));
+        assert!(!verify_delete_content_signature(&group, 123, &ids, &hashes, &[0; 10]));
+    }
+
+    fn message(sender: &str, timestamp: u64, hash: &str) -> Message {
+        let mut message = Message::new("x".into(), timestamp, false);
+        message.sender = Some(sender.into());
+        message.group_hash = Some(hash.into());
+        message
+    }
+
+    #[test]
+    fn delete_rules_follow_the_official_clients() {
+        let me = "05me";
+        let ids = vec!["05bb".to_owned()];
+        let hashes = vec!["h-old-bb".to_owned(), "h-cc".to_owned()];
+        let old_bb = message("05bb", 100, "h-old-bb");
+        let other_bb = message("05bb", 150, "h-other");
+        let new_bb = message("05bb", 200, "h-new-bb");
+        let cc = message("05cc", 100, "h-cc");
+        // A member (no admin signature) deletes only their own, by hash.
+        let member = DeleteContent { admin: false, author: "05bb", ids: &ids, hashes: &hashes, before_ms: 150 };
+        assert!(member.matches(&old_bb, me));
+        assert!(!member.matches(&other_bb, me), "not named by hash");
+        assert!(!member.matches(&cc, me), "someone else's message");
+        // An admin deletes the member's messages and hashed ones, up to the
+        // command time only.
+        let admin = DeleteContent { admin: true, author: "05ad", ids: &ids, hashes: &hashes, before_ms: 150 };
+        assert!(admin.matches(&old_bb, me) && admin.matches(&other_bb, me) && admin.matches(&cc, me));
+        assert!(!admin.matches(&new_bb, me), "sent after the command");
+        let mut mine = Message::new("mine".into(), 100, true);
+        mine.group_hash = Some("h-mine".into());
+        assert!(!admin.matches(&mine, me));
+        let admin_me = DeleteContent { admin: true, author: "05ad", ids: &[me.to_owned()], hashes: &[], before_ms: 150 };
+        assert!(admin_me.matches(&mine, me));
+    }
+}
 
 #[cfg(test)]
 mod control_char_tests {

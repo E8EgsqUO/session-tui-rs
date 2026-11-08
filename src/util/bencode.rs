@@ -84,7 +84,7 @@ fn encode_into(value: &BtValue, buf: &mut Vec<u8>) {
 
 /// Decodes bencode bytes into a `BtValue`.
 pub fn decode(data: &[u8]) -> Result<BtValue, BencodeError> {
-    let (value, consumed) = decode_value(data, 0)?;
+    let (value, consumed) = decode_value(data, 0, 0)?;
     if consumed != data.len() {
         return Err(BencodeError::InvalidData(
             consumed,
@@ -94,16 +94,23 @@ pub fn decode(data: &[u8]) -> Result<BtValue, BencodeError> {
     Ok(value)
 }
 
+/// Deepest list/dict nesting accepted. Real Session data nests a few levels;
+/// the limit stops crafted input from overflowing the stack.
+const MAX_DEPTH: usize = 64;
+
 /// Decodes a value starting at position `pos`. Returns (value, new_position).
-fn decode_value(data: &[u8], pos: usize) -> Result<(BtValue, usize), BencodeError> {
+fn decode_value(data: &[u8], pos: usize, depth: usize) -> Result<(BtValue, usize), BencodeError> {
     if pos >= data.len() {
         return Err(BencodeError::UnexpectedEof);
+    }
+    if depth > MAX_DEPTH {
+        return Err(BencodeError::InvalidData(pos, "nested too deeply".into()));
     }
 
     match data[pos] {
         b'i' => decode_integer(data, pos),
-        b'l' => decode_list(data, pos),
-        b'd' => decode_dict(data, pos),
+        b'l' => decode_list(data, pos, depth),
+        b'd' => decode_dict(data, pos, depth),
         b'0'..=b'9' => decode_string(data, pos),
         _ => Err(BencodeError::InvalidData(
             pos,
@@ -163,15 +170,15 @@ fn decode_string(data: &[u8], pos: usize) -> Result<(BtValue, usize), BencodeErr
         .map_err(|_| BencodeError::InvalidData(pos, "invalid string length number".into()))?;
 
     let str_start = colon_pos + 1;
-    let str_end = str_start + len;
-    if str_end > data.len() {
-        return Err(BencodeError::UnexpectedEof);
-    }
+    let str_end = str_start
+        .checked_add(len)
+        .filter(|end| *end <= data.len())
+        .ok_or(BencodeError::UnexpectedEof)?;
 
     Ok((BtValue::String(data[str_start..str_end].to_vec()), str_end))
 }
 
-fn decode_list(data: &[u8], pos: usize) -> Result<(BtValue, usize), BencodeError> {
+fn decode_list(data: &[u8], pos: usize, depth: usize) -> Result<(BtValue, usize), BencodeError> {
     debug_assert_eq!(data[pos], b'l');
     let mut current = pos + 1; // skip 'l'
     let mut items = Vec::new();
@@ -183,13 +190,13 @@ fn decode_list(data: &[u8], pos: usize) -> Result<(BtValue, usize), BencodeError
         if data[current] == b'e' {
             return Ok((BtValue::List(items), current + 1));
         }
-        let (value, next) = decode_value(data, current)?;
+        let (value, next) = decode_value(data, current, depth + 1)?;
         items.push(value);
         current = next;
     }
 }
 
-fn decode_dict(data: &[u8], pos: usize) -> Result<(BtValue, usize), BencodeError> {
+fn decode_dict(data: &[u8], pos: usize, depth: usize) -> Result<(BtValue, usize), BencodeError> {
     debug_assert_eq!(data[pos], b'd');
     let mut current = pos + 1; // skip 'd'
     let mut map = BTreeMap::new();
@@ -220,7 +227,7 @@ fn decode_dict(data: &[u8], pos: usize) -> Result<(BtValue, usize), BencodeError
             }
         last_key = Some(key.clone());
 
-        let (val, after_val) = decode_value(data, after_key)?;
+        let (val, after_val) = decode_value(data, after_key, depth + 1)?;
         map.insert(key, val);
         current = after_val;
     }
@@ -401,6 +408,20 @@ mod tests {
         expected.insert(b"cow".to_vec(), BtValue::String(b"moo".to_vec()));
         expected.insert(b"spam".to_vec(), BtValue::Integer(3));
         assert_eq!(result, BtValue::Dict(expected));
+    }
+
+    #[test]
+    fn test_decode_rejects_malformed_input_without_panicking() {
+        // Length that overflows usize when added to the start offset.
+        assert!(decode(format!("{}:x", usize::MAX).as_bytes()).is_err());
+        assert!(decode(b"l18446744073709551615:xe").is_err());
+        // Length past the end.
+        assert!(decode(b"5:abc").is_err());
+        // Nesting far beyond anything real.
+        let deep = "l".repeat(100_000) + &"e".repeat(100_000);
+        assert!(decode(deep.as_bytes()).is_err());
+        let ok = "l".repeat(10) + &"e".repeat(10);
+        assert!(decode(ok.as_bytes()).is_ok());
     }
 
     #[test]

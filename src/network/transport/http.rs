@@ -177,11 +177,26 @@ impl Transport for HttpTransport {
             .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
             .collect();
 
-        let body = response
-            .bytes()
+        // Read at most MAX_RESPONSE_BYTES: attachment URLs come from other
+        // people, and a hostile server could otherwise stream without end.
+        let mut response = response;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(TransportError::ReceiveFailed("response too large".into()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
             .map_err(|e| TransportError::ReceiveFailed(format_error_chain(&e)))?
-            .to_vec();
+        {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(TransportError::ReceiveFailed("response too large".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
 
         Ok(TransportResponse {
             status_code,
@@ -190,6 +205,10 @@ impl Transport for HttpTransport {
         })
     }
 }
+
+/// Largest response body accepted. Session's file server caps uploads at
+/// 10 MB; encryption and onion framing add a little on top.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Installs the `ring` crypto provider as rustls' process-wide default
 /// exactly once. Subsequent calls are a no-op.

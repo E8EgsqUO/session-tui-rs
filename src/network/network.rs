@@ -21,6 +21,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::network::key_types::X25519Pubkey;
+use crate::network::service_node::ServiceNode;
 use crate::network::onionreq::response_parser::DecryptedResponse;
 use crate::network::routing::onion_request::{
     OnionRequestRouter, OnionRequestRouterConfig, OnionRouteError,
@@ -95,7 +96,13 @@ pub struct Network<T: Transport + Clone + 'static> {
     pool: Arc<Mutex<SnodePool>>,
     paths: Arc<Mutex<PathManager>>,
     router: OnionRequestRouter,
+    /// Swarm members per account/group key, with when they were looked up.
+    swarms: Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<ServiceNode>)>>>,
 }
+
+/// How long a looked-up swarm is reused before asking again. Swarms change
+/// rarely; a 421 reply ("wrong swarm") clears the entry early.
+const SWARM_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 impl<T: Transport + Clone + 'static> Network<T> {
     /// Creates a new network facade. Nothing is bootstrapped yet; the first
@@ -111,7 +118,76 @@ impl<T: Transport + Clone + 'static> Network<T> {
             pool: Arc::new(Mutex::new(pool)),
             paths: Arc::new(Mutex::new(paths)),
             router,
+            swarms: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// The swarm (storage nodes) of `pubkey_hex`, looked up over an onion
+    /// path and cached for [`SWARM_CACHE_TTL`].
+    pub async fn swarm_nodes(&self, pubkey_hex: &str) -> Result<Vec<ServiceNode>, NetworkError> {
+        if let Some((at, nodes)) = self.swarms.lock().await.get(pubkey_hex)
+            && at.elapsed() < SWARM_CACHE_TTL
+            && !nodes.is_empty()
+        {
+            return Ok(nodes.clone());
+        }
+        let nodes = self.fetch_swarm(pubkey_hex).await?;
+        if nodes.is_empty() {
+            return Err(NetworkError::Swarm(
+                crate::network::swarm::SwarmFetchError::Parse("empty swarm".into()),
+            ));
+        }
+        self.swarms
+            .lock()
+            .await
+            .insert(pubkey_hex.to_owned(), (std::time::Instant::now(), nodes.clone()));
+        Ok(nodes)
+    }
+
+    /// Drop the cached swarm of `pubkey_hex` (after a 421 or a dead node).
+    pub async fn forget_swarm(&self, pubkey_hex: &str) {
+        self.swarms.lock().await.remove(pubkey_hex);
+    }
+
+    /// `retrieve` from one specific swarm member, so the caller can keep a
+    /// cursor per node like the official clients. A 421 is returned as is.
+    pub async fn send_retrieve_to(
+        &self,
+        node: &ServiceNode,
+        params: &rpc::RetrieveParams<'_>,
+    ) -> Result<DecryptedResponse, NetworkError> {
+        let body = rpc::build_retrieve_params(params).map_err(|e| {
+            NetworkError::Encode(format!("build retrieve params: {e}"))
+        })?;
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| NetworkError::Encode(e.to_string()))?;
+        self.send_with_retry(
+            PathCategory::Standard,
+            &NetworkDestination::ServiceNode(node.clone()),
+            rpc::METHOD_RETRIEVE,
+            &body_bytes,
+            None,
+        )
+        .await
+    }
+
+    /// Any RPC to one specific swarm member. A 421 is returned as is.
+    pub async fn send_rpc_to(
+        &self,
+        node: &ServiceNode,
+        method: &str,
+        params: Value,
+    ) -> Result<DecryptedResponse, NetworkError> {
+        let body_bytes =
+            serde_json::to_vec(&params).map_err(|e| NetworkError::Encode(e.to_string()))?;
+        self.send_with_retry(
+            PathCategory::Standard,
+            &NetworkDestination::ServiceNode(node.clone()),
+            method,
+            &body_bytes,
+            None,
+        )
+        .await
     }
 
     /// Ensures the snode pool has at least some nodes. Idempotent: if already
@@ -237,6 +313,12 @@ impl<T: Transport + Clone + 'static> Network<T> {
         &self,
         pubkey_hex: &str,
     ) -> Result<NetworkDestination, NetworkError> {
+        let nodes = self.swarm_nodes(pubkey_hex).await?;
+        let index = rand::random::<u32>() as usize % nodes.len();
+        Ok(NetworkDestination::ServiceNode(nodes[index].clone()))
+    }
+
+    async fn fetch_swarm(&self, pubkey_hex: &str) -> Result<Vec<ServiceNode>, NetworkError> {
         self.ensure_bootstrapped().await?;
 
         // Make sure we have at least one live path for the onion-wrapped
@@ -263,12 +345,7 @@ impl<T: Transport + Clone + 'static> Network<T> {
             .await?
         };
 
-        let snode = snodes.into_iter().next().ok_or_else(|| {
-            NetworkError::Swarm(
-                crate::network::swarm::SwarmFetchError::Parse("empty swarm".into()),
-            )
-        })?;
-        Ok(NetworkDestination::ServiceNode(snode))
+        Ok(snodes)
     }
 
     async fn any_snode_destination(&self) -> Result<NetworkDestination, NetworkError> {
@@ -321,6 +398,7 @@ impl<T: Transport + Clone + 'static> Network<T> {
                     // 421 Misdirected: swarm moved. Re-resolve once then retry.
                     if resp.status_code == 421 {
                         if let Some(pk) = swarm_pubkey_hex {
+                            self.forget_swarm(pk).await;
                             if let Ok(new_dest) = self.destination_for_swarm(pk).await {
                                 current_dest = new_dest;
                                 continue;

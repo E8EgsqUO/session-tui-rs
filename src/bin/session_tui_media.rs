@@ -157,6 +157,21 @@ pub fn decrypt_attachment(
         .map_err(|_| "attachment decryption failed".to_string())
 }
 
+/// Decode an image from someone else with bounded memory: at most 8192 px
+/// per side and 192 MB of buffers (a 16 MP RGBA image needs 64 MB), instead
+/// of the library default of 512 MB, so a crafted image can't stall us.
+pub fn decode_image(data: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(192 * 1024 * 1024);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    reader.limits(limits);
+    reader.decode().map_err(|e| e.to_string())
+}
+
 pub fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::new(std::io::Cursor::new(data))
         .with_guessed_format()
@@ -220,7 +235,7 @@ pub fn shrink_preview(preview: ImagePreview) -> ImagePreview {
 }
 
 pub fn image_preview(data: &[u8]) -> Option<ImagePreview> {
-    let image = image::load_from_memory(data).ok()?;
+    let image = decode_image(data).ok()?;
     let image = image
         .thumbnail(PREVIEW_MAX_WIDTH, PREVIEW_MAX_ROWS * 2)
         .to_rgb8();
