@@ -7,10 +7,13 @@ This repository includes the Session Rust core modules used by the client, so it
 ## Features
 
 - Sign in with a 32-byte hex seed or a 13-word Session recovery phrase. The seed can be saved: with DPAPI on Windows, and on Linux/macOS in a passphrase-encrypted file (Argon2id + XChaCha20-Poly1305, mode 0600). `--forget-seed` removes it.
-- Chat with contacts and groups (as admin or ordinary member); accept group invites with `/accept`. Messages are fetched automatically, or with `/rsync`.
+- Chat with contacts and groups (as admin or ordinary member); accept group invites with `/accept`. Messages are fetched automatically, or with `/rsync`. Groups can't be created or managed here yet; create them in the official app.
+- Message requests: chats from people you haven't approved are listed separately, marked REQUEST. Until you `/accept` (or reply), they get no read or delivery receipts and their attachments aren't downloaded. `/decline` deletes the request.
+- Chat management: `/delete` deletes a chat and its messages (hidden on your other devices too; the contact stays), `/remove` removes a contact from your account and deletes the chat. Both ask for confirmation.
 - Messages are sent in the background; failed ones can be resent with `/retry`.
 - Send and receive text, images, audio and other files. Several files can go in one message (`/attach a.jpg b.jpg -- caption`), and albums are shown as one message.
 - View images with `/view N` or a mouse click, and use ←/→ to step through the images in a message. Save attachments with `/save [N] [PATH]`.
+- Emoji shortcodes such as `:joy:`, `:haha:` or `:+1:` are converted when sending.
 - Replies (`r` on a message), reactions (`+` or `/react EMOJI`), disappearing messages (`/disappear off | read 12h | send 1d`), typing indicators, link previews, and notices for screenshots, missed calls and group changes.
 - Delete or unsend messages, with read and delivery receipts.
 - Account data syncs with your other Session devices: profile name, contacts (approved and blocked), per-chat disappearing settings, read state, and joined groups.
@@ -18,12 +21,17 @@ This repository includes the Session Rust core modules used by the client, so it
 - Use `https_proxy` or `HTTPS_PROXY` for HTTPS connections.
 - Use `--debug` to write `session-tui-debug.log` in the current directory.
 - Tab switches focus among chats, messages and the composer; use the arrow keys to navigate.
+- Mouse: click a chat or image, scroll with the wheel, and drag the border between the chat list and the messages to resize (the width is remembered).
+- Copying: double-click a message to copy its text, the chat title to copy the contact's Session ID, or the top bar to copy your own ID. On the new-account screen, press C or click to copy the recovery phrase. Copying uses OSC 52 (Windows Terminal and most terminals) and, on Linux, `wl-copy`, `xclip` or `xsel` when installed. Shift+drag still selects text in most terminals.
+- Privacy: full Session IDs aren't shown on screen (a shortened form is), and control characters in names, messages and file names are stripped so they can't inject terminal escape sequences.
 
 Voice and video calls are not supported.
 
 ## Build
 
-Requirements: Rust 1.93 or newer and `protoc`.
+Prebuilt binaries for Linux x86_64, macOS ARM64 and Windows x86_64 are on the [Releases](https://github.com/E8EgsqUO/session-tui-rs/releases) page, with SHA-256 checksums in `SHA256SUMS.txt`.
+
+To build it yourself you need Rust 1.93 or newer and `protoc`.
 
 ```sh
 cargo build --locked --release --bin session-tui
@@ -35,7 +43,7 @@ Run the client with:
 cargo run --release --bin session-tui
 ```
 
-GitHub Actions builds downloadable binaries for Linux x86_64, macOS ARM64, and Windows x86_64 on pushes and pull requests.
+GitHub Actions builds the binaries on every push and pull request. Pushing a `v*` tag also publishes them as a GitHub release.
 
 ## License
 
