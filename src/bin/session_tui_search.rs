@@ -40,7 +40,7 @@ pub struct SearchQuery {
     pub keyword: String,
 }
 
-fn parse_date(text: &str) -> Result<Date, String> {
+pub fn parse_date(text: &str) -> Result<Date, String> {
     let bad = || format!("INVALID DATE {text} · USE YYYY-MM-DD");
     let mut parts = text.split('-');
     let (Some(y), Some(m), Some(d), None) =
@@ -372,7 +372,7 @@ pub fn draw(
     use super::{BG, MUTED, PANEL, TEAL, TEXT};
     let width = area.width.saturating_sub(6).clamp(30, 110);
     let height = area.height.saturating_sub(4).clamp(8, 40);
-    let rect = super::centered_rect(width, height, area);
+    let rect = super::centered_cells(width, height, area);
     frame.render_widget(Clear, rect);
     let count = if view.running {
         "searching…".to_owned()
@@ -455,7 +455,7 @@ pub fn draw(
 // Glue to the app state.
 // ---------------------------------------------------------------------------
 
-use super::{App, FocusArea, now_ms};
+use super::{App, now_ms};
 
 /// `/search ARGS`. Opens the panel and starts the search off the UI thread.
 pub(super) fn command(app: &mut App, args: &str) {
@@ -556,27 +556,11 @@ pub(super) fn command(app: &mut App, args: &str) {
     }));
 }
 
-/// Index of the hit's message, if it is still there.
-fn locate(app: &App, hit: &SearchHit) -> Option<(usize, usize)> {
-    let chat = app
-        .conversations
-        .iter()
-        .position(|c| c.id == hit.conversation)?;
-    let conversation = &app.conversations[chat];
-    let index = conversation.position_of(&hit.key, &app.local_id)?;
-    let now = now_ms();
-    (!conversation.messages[index]
-        .expires_at
-        .is_some_and(|at| at <= now))
-    .then_some((chat, index))
-}
-
 pub(super) fn exists(app: &App, hit: &SearchHit) -> bool {
-    locate(app, hit).is_some()
+    super::session_tui_browse::locate(app, &hit.conversation, &hit.key).is_some()
 }
 
-/// Open the chat of the selected hit with that message selected, in view
-/// and briefly highlighted. Only the view changes.
+/// Open the chat of the selected hit at that message (the shared jump).
 pub(super) fn jump(app: &mut App) -> Result<(), String> {
     let hit = app
         .search
@@ -584,18 +568,7 @@ pub(super) fn jump(app: &mut App) -> Result<(), String> {
         .and_then(SearchView::current)
         .cloned()
         .ok_or("NO RESULT SELECTED")?;
-    let (chat, index) = locate(app, &hit).ok_or("THAT MESSAGE IS NO LONGER AVAILABLE")?;
-    app.selected = chat;
-    let conversation = &mut app.conversations[chat];
-    conversation.selected_message = index;
-    conversation.scroll = None;
-    conversation.follow_selection = true;
-    app.focus = FocusArea::Messages;
-    app.highlight = Some((
-        hit.conversation,
-        hit.key,
-        std::time::Instant::now() + std::time::Duration::from_secs(3),
-    ));
+    super::session_tui_browse::open_message(app, &hit.conversation, &hit.key)?;
     app.last_search = app.search.take();
     Ok(())
 }

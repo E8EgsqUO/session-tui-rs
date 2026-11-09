@@ -1,6 +1,10 @@
 mod session_tui_account;
+mod session_tui_browse;
+mod session_tui_chats;
+mod session_tui_commands;
 mod session_tui_group;
 mod session_tui_input;
+mod session_tui_local;
 mod session_tui_media;
 mod session_tui_netdiag;
 mod session_tui_search;
@@ -618,6 +622,22 @@ struct App {
     net_task: Option<tokio::task::JoinHandle<libsession::network::NetworkDiagnostics>>,
     /// When a sync last finished and was saved.
     last_sync_ok: Option<std::time::SystemTime>,
+    /// Composer drafts per chat (local only).
+    drafts: session_tui_local::Drafts,
+    /// Pinned chats (local only).
+    pinned: HashSet<String>,
+    /// Bookmarked messages: (chat, message) references (local only).
+    bookmarks: HashSet<(String, session_tui_separators::MessageKey)>,
+    /// `/filter` of the chat list.
+    chat_filter: Option<session_tui_chats::ChatFilter>,
+    /// Bookmarks / media / links list.
+    browse: Option<session_tui_browse::BrowseView>,
+    /// A command to run as if typed (e.g. `/save N` from the media list);
+    /// the composer text is put back afterwards.
+    queued_command: Option<String>,
+    restore_input: Option<(String, usize)>,
+    /// Tab completion in progress (reset by any other key).
+    completion: Option<session_tui_commands::Completion>,
 }
 
 impl App {
@@ -671,6 +691,14 @@ impl App {
             net_view: None,
             net_task: None,
             last_sync_ok: None,
+            drafts: Default::default(),
+            pinned: HashSet::new(),
+            bookmarks: HashSet::new(),
+            chat_filter: None,
+            browse: None,
+            queued_command: None,
+            restore_input: None,
+            completion: None,
         }
     }
 
@@ -678,16 +706,23 @@ impl App {
     /// the currently selected chat selected.
     fn sort_conversations(&mut self) {
         let selected_id = self.conversations.get(self.selected).map(|c| c.id.clone());
-        self.conversations
-            .sort_by_key(|c| std::cmp::Reverse(c.last_activity()));
-        // Message requests go below the regular chats, as their own section.
-        let requests: HashSet<String> = self
+        // Pinned chats first; message requests below the regular chats, as
+        // their own section; newest first within each.
+        let keys: HashMap<String, _> = self
             .conversations
             .iter()
-            .filter(|c| self.is_request(c))
-            .map(|c| c.id.clone())
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    session_tui_chats::sort_key(
+                        self.pinned.contains(&c.id),
+                        self.is_request(c),
+                        c.last_activity(),
+                    ),
+                )
+            })
             .collect();
-        self.conversations.sort_by_key(|c| requests.contains(&c.id));
+        self.conversations.sort_by_key(|c| keys[&c.id]);
         if let Some(id) = selected_id
             && let Some(index) = self.conversations.iter().position(|c| c.id == id)
         {
@@ -1153,16 +1188,12 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         let row = (mouse.row.saturating_sub(area.y) / 3) as usize + app.contact_list_offset;
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if row < app.conversations.len() {
-                    app.selected = row;
+                if let Some(&index) = session_tui_chats::visible(app).get(row) {
+                    app.selected = index;
                 }
             }
-            MouseEventKind::ScrollUp => app.selected = app.selected.saturating_sub(1),
-            MouseEventKind::ScrollDown => {
-                if !app.conversations.is_empty() {
-                    app.selected = (app.selected + 1).min(app.conversations.len() - 1);
-                }
-            }
+            MouseEventKind::ScrollUp => session_tui_chats::step(app, -1),
+            MouseEventKind::ScrollDown => session_tui_chats::step(app, 1),
             _ => {}
         }
         return;
@@ -1972,6 +2003,7 @@ impl LocalStore {
             batch: std::cell::RefCell::new(None),
         };
         store.add_sender_to_message_key()?;
+        session_tui_local::migrate(&store.connection)?;
         Ok(store)
     }
 
@@ -5216,7 +5248,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     {
         apply_account_state(&mut app, &store, &configs.state());
     }
+    session_tui_local::load(&mut app, &store);
+    app.sort_conversations();
     let result = run(&mut terminal, &mut app, &client, &store).await;
+    session_tui_local::flush_drafts(&mut app, &store);
     restore_terminal();
     result?;
     Ok(())
@@ -5671,12 +5706,18 @@ async fn run(
             }
         }
         session_tui_netdiag::poll(app, client, store).await;
+        if let Some((input, cursor)) = app.restore_input.take() {
+            app.input = input;
+            app.cursor = cursor;
+        }
+        session_tui_local::sync_drafts(app, store);
         // Fix this visit's unread boundary before anything is marked read.
         update_unread_marker(app);
         if app.recovery_seed.is_none()
             && !app.show_help
             && app.search.is_none()
             && app.net_view.is_none()
+            && app.browse.is_none()
             && app.window_focused
             && mark_current_conversation_read(app, store)
         {
@@ -5733,11 +5774,24 @@ async fn run(
             last_draw = Instant::now();
             redraw = false;
         }
-        if !event::poll(Duration::from_millis(250))? {
+        let queued = app.queued_command.take();
+        if queued.is_none() && !event::poll(Duration::from_millis(250))? {
             continue;
         }
         redraw = true;
-        let key = match event::read()? {
+        let event = match queued {
+            // Run it like a typed command, then give the composer back.
+            Some(command) => {
+                app.restore_input = Some((std::mem::replace(&mut app.input, command), app.cursor));
+                app.cursor = app.input.len();
+                Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))
+            }
+            None => event::read()?,
+        };
+        let key = match event {
             Event::FocusGained => {
                 app.window_focused = true;
                 continue;
@@ -5850,6 +5904,10 @@ async fn run(
             session_tui_netdiag::handle_key(app, client, store, key.code);
             continue;
         }
+        if app.browse.is_some() {
+            session_tui_browse::handle_key(app, key.code);
+            continue;
+        }
         if app.search.is_some() {
             session_tui_search::handle_key(app, key.code);
             continue;
@@ -5866,6 +5924,9 @@ async fn run(
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let editing = !app.input.is_empty();
+        if key.code != KeyCode::Tab {
+            app.completion = None;
+        }
         match key.code {
             // Line break: Shift+Enter / Alt+Enter / Ctrl+J (terminals differ
             // in which of these they can report).
@@ -5919,6 +5980,26 @@ async fn run(
                     app.reaction_picker = true;
                 } else {
                     app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+                }
+            }
+            KeyCode::Tab
+                if app.focus == FocusArea::Composer
+                    && app.input_mode == InputMode::Message
+                    && app.input.starts_with('/')
+                    && !app.input.contains(char::is_whitespace) =>
+            {
+                use session_tui_commands::Tab;
+                match session_tui_commands::complete(&app.input, &mut app.completion) {
+                    Tab::Complete(text) => {
+                        app.input = text;
+                        app.cursor = app.input.len();
+                        app.status = match app.completion.as_ref() {
+                            Some(c) => format!("{} · TAB FOR NEXT", c.matches.join("  ")),
+                            None => "COMMAND COMPLETED".into(),
+                        };
+                    }
+                    Tab::NoMatch => app.status = "NO COMMAND STARTS LIKE THAT".into(),
+                    Tab::NotCommand => {}
                 }
             }
             KeyCode::Tab => {
@@ -5985,18 +6066,16 @@ async fn run(
                 app.status = "ENTER CONTACT SESSION ID (05…)".into();
             }
             KeyCode::Left if app.input.is_empty() && !app.conversations.is_empty() => {
-                app.selected = app.selected.saturating_sub(1);
+                session_tui_chats::step(app, -1);
             }
             KeyCode::Right if app.input.is_empty() && !app.conversations.is_empty() => {
-                app.selected = (app.selected + 1).min(app.conversations.len() - 1);
+                session_tui_chats::step(app, 1);
             }
             KeyCode::Up if app.input.is_empty() && app.focus == FocusArea::Contacts => {
-                app.selected = app.selected.saturating_sub(1);
+                session_tui_chats::step(app, -1);
             }
             KeyCode::Down if app.input.is_empty() && app.focus == FocusArea::Contacts => {
-                if !app.conversations.is_empty() {
-                    app.selected = (app.selected + 1).min(app.conversations.len() - 1);
-                }
+                session_tui_chats::step(app, 1);
             }
             KeyCode::Up if app.input.is_empty() && app.focus == FocusArea::Messages => {
                 if let Some(conversation) = app.conversations.get_mut(app.selected) {
@@ -6084,12 +6163,13 @@ async fn run(
                 {
                     app.input.clear();
                     app.cursor = 0;
-                    let count = app.conversations.len();
-                    if number <= count {
-                        app.selected = number - 1;
+                    // Numbered as the (filtered) list shows them.
+                    let count = session_tui_chats::visible(app).len();
+                    if let Some(index) = session_tui_chats::nth(app, number) {
+                        app.selected = index;
                         app.status = format!(
                             "CHAT {number} · {}",
-                            app.conversations[number - 1].title(&app.local_id)
+                            app.conversations[index].title(&app.local_id)
                         );
                     } else {
                         app.status = match count {
@@ -6461,6 +6541,80 @@ async fn run(
                         app.status =
                             format!("NEW-MESSAGE BELL {}", if app.bell { "ON" } else { "OFF" });
                     }
+                    "/unread" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_browse::unread(app);
+                    }
+                    "/goto" => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_browse::goto(app, rest);
+                    }
+                    "/bookmark" | "/unbookmark" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_browse::bookmark(app, store, command == "/bookmark");
+                    }
+                    "/bookmarks" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_browse::open_bookmarks(app, store);
+                    }
+                    "/media" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_browse::open_media(app);
+                    }
+                    "/links" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_browse::open_links(app);
+                    }
+                    "/filter" => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        app.chat_filter = session_tui_chats::ChatFilter::parse(rest);
+                        app.status = match app.chat_filter.as_ref() {
+                            None => format!("FILTER CLEARED · {} CHATS", app.conversations.len()),
+                            Some(filter) => match session_tui_chats::visible(app).len() {
+                                0 => {
+                                    format!("NO CHATS MATCH {} · /filter TO CLEAR", filter.label())
+                                }
+                                n => format!(
+                                    "FILTER {} · {n} OF {} CHATS",
+                                    filter.label(),
+                                    app.conversations.len()
+                                ),
+                            },
+                        };
+                    }
+                    "/pin" | "/unpin" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        let pin = command == "/pin";
+                        let Some(id) = app.conversations.get(app.selected).map(|c| c.id.clone())
+                        else {
+                            app.status = "NO CHAT OPEN".into();
+                            continue;
+                        };
+                        if app.pinned.contains(&id) == pin {
+                            app.status = if pin { "ALREADY PINNED" } else { "NOT PINNED" }.into();
+                            continue;
+                        }
+                        app.status = match store.set_pinned(&id, pin) {
+                            Ok(()) => {
+                                if pin {
+                                    app.pinned.insert(id);
+                                } else {
+                                    app.pinned.remove(&id);
+                                }
+                                app.sort_conversations();
+                                if pin { "CHAT PINNED" } else { "CHAT UNPINNED" }.into()
+                            }
+                            Err(error) => format!("PIN NOT SAVED · {error}"),
+                        };
+                    }
                     "/net" if rest.is_empty() => {
                         app.input.clear();
                         app.cursor = 0;
@@ -6475,7 +6629,7 @@ async fn run(
                         app.input.clear();
                         app.show_emoji = true;
                     }
-                    "/?" if rest.is_empty() => {
+                    "/?" | "/help" if rest.is_empty() => {
                         app.input.clear();
                         app.help_scroll = 0;
                         app.show_help = true;
@@ -6630,6 +6784,7 @@ async fn run(
                                 let _ = store.delete_message(&peer, message);
                             }
                             let _ = store.delete_empty_contact(&peer);
+                            session_tui_local::forget_chat(app, store, &peer);
                             app.selected =
                                 app.selected.min(app.conversations.len().saturating_sub(1));
                             app.status =
@@ -6723,6 +6878,13 @@ async fn run(
             }
             KeyCode::Backspace => {
                 session_tui_input::backspace(&mut app.input, &mut app.cursor);
+            }
+            // Alt+N (terminals that send Esc+n report it as Alt too).
+            KeyCode::Char('n' | 'N')
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                session_tui_browse::next_unread_chat(app);
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.focus = FocusArea::Composer;
@@ -7336,6 +7498,7 @@ fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) 
         let _ = store.delete_message(id, message);
     }
     let _ = store.delete_empty_contact(id);
+    session_tui_local::forget_chat(app, store, id);
     if app.selected > index || app.selected >= app.conversations.len() {
         app.selected = app.selected.saturating_sub(1);
     }
@@ -7361,11 +7524,6 @@ fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) 
     }
 }
 
-/// Mark the open chat read. The read flags, disappear-after-read timers,
-/// the read state for other devices and the read receipt are written in one
-/// transaction and only then applied on screen: either all of it happens,
-/// or none of it and it is tried again on the next pass. Returns true when
-/// a read receipt was queued.
 /// Keep the "Unread Messages" boundary of the open chat (see
 /// [`session_tui_separators::UnreadMarker`]). Only reads state.
 fn update_unread_marker(app: &mut App) {
@@ -7385,6 +7543,11 @@ fn update_unread_marker(app: &mut App) {
     );
 }
 
+/// Mark the open chat read. The read flags, disappear-after-read timers,
+/// the read state for other devices and the read receipt are written in one
+/// transaction and only then applied on screen: either all of it happens,
+/// or none of it and it is tried again on the next pass. Returns true when
+/// a read receipt was queued.
 fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> bool {
     let Some(conversation) = app.conversations.get(app.selected) else {
         return false;
@@ -8351,6 +8514,12 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
         session_tui_netdiag::draw(frame, area, view);
         return None;
     }
+    if let Some(mut view) = app.browse.take() {
+        session_tui_browse::draw(frame, area, &mut view, |item| {
+            session_tui_browse::locate(app, &item.conversation, &item.key).is_some()
+        });
+        app.browse = Some(view);
+    }
     if let Some(mut view) = app.search.take() {
         session_tui_search::draw(frame, area, &mut view, format_time, |hit| {
             session_tui_search::exists(app, hit)
@@ -8590,7 +8759,18 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
             },
             Style::default().fg(Color::Yellow),
         ),
-        Span::styled("  Ctrl+N +", Style::default().fg(TEAL)),
+        Span::styled(
+            match app.chat_filter.as_ref() {
+                Some(filter) => format!(
+                    "  FILTER {} · {}/{}",
+                    filter.label(),
+                    session_tui_chats::visible(app).len(),
+                    app.conversations.len()
+                ),
+                None => "  Ctrl+N +".to_owned(),
+            },
+            Style::default().fg(TEAL),
+        ),
     ]))
     .block(
         Block::default()
@@ -8599,12 +8779,13 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
             .style(Style::default().bg(PANEL)),
     );
     frame.render_widget(title, inner[0]);
-    let items: Vec<ListItem<'_>> = app
-        .conversations
+    let visible = session_tui_chats::visible(app);
+    let mut items: Vec<ListItem<'_>> = visible
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            let selected = i == app.selected;
+        .map(|(i, &index)| {
+            let c = &app.conversations[index];
+            let selected = index == app.selected;
             let marker = if selected && active { "▌" } else { " " };
             let entry_color = if selected {
                 if active { TEAL } else { MUTED }
@@ -8626,13 +8807,14 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
                     ),
                     Span::styled(
                         format!(
-                            " {}{}{}",
+                            " {}{}{}{}",
                             // The number `/N` switches to.
                             if i < 9 {
                                 format!("{} ", i + 1)
                             } else {
                                 "  ".to_owned()
                             },
+                            if app.pinned.contains(&c.id) { "^ " } else { "" },
                             if c.id.starts_with("03") { "# " } else { "" },
                             c.title(&app.local_id)
                         ),
@@ -8663,6 +8845,15 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
             ]))
         })
         .collect();
+    if items.is_empty() && app.chat_filter.is_some() {
+        items.push(ListItem::new(Text::from(vec![
+            Line::from(Span::styled("  No chats match", Style::default().fg(MUTED))),
+            Line::from(Span::styled(
+                "  /filter alone shows all",
+                Style::default().fg(MUTED),
+            )),
+        ])));
+    }
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::RIGHT)
@@ -8670,7 +8861,7 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
             .style(Style::default().bg(BG)),
     );
     let mut state = ListState::default();
-    state.select(Some(app.selected));
+    state.select(visible.iter().position(|&index| index == app.selected));
     frame.render_stateful_widget(list, inner[1], &mut state);
     app.contact_list_offset = state.offset();
 }
@@ -8720,8 +8911,6 @@ fn message_layout_key(app: &App, message: &Message, width: usize) -> u64 {
     hasher.finish()
 }
 
-/// Rows of one message, and its attachments' row ranges within them.
-#[allow(clippy::type_complexity)]
 /// One-line excerpt of the quoted message. Some clients send the quote
 /// without its text, so fall back to the original in local history
 /// (the quote id is the original's timestamp).
@@ -8748,6 +8937,8 @@ fn quote_preview(c: &Conversation, quote: &QuoteRef) -> String {
     }
 }
 
+/// Rows of one message, and its attachments' row ranges within them.
+#[allow(clippy::type_complexity)]
 fn message_lines(
     app: &App,
     c: &Conversation,
@@ -8822,6 +9013,13 @@ fn message_lines(
                 Style::default().fg(tick_color).add_modifier(Modifier::BOLD),
             ));
         }
+    }
+    if !app.bookmarks.is_empty()
+        && app
+            .bookmarks
+            .contains(&(c.id.clone(), message.key(&c.id, &app.local_id)))
+    {
+        metadata.push(Span::styled("  ★", Style::default().fg(UNREAD)));
     }
     if let Some(expires_at) = message.expires_at {
         let left = expires_at.saturating_sub(now_ms()) / 1000;
@@ -9261,142 +9459,10 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     app.composer_area = Some(rows[2]);
 }
 
-const HELP: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Navigation",
-        &[
-            ("Tab / Shift+Tab", "Move focus: chats → messages → composer"),
-            ("← / →", "Previous / next chat (when the composer is empty)"),
-            ("↑ / ↓", "Move in the focused list"),
-            (
-                "Mouse",
-                "Click a chat, message or image; wheel moves the selection",
-            ),
-            ("/? · Esc", "Open / close this help (↑/↓ scroll)"),
-            ("/exit · Ctrl+C", "Quit"),
-        ],
-    ),
-    (
-        "Composer",
-        &[
-            ("Enter", "Send"),
-            ("Shift+Enter · Alt+Enter · Ctrl+J", "New line"),
-            (
-                "← → ↑ ↓ Home End",
-                "Move the cursor (Ctrl+A / Ctrl+E: line start / end)",
-            ),
-            ("Backspace · Delete", "Delete before / after the cursor"),
-            ("Ctrl+W · Ctrl+U", "Delete previous word · clear everything"),
-            ("Paste", "Inserted at the cursor, line breaks kept"),
-            (
-                ":joy: :heart: :+1:",
-                "Emoji shortcodes (/emoji lists them; Win+. on Windows)",
-            ),
-        ],
-    ),
-    (
-        "Messages (focus the message list)",
-        &[
-            ("r", "Reply to the selected message (Esc cancels)"),
-            ("e  then 1-6", "Reaction bar: 😂 🥰 😢 😡 😮 😈"),
-            ("+", "React 👍"),
-            (
-                "/react EMOJI",
-                "React with any emoji or :shortcode: (again removes it)",
-            ),
-            (
-                "Delete",
-                "Delete: 1 on this device only · 2 for everyone (your messages)",
-            ),
-            ("/retry", "Resend the selected failed message"),
-            ("✓ / ✓✓ / teal ✓✓", "Sent / delivered / read"),
-        ],
-    ),
-    (
-        "Attachments",
-        &[
-            (
-                "/attach P1 [P2…] [-- caption]",
-                "Send files as one message (max 32; quote paths with spaces)",
-            ),
-            (
-                "/view [N]",
-                "Open image N of the selected message; ←/→ next/previous",
-            ),
-            (
-                "/paste [-- caption]",
-                "Send the image on the clipboard (e.g. a screenshot)",
-            ),
-            (
-                "/save [N] [PATH]",
-                "Save attachment N, or all, to PATH or the current folder",
-            ),
-        ],
-    ),
-    (
-        "Chats and groups",
-        &[
-            ("Ctrl+N", "Start a chat with a Session ID"),
-            (
-                "/disappear off | read 12h | send 1d",
-                "Disappearing messages for this 1:1 chat",
-            ),
-            (
-                "/1 … /9",
-                "Switch to chat N (the number shown in the chat list)",
-            ),
-            (
-                "/accept",
-                "Accept a message request, or join the group you were invited to",
-            ),
-            ("/decline", "Decline a message request (deletes it)"),
-            (
-                "/delete",
-                "Delete this chat and its messages (the contact stays)",
-            ),
-            (
-                "/remove",
-                "Remove this contact from your account and delete the chat",
-            ),
-            (
-                "/block · /unblock",
-                "Block / unblock this 1:1 contact on all your devices",
-            ),
-            ("/rsync", "Fetch messages now (also automatic)"),
-            (
-                "/search [--all | --chat ID|NAME] WORD",
-                "Search messages (--from/--to YYYY-MM-DD); Enter opens one",
-            ),
-            (
-                "End · Ctrl+End",
-                "Jump to the newest message (message list)",
-            ),
-            (
-                "/net",
-                "Network diagnostics (paths, nodes, outbox; R refresh)",
-            ),
-        ],
-    ),
-    (
-        "Settings",
-        &[
-            (
-                "/name [NAME]",
-                "Show / set your display name (synced to your other devices)",
-            ),
-            (
-                "/bell on|off",
-                "Terminal bell for new messages (title shows unread count)",
-            ),
-            ("--debug", "Start with a debug log (session-tui-debug.log)"),
-            ("--forget-seed", "Start and delete the saved seed"),
-        ],
-    ),
-];
-
 fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, scroll: u16) {
     let popup = centered_rect(90, 90, area);
     frame.render_widget(Clear, popup);
+    use session_tui_commands::HELP;
     let key_width = HELP
         .iter()
         .flat_map(|(_, entries)| entries.iter())
@@ -9438,21 +9504,34 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, scroll: u16) {
     frame.render_widget(help, popup);
 }
 
+/// A `width` × `height` cell rectangle centred in `area` (clipped to it).
+fn centered_cells(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// `width` / `height` are percentages of `area` (at most 100).
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - height) / 2),
-            Constraint::Percentage(height),
-            Constraint::Percentage((100 - height) / 2),
+            Constraint::Percentage((100 - height.min(100)) / 2),
+            Constraint::Percentage(height.min(100)),
+            Constraint::Percentage((100 - height.min(100)) / 2),
         ])
         .split(area);
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage((100 - width) / 2),
-            Constraint::Percentage(width),
-            Constraint::Percentage((100 - width) / 2),
+            Constraint::Percentage((100 - width.min(100)) / 2),
+            Constraint::Percentage(width.min(100)),
+            Constraint::Percentage((100 - width.min(100)) / 2),
         ])
         .split(vertical[1])[1]
 }
@@ -10010,7 +10089,9 @@ mod history_key_tests {
 
     /// Tests with a real store share one data folder (set once) and run one
     /// at a time; each uses its own account, so its own database file.
-    fn test_store(account: u8) -> (std::sync::MutexGuard<'static, ()>, Identity, LocalStore) {
+    pub(super) fn test_store(
+        account: u8,
+    ) -> (std::sync::MutexGuard<'static, ()>, Identity, LocalStore) {
         static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
         let guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DIR.get_or_init(|| {
@@ -10956,3 +11037,7 @@ mod delete_prompt_tests {
 #[cfg(test)]
 #[path = "session_tui_quality_tests.rs"]
 mod session_tui_quality_tests;
+
+#[cfg(test)]
+#[path = "session_tui_feature_tests.rs"]
+mod session_tui_feature_tests;
