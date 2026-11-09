@@ -24,10 +24,8 @@ use std::sync::Arc;
 use std::sync::Once;
 
 use reqwest::{Client, ClientBuilder};
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
-use rustls::crypto::{ring as rustls_ring, CryptoProvider};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, ring as rustls_ring};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 
@@ -151,7 +149,9 @@ impl Transport for HttpTransport {
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|e| TransportError::Other(format!("invalid method: {e}")))?;
 
-        let mut builder = client.request(method, &request.url).timeout(request.timeout);
+        let mut builder = client
+            .request(method, &request.url)
+            .timeout(request.timeout);
 
         for (k, v) in &request.headers {
             builder = builder.header(k, v);
@@ -165,7 +165,7 @@ impl Transport for HttpTransport {
             Ok(r) => r,
             Err(e) if e.is_timeout() => return Err(TransportError::Timeout),
             Err(e) if e.is_connect() => {
-                return Err(TransportError::ConnectionFailed(format_error_chain(&e)))
+                return Err(TransportError::ConnectionFailed(format_error_chain(&e)));
             }
             Err(e) => return Err(TransportError::SendFailed(format_error_chain(&e))),
         };
@@ -187,11 +187,13 @@ impl Transport for HttpTransport {
             return Err(TransportError::ReceiveFailed("response too large".into()));
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| TransportError::ReceiveFailed(format_error_chain(&e)))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            if e.is_timeout() {
+                TransportError::Timeout
+            } else {
+                TransportError::ReceiveFailed(format_error_chain(&e))
+            }
+        })? {
             if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
                 return Err(TransportError::ReceiveFailed("response too large".into()));
             }
@@ -309,36 +311,36 @@ impl ServerCertVerifier for SessionSeedVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &crypto_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &crypto_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
+        crypto_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -392,35 +394,221 @@ impl ServerCertVerifier for AcceptAnyCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &crypto_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &crypto_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
+        crypto_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod handshake_signature_tests {
+    use super::*;
+    use rustls::internal::msgs::codec::{Codec, Reader};
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    fn signed(message: &[u8]) -> DigitallySignedStruct {
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("testdata/handshake-key.der").to_vec(),
+        ));
+        let key = crypto_provider()
+            .key_provider
+            .load_private_key(key)
+            .unwrap();
+        let signer = key
+            .choose_scheme(&[SignatureScheme::RSA_PSS_SHA256])
+            .unwrap();
+        let signature = signer.sign(message).unwrap();
+        // Use rustls' wire codec, rather than accessing private signature fields.
+        let mut wire = Vec::new();
+        signer.scheme().encode(&mut wire);
+        (signature.len() as u16).encode(&mut wire);
+        wire.extend_from_slice(&signature);
+        DigitallySignedStruct::read(&mut Reader::init(&wire)).unwrap()
+    }
+
+    #[test]
+    fn both_verifiers_require_valid_tls12_and_tls13_handshake_signatures() {
+        let cert = CertificateDer::from(include_bytes!("testdata/handshake-cert.der").to_vec());
+        let verifiers: [&dyn ServerCertVerifier; 2] =
+            [&SessionSeedVerifier, &AcceptAnyCertVerifier];
+        let signature = signed(b"actual handshake transcript");
+        for verifier in verifiers {
+            assert!(
+                verifier
+                    .verify_tls12_signature(b"actual handshake transcript", &cert, &signature)
+                    .is_ok()
+            );
+            assert!(
+                verifier
+                    .verify_tls13_signature(b"actual handshake transcript", &cert, &signature)
+                    .is_ok()
+            );
+            assert!(
+                verifier
+                    .verify_tls12_signature(b"forged transcript", &cert, &signature)
+                    .is_err()
+            );
+            assert!(
+                verifier
+                    .verify_tls13_signature(b"forged transcript", &cert, &signature)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn copying_a_pinned_certificate_does_not_authorize_an_attacker_key() {
+        let signature = signed(b"attacker handshake");
+        let verifier = SessionSeedVerifier;
+        let name = ServerName::try_from("seed1.getsession.org").unwrap();
+        for pinned in seed_certs::pinned_certs() {
+            assert!(
+                verifier
+                    .verify_server_cert(pinned, &[], &name, &[], UnixTime::now())
+                    .is_ok()
+            );
+            assert!(
+                verifier
+                    .verify_tls12_signature(b"attacker handshake", pinned, &signature)
+                    .is_err()
+            );
+            assert!(
+                verifier
+                    .verify_tls13_signature(b"attacker handshake", pinned, &signature)
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_boundary_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn request(
+        reply: Vec<u8>,
+        keep_open: bool,
+        timeout: std::time::Duration,
+    ) -> Result<TransportResponse, TransportError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                header.push(byte[0]);
+                assert!(header.len() < 8192);
+            }
+            let _ = stream.write_all(&reply).await;
+            if keep_open {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+        // Keep tests independent of users' proxy variables; no external network.
+        install_default_crypto_provider();
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let transport = HttpTransport {
+            inner: Arc::new(HttpTransportInner {
+                strict_client: client.clone(),
+                trust_all_client: client.clone(),
+                seed_pinned_client: client,
+            }),
+        };
+        let req = TransportRequest {
+            url: format!("http://{address}/"),
+            method: "GET".into(),
+            body: vec![],
+            headers: vec![],
+            timeout,
+            accept_invalid_certs: false,
+        };
+        let result = transport.send_request(&req).await;
+        server.abort();
+        result
+    }
+    #[tokio::test]
+    async fn rejects_an_oversized_content_length_before_buffering_the_body() {
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let error = request(reply, false, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error,TransportError::ReceiveFailed(ref text) if text=="response too large")
+        );
+    }
+    #[tokio::test]
+    async fn enforces_limit_when_chunked_response_has_no_content_length() {
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            MAX_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        reply.resize(reply.len() + MAX_RESPONSE_BYTES + 1, b'x');
+        reply.extend_from_slice(b"\r\n0\r\n\r\n");
+        let error = request(reply, false, std::time::Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error,TransportError::ReceiveFailed(ref text) if text=="response too large")
+        );
+    }
+    #[tokio::test]
+    async fn a_stalled_response_body_is_a_timeout_not_a_generic_receive_failure() {
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nx".to_vec();
+        assert!(matches!(
+            request(reply, true, std::time::Duration::from_millis(250)).await,
+            Err(TransportError::Timeout)
+        ));
+    }
+    #[tokio::test]
+    async fn accepts_a_complete_small_response() {
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_vec();
+        assert_eq!(
+            request(reply, false, std::time::Duration::from_secs(5))
+                .await
+                .unwrap()
+                .body,
+            b"abc"
+        );
     }
 }

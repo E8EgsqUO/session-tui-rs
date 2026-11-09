@@ -7,8 +7,8 @@
 
 use std::collections::BTreeMap;
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::Digest;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
@@ -147,9 +147,9 @@ pub fn encrypt_for_recipient(
     let signed_msg = sign_for_recipient(ed25519_privkey, recipient_pubkey, message)?;
     let recip_pk = strip_05_prefix(recipient_pubkey)?;
 
-    let recip_pk_arr: [u8; 32] = recip_pk.try_into().map_err(|_| {
-        CryptoError::InvalidInput("recipient pubkey must be 32 bytes".into())
-    })?;
+    let recip_pk_arr: [u8; 32] = recip_pk
+        .try_into()
+        .map_err(|_| CryptoError::InvalidInput("recipient pubkey must be 32 bytes".into()))?;
     let recip_box_pk = crypto_box::PublicKey::from(recip_pk_arr);
 
     let ciphertext = recip_box_pk
@@ -181,8 +181,7 @@ pub fn encrypt_for_recipient_deterministic(
     // BLAKE2b(keyed="SessionBoxEphemeralHashKey", sender_seed || recipient_pk || message)
     // crypto_box_SEEDBYTES = 32
     let sender_seed = &ed25519_privkey[..32];
-    let mut eph_seed =
-        blake2b_keyed_hash(&[sender_seed, recip_pk, message], BOX_HASHKEY, 32);
+    let mut eph_seed = blake2b_keyed_hash(&[sender_seed, recip_pk, message], BOX_HASHKEY, 32);
 
     // Generate ephemeral keypair from seed using crypto_box_seed_keypair equivalent.
     // In libsodium, crypto_box_seed_keypair hashes the seed with SHA-512 then clamps.
@@ -313,9 +312,9 @@ fn blinded_shared_secret(
     // Decompress jB as an Edwards point and perform scalar multiplication
     let j_b_arr: [u8; 32] = j_b_raw.try_into().unwrap();
     let j_b_compressed = CompressedEdwardsY(j_b_arr);
-    let j_b_point = j_b_compressed.decompress().ok_or_else(|| {
-        CryptoError::InvalidInput("Failed to decompress blinded pubkey".into())
-    })?;
+    let j_b_point = j_b_compressed
+        .decompress()
+        .ok_or_else(|| CryptoError::InvalidInput("Failed to decompress blinded pubkey".into()))?;
 
     let shared_point = (ka_scalar * j_b_point).compress();
     let shared_secret_raw = shared_point.to_bytes();
@@ -428,9 +427,9 @@ pub fn encrypt_for_blinded_recipient(
     // Encrypt using XChaCha20-Poly1305
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ct = cipher
-        .encrypt(&nonce, buf.as_slice())
-        .map_err(|e| CryptoError::EncryptionFailed(format!("Crypto aead encryption failed: {e}")))?;
+    let ct = cipher.encrypt(&nonce, buf.as_slice()).map_err(|e| {
+        CryptoError::EncryptionFailed(format!("Crypto aead encryption failed: {e}"))
+    })?;
 
     // Result: version_byte || ciphertext || nonce
     let mut result = Vec::with_capacity(1 + ct.len() + 24);
@@ -514,9 +513,9 @@ fn blinded15_id_from_ed(ed_pk: &[u8], server_pk: &[u8]) -> CryptoResult<Vec<u8>>
     k_wide.copy_from_slice(&k_hash);
     let k_scalar = Scalar::from_bytes_mod_order_wide(&k_wide);
 
-    let ed_pk_arr: [u8; 32] = ed_pk.try_into().map_err(|_| {
-        CryptoError::InvalidInput("ed_pk must be 32 bytes".into())
-    })?;
+    let ed_pk_arr: [u8; 32] = ed_pk
+        .try_into()
+        .map_err(|_| CryptoError::InvalidInput("ed_pk must be 32 bytes".into()))?;
     let ed_pk_compressed = CompressedEdwardsY(ed_pk_arr);
     let ed_pk_point = ed_pk_compressed.decompress().ok_or_else(|| {
         CryptoError::KeyConversionFailed("Failed to decompress ed25519 pubkey".into())
@@ -542,9 +541,9 @@ fn blinded25_id_from_ed(ed_pk: &[u8], server_pk: &[u8]) -> CryptoResult<Vec<u8>>
     use curve25519_dalek::edwards::CompressedEdwardsY;
     use curve25519_dalek::scalar::Scalar;
 
-    let ed_pk_arr: [u8; 32] = ed_pk.try_into().map_err(|_| {
-        CryptoError::InvalidInput("ed_pk must be 32 bytes".into())
-    })?;
+    let ed_pk_arr: [u8; 32] = ed_pk
+        .try_into()
+        .map_err(|_| CryptoError::InvalidInput("ed_pk must be 32 bytes".into()))?;
 
     // k = BLAKE2b-64(server_pk || ed_pk, key="25Blind") mod L
     let k_hash = blake2b_keyed_hash(&[server_pk, &ed_pk_arr], b"25Blind", 64);
@@ -985,7 +984,7 @@ pub fn decrypt_group_message(
         _ => {
             return Err(CryptoError::DecryptionFailed(
                 "decrypted data is not a bencoded dict".into(),
-            ))
+            ));
         }
     };
 
@@ -1014,7 +1013,7 @@ pub fn decrypt_group_message(
         _ => {
             return Err(CryptoError::DecryptionFailed(
                 "missing message author pubkey".into(),
-            ))
+            ));
         }
     };
 
@@ -1072,7 +1071,7 @@ pub fn decrypt_group_message(
         _ => {
             return Err(CryptoError::DecryptionFailed(
                 "message signature is missing".into(),
-            ))
+            ));
         }
     };
 
@@ -1090,17 +1089,13 @@ pub fn decrypt_group_message(
 
     let data = if compressed {
         crate::util::zstd_compress::decompress(&raw_data, GROUPS_MAX_PLAINTEXT_MESSAGE_SIZE)
-            .ok_or_else(|| {
-                CryptoError::DecryptionFailed("message decompression failed".into())
-            })?
+            .ok_or_else(|| CryptoError::DecryptionFailed("message decompression failed".into()))?
     } else {
         raw_data
     };
 
     // Check that we don't have both "d" and "z"
-    if !compressed
-        && dict.contains_key(b"z".as_slice())
-    {
+    if !compressed && dict.contains_key(b"z".as_slice()) {
         return Err(CryptoError::DecryptionFailed(
             "message signature cannot contain both compressed (z) and uncompressed (d) data".into(),
         ));
@@ -1145,9 +1140,11 @@ pub fn decrypt_ons_response(
             let mut key = [0u8; 32];
 
             // crypto_pwhash_OPSLIMIT_MODERATE = 3, crypto_pwhash_MEMLIMIT_MODERATE = 256MB
-            let params = argon2::Params::new(256 * 1024, 3, 1, Some(32))
-                .map_err(|e| CryptoError::DecryptionFailed(format!("Failed to create Argon2 params: {e}")))?;
-            let argon2_ctx = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+            let params = argon2::Params::new(256 * 1024, 3, 1, Some(32)).map_err(|e| {
+                CryptoError::DecryptionFailed(format!("Failed to create Argon2 params: {e}"))
+            })?;
+            let argon2_ctx =
+                argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
             argon2_ctx
                 .hash_password_into(lowercase_name.as_bytes(), &salt, &mut key)
                 .map_err(|e| {
@@ -1230,13 +1227,11 @@ pub fn decrypt_push_notification(payload: &[u8], enc_key: &[u8]) -> CryptoResult
 
     let key: [u8; 32] = enc_key[..32].try_into().unwrap();
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let mut buf = cipher
-        .decrypt(&nonce, ct_data)
-        .map_err(|_| {
-            CryptoError::DecryptionFailed(
-                "Failed to decrypt; perhaps the secret key is invalid?".into(),
-            )
-        })?;
+    let mut buf = cipher.decrypt(&nonce, ct_data).map_err(|_| {
+        CryptoError::DecryptionFailed(
+            "Failed to decrypt; perhaps the secret key is invalid?".into(),
+        )
+    })?;
 
     // Remove trailing null bytes
     if let Some(pos) = buf.iter().rposition(|&c| c != 0) {
@@ -1263,9 +1258,9 @@ pub fn encrypt_xchacha20(plaintext: &[u8], enc_key: &[u8]) -> CryptoResult<Vec<u
     let key: [u8; 32] = enc_key[..32].try_into().unwrap();
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ct = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|e| CryptoError::EncryptionFailed(format!("XChaCha20-Poly1305 encrypt failed: {e}")))?;
+    let ct = cipher.encrypt(&nonce, plaintext).map_err(|e| {
+        CryptoError::EncryptionFailed(format!("XChaCha20-Poly1305 encrypt failed: {e}"))
+    })?;
 
     let mut result = Vec::with_capacity(24 + ct.len());
     result.extend_from_slice(&nonce);
@@ -1294,11 +1289,9 @@ pub fn decrypt_xchacha20(ciphertext: &[u8], enc_key: &[u8]) -> CryptoResult<Vec<
 
     let key: [u8; 32] = enc_key[..32].try_into().unwrap();
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let buf = cipher
-        .decrypt(&nonce, ct_data)
-        .map_err(|_| {
-            CryptoError::DecryptionFailed("Could not decrypt (XChaCha20-Poly1305)".into())
-        })?;
+    let buf = cipher.decrypt(&nonce, ct_data).map_err(|_| {
+        CryptoError::DecryptionFailed("Could not decrypt (XChaCha20-Poly1305)".into())
+    })?;
 
     Ok(buf)
 }
@@ -1337,12 +1330,12 @@ mod tests {
 
     // Test setup: derive keys from seeds matching the C++ test vectors
     fn setup_keys() -> (
-        [u8; 32],  // ed_pk
-        [u8; 64],  // ed_sk
-        [u8; 32],  // curve_pk
-        [u8; 32],  // ed_pk2
-        [u8; 64],  // ed_sk2
-        [u8; 32],  // curve_pk2
+        [u8; 32], // ed_pk
+        [u8; 64], // ed_sk
+        [u8; 32], // curve_pk
+        [u8; 32], // ed_pk2
+        [u8; 64], // ed_sk2
+        [u8; 32], // curve_pk2
     ) {
         let seed = hex_to_bytes("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let (ed_pk, ed_sk) = ed25519_key_pair_from_seed(&seed).unwrap();
@@ -1357,7 +1350,8 @@ mod tests {
             "d2ad010eeb72d72e561d9de7bd7b6989af77dcabffa03a5111a6c859ae5c3a72"
         );
 
-        let seed2 = hex_to_bytes("00112233445566778899aabbccddeeff00000000000000000000000000000000");
+        let seed2 =
+            hex_to_bytes("00112233445566778899aabbccddeeff00000000000000000000000000000000");
         let (ed_pk2, ed_sk2) = ed25519_key_pair_from_seed(&seed2).unwrap();
         let curve_pk2 = to_curve25519_pubkey(&ed_pk2).unwrap();
 
@@ -1405,8 +1399,7 @@ mod tests {
     fn test_encrypt_decrypt_seed_only_unprefixed_sid() {
         let (ed_pk, ed_sk, _curve_pk, _ed_pk2, ed_sk2, curve_pk2) = setup_keys();
 
-        let lorem_ipsum =
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor \
+        let lorem_ipsum = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor \
              incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis \
              nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. \
              Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu \
@@ -1444,10 +1437,8 @@ mod tests {
         assert_ne!(enc1, enc2);
 
         // Deterministic should produce the same ciphertext each time
-        let enc_det =
-            encrypt_for_recipient_deterministic(&ed_sk, &sid_raw2, b"hello").unwrap();
-        let enc_det2 =
-            encrypt_for_recipient_deterministic(&ed_sk, &sid_raw2, b"hello").unwrap();
+        let enc_det = encrypt_for_recipient_deterministic(&ed_sk, &sid_raw2, b"hello").unwrap();
+        let enc_det2 = encrypt_for_recipient_deterministic(&ed_sk, &sid_raw2, b"hello").unwrap();
         assert_eq!(enc_det, enc_det2);
         assert_ne!(enc_det, enc1);
         assert_eq!(enc_det.len(), enc1.len());
@@ -1579,42 +1570,34 @@ mod tests {
         let enc_key =
             hex_to_bytes("0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210");
         assert!(decrypt_xchacha20(b"invalid", &enc_key).is_err());
-        assert!(decrypt_xchacha20(
-            &hex_to_bytes(
-                "da74ac6e96afda1c5a07d5bde1b8b1e1c05be73cb3c84112f31f00369d67154d\
+        assert!(
+            decrypt_xchacha20(
+                &hex_to_bytes(
+                    "da74ac6e96afda1c5a07d5bde1b8b1e1c05be73cb3c84112f31f00369d67154d\
                  00ff029090b069b48c3cf603d838d4ef623d54"
-            ),
-            b"invalid"
-        )
-        .is_err());
+                ),
+                b"invalid"
+            )
+            .is_err()
+        );
         assert!(encrypt_xchacha20(b"test", b"invalid").is_err());
     }
 
     #[test]
     fn test_encrypt_decrypt_group_roundtrip() {
-        let seed = hex_to_bytes(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000",
-        );
+        let seed = hex_to_bytes("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let (_, ed_sk) = ed25519_key_pair_from_seed(&seed).unwrap();
 
         // Use a separate group key pair
-        let group_seed = hex_to_bytes(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        );
+        let group_seed =
+            hex_to_bytes("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
         let (group_pk, _group_sk) = ed25519_key_pair_from_seed(&group_seed).unwrap();
         let group_enc_key =
             hex_to_bytes("fedcba9876543210fedcba98765432100123456789abcdef0123456789abcdef");
 
         let plaintext = b"Hello, group!";
-        let ciphertext = encrypt_for_group(
-            &ed_sk,
-            &group_pk,
-            &group_enc_key,
-            plaintext,
-            false,
-            256,
-        )
-        .unwrap();
+        let ciphertext =
+            encrypt_for_group(&ed_sk, &group_pk, &group_enc_key, plaintext, false, 256).unwrap();
 
         let keys: Vec<&[u8]> = vec![&group_enc_key];
         let result = decrypt_group_message(&keys, &group_pk, &ciphertext).unwrap();
@@ -1626,14 +1609,11 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_group_compressed() {
-        let seed = hex_to_bytes(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000",
-        );
+        let seed = hex_to_bytes("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let (_, ed_sk) = ed25519_key_pair_from_seed(&seed).unwrap();
 
-        let group_seed = hex_to_bytes(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        );
+        let group_seed =
+            hex_to_bytes("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
         let (group_pk, _) = ed25519_key_pair_from_seed(&group_seed).unwrap();
         let group_enc_key =
             hex_to_bytes("fedcba9876543210fedcba98765432100123456789abcdef0123456789abcdef");
@@ -1657,29 +1637,19 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_group_multiple_keys() {
-        let seed = hex_to_bytes(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000",
-        );
+        let seed = hex_to_bytes("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let (_, ed_sk) = ed25519_key_pair_from_seed(&seed).unwrap();
 
-        let group_seed = hex_to_bytes(
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        );
+        let group_seed =
+            hex_to_bytes("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899");
         let (group_pk, _) = ed25519_key_pair_from_seed(&group_seed).unwrap();
         let group_enc_key =
             hex_to_bytes("fedcba9876543210fedcba98765432100123456789abcdef0123456789abcdef");
         let wrong_key =
             hex_to_bytes("1111111111111111111111111111111122222222222222222222222222222222");
 
-        let ciphertext = encrypt_for_group(
-            &ed_sk,
-            &group_pk,
-            &group_enc_key,
-            b"test",
-            false,
-            0,
-        )
-        .unwrap();
+        let ciphertext =
+            encrypt_for_group(&ed_sk, &group_pk, &group_enc_key, b"test", false, 0).unwrap();
 
         // First key is wrong, second is right
         let keys: Vec<&[u8]> = vec![&wrong_key, &group_enc_key];
@@ -1694,16 +1664,8 @@ mod tests {
         let server_pk =
             hex_to_bytes("1d7e7f92b1ed3643855c98ecac02fc7274033a3467653f047d6e433540c03f17");
 
-        let blind15_pk = blind15_key_pair_pk(
-            &ed_sk,
-            &server_pk,
-        )
-        .unwrap();
-        let blind15_pk2 = blind15_key_pair_pk(
-            &ed_sk2,
-            &server_pk,
-        )
-        .unwrap();
+        let blind15_pk = blind15_key_pair_pk(&ed_sk, &server_pk).unwrap();
+        let blind15_pk2 = blind15_key_pair_pk(&ed_sk2, &server_pk).unwrap();
 
         let mut blind15_pk2_prefixed = vec![0x15];
         blind15_pk2_prefixed.extend_from_slice(&blind15_pk2);
@@ -1711,13 +1673,9 @@ mod tests {
         let mut blind15_pk_prefixed = vec![0x15];
         blind15_pk_prefixed.extend_from_slice(&blind15_pk);
 
-        let enc = encrypt_for_blinded_recipient(
-            &ed_sk,
-            &server_pk,
-            &blind15_pk2_prefixed,
-            b"hello",
-        )
-        .unwrap();
+        let enc =
+            encrypt_for_blinded_recipient(&ed_sk, &server_pk, &blind15_pk2_prefixed, b"hello")
+                .unwrap();
 
         let sid = format!("05{}", hex::encode(curve_pk));
 
@@ -1740,16 +1698,8 @@ mod tests {
         let server_pk =
             hex_to_bytes("1d7e7f92b1ed3643855c98ecac02fc7274033a3467653f047d6e433540c03f17");
 
-        let blind25_pk = blind25_key_pair_pk(
-            &ed_sk,
-            &server_pk,
-        )
-        .unwrap();
-        let blind25_pk2 = blind25_key_pair_pk(
-            &ed_sk2,
-            &server_pk,
-        )
-        .unwrap();
+        let blind25_pk = blind25_key_pair_pk(&ed_sk, &server_pk).unwrap();
+        let blind25_pk2 = blind25_key_pair_pk(&ed_sk2, &server_pk).unwrap();
 
         let mut blind25_pk2_prefixed = vec![0x25];
         blind25_pk2_prefixed.extend_from_slice(&blind25_pk2);
@@ -1757,13 +1707,9 @@ mod tests {
         let mut blind25_pk_prefixed = vec![0x25];
         blind25_pk_prefixed.extend_from_slice(&blind25_pk);
 
-        let enc = encrypt_for_blinded_recipient(
-            &ed_sk,
-            &server_pk,
-            &blind25_pk2_prefixed,
-            b"hello",
-        )
-        .unwrap();
+        let enc =
+            encrypt_for_blinded_recipient(&ed_sk, &server_pk, &blind25_pk2_prefixed, b"hello")
+                .unwrap();
 
         let sid = format!("05{}", hex::encode(curve_pk));
 
@@ -1798,24 +1744,15 @@ mod tests {
         let server_pk =
             hex_to_bytes("1d7e7f92b1ed3643855c98ecac02fc7274033a3467653f047d6e433540c03f17");
 
-        let blind25_pk = blind25_key_pair_pk(
-            &ed_sk,
-            &server_pk,
-        )
-        .unwrap();
-        let blind25_pk2 = blind25_key_pair_pk(
-            &ed_sk2,
-            &server_pk,
-        )
-        .unwrap();
+        let blind25_pk = blind25_key_pair_pk(&ed_sk, &server_pk).unwrap();
+        let blind25_pk2 = blind25_key_pair_pk(&ed_sk2, &server_pk).unwrap();
 
         let mut blind25_pk2_prefixed = vec![0x25];
         blind25_pk2_prefixed.extend_from_slice(&blind25_pk2);
         let mut blind25_pk_prefixed = vec![0x25];
         blind25_pk_prefixed.extend_from_slice(&blind25_pk);
 
-        let lorem_ipsum =
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor \
+        let lorem_ipsum = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor \
              incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis \
              nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. \
              Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu \
@@ -1889,24 +1826,22 @@ mod tests {
         let mut blind25_pk_prefixed = vec![0x25];
         blind25_pk_prefixed.extend_from_slice(&blind25_pk);
 
-        let enc = encrypt_for_blinded_recipient(
-            &ed_sk,
-            &server_pk,
-            &blind25_pk2_prefixed,
-            b"hello",
-        )
-        .unwrap();
+        let enc =
+            encrypt_for_blinded_recipient(&ed_sk, &server_pk, &blind25_pk2_prefixed, b"hello")
+                .unwrap();
 
         // Tamper with ciphertext
         let mut broken = enc.clone();
         broken[23] ^= 0x80;
-        assert!(decrypt_from_blinded_recipient(
-            &ed_sk2,
-            &server_pk,
-            &blind25_pk_prefixed,
-            &blind25_pk2_prefixed,
-            &broken,
-        )
-        .is_err());
+        assert!(
+            decrypt_from_blinded_recipient(
+                &ed_sk2,
+                &server_pk,
+                &blind25_pk_prefixed,
+                &blind25_pk2_prefixed,
+                &broken,
+            )
+            .is_err()
+        );
     }
 }

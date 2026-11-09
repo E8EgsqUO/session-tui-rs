@@ -22,19 +22,39 @@ pub enum AccountChange {
     ProfileName(String),
     /// We talk to this person: mark them approved (as Session does when you
     /// message someone) and record their display name.
-    ApproveContact { id: String, name: Option<String> },
-    SetBlocked { id: String, blocked: bool },
+    ApproveContact {
+        id: String,
+        name: Option<String>,
+    },
+    SetBlocked {
+        id: String,
+        blocked: bool,
+    },
     /// Chat deleted: hide it on all devices (priority -1, as Session does).
-    HideContact { id: String },
+    HideContact {
+        id: String,
+    },
     /// Contact deleted from the account.
-    RemoveContact { id: String },
+    RemoveContact {
+        id: String,
+    },
     /// Disappearing setting for a 1:1 chat: (`Content` kind 1 = after read,
     /// 2 = after send, seconds) or `None` for off.
-    ContactExpiry { id: String, expiry: Option<(i32, u32)> },
+    ContactExpiry {
+        id: String,
+        expiry: Option<(i32, u32)>,
+    },
     /// Everything up to this timestamp (ms) was read on this device.
-    ReadUpTo { conversation: String, timestamp_ms: i64 },
+    ReadUpTo {
+        conversation: String,
+        timestamp_ms: i64,
+    },
     /// A group joined from an invite.
-    JoinGroup { id: String, name: String, auth_data: Vec<u8> },
+    JoinGroup {
+        id: String,
+        name: String,
+        auth_data: Vec<u8>,
+    },
 }
 
 impl AccountChange {
@@ -59,9 +79,16 @@ impl AccountChange {
                 | RemoveContact { id: a },
                 RemoveContact { id: b },
             ) => a != b,
-            (ReadUpTo { conversation: a, timestamp_ms: old_ts }, ReadUpTo { conversation: b, timestamp_ms: new_ts }) => {
-                a != b || old_ts > new_ts
-            }
+            (
+                ReadUpTo {
+                    conversation: a,
+                    timestamp_ms: old_ts,
+                },
+                ReadUpTo {
+                    conversation: b,
+                    timestamp_ms: new_ts,
+                },
+            ) => a != b || old_ts > new_ts,
             _ => true,
         });
         let superseded = pending.iter().any(|old| matches!(
@@ -301,8 +328,14 @@ impl AccountConfigs {
                 conversation,
                 timestamp_ms,
             } => {
-                let Some(key) = id_key(conversation) else { return false };
-                let section: &[u8] = if conversation.starts_with("03") { b"g" } else { b"1" };
+                let Some(key) = id_key(conversation) else {
+                    return false;
+                };
+                let section: &[u8] = if conversation.starts_with("03") {
+                    b"g"
+                } else {
+                    b"1"
+                };
                 let current = match self.convos.data().get(section) {
                     Some(ConfigValue::Dict(d)) => match d.get(&key) {
                         Some(ConfigValue::Dict(entry)) => get_int(entry, b"r"),
@@ -351,7 +384,9 @@ impl AccountConfigs {
         let mut contacts = Vec::new();
         if let Some(ConfigValue::Dict(entries)) = self.contacts.data().get(b"c".as_slice()) {
             for (key, value) in entries {
-                let ConfigValue::Dict(entry) = value else { continue };
+                let ConfigValue::Dict(entry) = value else {
+                    continue;
+                };
                 if key.len() != 33 || key[0] != 0x05 {
                     continue;
                 }
@@ -437,12 +472,19 @@ mod tests {
         }));
         assert!(configs.contacts.needs_push());
         let ours = configs.contacts.push();
-        assert!(ours.seqno > phone_seqno, "a local edit must create a new version");
+        assert!(
+            ours.seqno > phone_seqno,
+            "a local edit must create a new version"
+        );
 
         // The phone merges our push and still has its unknown field.
         phone.merge(&[("h2", ours.messages[0].as_slice())]).unwrap();
-        let ConfigValue::Dict(c) = &phone.data()[b"c".as_slice()] else { panic!() };
-        let ConfigValue::Dict(entry) = &c[&id_key(&peer()).unwrap()] else { panic!() };
+        let ConfigValue::Dict(c) = &phone.data()[b"c".as_slice()] else {
+            panic!()
+        };
+        let ConfigValue::Dict(entry) = &c[&id_key(&peer()).unwrap()] else {
+            panic!()
+        };
         assert_eq!(get_int(entry, b"Z"), 42);
         assert_eq!(get_int(entry, b"a"), 1);
         assert_eq!(get_str(entry, b"n").as_deref(), Some("Alice"));
@@ -479,8 +521,12 @@ mod tests {
             id: peer(),
             expiry: Some((1, 3600)), // Content: after read
         });
-        let ConfigValue::Dict(c) = &configs.contacts.data()[b"c".as_slice()] else { panic!() };
-        let ConfigValue::Dict(entry) = &c[&id_key(&peer()).unwrap()] else { panic!() };
+        let ConfigValue::Dict(c) = &configs.contacts.data()[b"c".as_slice()] else {
+            panic!()
+        };
+        let ConfigValue::Dict(entry) = &c[&id_key(&peer()).unwrap()] else {
+            panic!()
+        };
         assert_eq!(get_int(entry, b"e"), 2); // config: after read
         assert_eq!(configs.state().contacts[0].expiry, Some((1, 3600)));
     }
@@ -495,8 +541,7 @@ mod tests {
             auth_data: vec![1; 100],
         });
         let dumps = configs.dumps();
-        let restored =
-            AccountConfigs::new(&sk, &dumps.map(Some)).unwrap();
+        let restored = AccountConfigs::new(&sk, &dumps.map(Some)).unwrap();
         let groups: Vec<_> = restored.groups.get().iter_groups().cloned().collect();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].base.name, "Team");
@@ -515,6 +560,9 @@ mod tests {
         AccountChange::queue(&mut pending, read(5));
         AccountChange::queue(&mut pending, read(9));
         AccountChange::queue(&mut pending, read(7));
-        assert_eq!(pending, vec![AccountChange::ProfileName("b".into()), read(9)]);
+        assert_eq!(
+            pending,
+            vec![AccountChange::ProfileName("b".into()), read(9)]
+        );
     }
 }

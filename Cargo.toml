@@ -2,6 +2,8 @@
 name = "libsession"
 version = "0.11.0"
 edition = "2024"
+# Files beside session_tui.rs are modules, not independent executables.
+autobins = false
 rust-version = "1.93"
 license = "GPL-3.0-only"
 description = "Session messenger terminal client written in Rust, with text chat and image, audio, and file attachments; no voice or video calls"
@@ -68,6 +70,10 @@ thiserror = "2.0.18"
 
 # System clipboard images for /paste
 arboard = { version = "3.4.1", default-features = false, features = ["image-data", "wayland-data-control"] }
+
+# Local time zone offset at a given instant (date separators across DST).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

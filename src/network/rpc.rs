@@ -318,26 +318,10 @@ mod tests {
         let v = build_get_n_service_nodes_params();
         assert_eq!(v["active_only"], true);
         let fields = v["fields"].as_array().unwrap();
-        assert!(
-            fields
-                .iter()
-                .any(|f| f.as_str() == Some("public_ip"))
-        );
-        assert!(
-            fields
-                .iter()
-                .any(|f| f.as_str() == Some("pubkey_ed25519"))
-        );
-        assert!(
-            fields
-                .iter()
-                .any(|f| f.as_str() == Some("pubkey_x25519"))
-        );
-        assert!(
-            fields
-                .iter()
-                .any(|f| f.as_str() == Some("storage_port"))
-        );
+        assert!(fields.iter().any(|f| f.as_str() == Some("public_ip")));
+        assert!(fields.iter().any(|f| f.as_str() == Some("pubkey_ed25519")));
+        assert!(fields.iter().any(|f| f.as_str() == Some("pubkey_x25519")));
+        assert!(fields.iter().any(|f| f.as_str() == Some("storage_port")));
     }
 
     #[test]

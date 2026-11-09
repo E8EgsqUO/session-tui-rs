@@ -17,7 +17,7 @@ use crate::util::bencode::{self, BtValue};
 use crate::config::config_message::{
     ConfigData, ConfigValue, MutableConfigMessage, SignCallable, VerifyCallable,
 };
-use crate::config::encrypt::{config_decrypt, config_encrypt, pad_message, ENCRYPT_DATA_OVERHEAD};
+use crate::config::encrypt::{ENCRYPT_DATA_OVERHEAD, config_decrypt, config_encrypt, pad_message};
 use crate::config::namespaces::Namespace;
 
 // ── Config state ────────────────────────────────────────────────────────────
@@ -296,7 +296,9 @@ impl<T: ConfigType> ConfigBase<T> {
 
     /// Sets the config state, tracking old hashes.
     fn set_state(&mut self, s: ConfigState) {
-        if s == ConfigState::Dirty && self.state == ConfigState::Clean && !self.curr_hashes.is_empty()
+        if s == ConfigState::Dirty
+            && self.state == ConfigState::Clean
+            && !self.curr_hashes.is_empty()
         {
             // Move current hashes to old hashes when transitioning clean -> dirty
             for h in self.curr_hashes.drain() {
@@ -402,9 +404,10 @@ impl<T: ConfigType> ConfigBase<T> {
             if let Some(mut plain) = decrypted {
                 // Strip null-byte padding from the beginning
                 if let Some(pos) = plain.iter().position(|&b| b != 0)
-                    && pos > 0 {
-                        plain = plain[pos..].to_vec();
-                    }
+                    && pos > 0
+                {
+                    plain = plain[pos..].to_vec();
+                }
 
                 if plain.is_empty() {
                     continue;
@@ -560,9 +563,10 @@ impl<T: ConfigType> ConfigBase<T> {
         if let Some(BtValue::List(hashes)) = dict.get(b"+".as_ref()) {
             for h in hashes {
                 if let BtValue::String(s) = h
-                    && let Ok(hash_str) = String::from_utf8(s.clone()) {
-                        self.curr_hashes.insert(hash_str);
-                    }
+                    && let Ok(hash_str) = String::from_utf8(s.clone())
+                {
+                    self.curr_hashes.insert(hash_str);
+                }
             }
         }
 
@@ -570,9 +574,10 @@ impl<T: ConfigType> ConfigBase<T> {
         if let Some(BtValue::List(hashes)) = dict.get(b"-".as_ref()) {
             for h in hashes {
                 if let BtValue::String(s) = h
-                    && let Ok(hash_str) = String::from_utf8(s.clone()) {
-                        self.old_hashes.insert(hash_str);
-                    }
+                    && let Ok(hash_str) = String::from_utf8(s.clone())
+                {
+                    self.old_hashes.insert(hash_str);
+                }
             }
         }
 

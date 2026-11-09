@@ -56,9 +56,7 @@ pub fn utf8_truncate(val: &str, max_bytes: usize) -> &str {
 /// - Host is normalized to lowercase.
 /// - Port is None if not present or if it matches the default for the protocol (80 for http, 443 for https).
 /// - Path is None if not present or if it's just a single "/".
-pub fn parse_url(
-    url: &str,
-) -> Result<(String, String, Option<u16>, Option<String>), UtilError> {
+pub fn parse_url(url: &str) -> Result<(String, String, Option<u16>, Option<String>), UtilError> {
     let mut remaining = url;
 
     // Extract protocol

@@ -176,24 +176,22 @@ mod tests {
 
     #[test]
     fn test_sign_is_deterministic_for_same_inputs() {
-        let seed = hex!(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        );
+        let seed = hex!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         let a = sign_request_b64("retrieve", 11, 1_700_000_000_000, &seed).unwrap();
         let b = sign_request_b64("retrieve", 11, 1_700_000_000_000, &seed).unwrap();
         assert_eq!(a, b);
 
         // Base64-decodes to exactly 64 bytes.
         use base64::Engine;
-        let raw = base64::engine::general_purpose::STANDARD.decode(&a).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&a)
+            .unwrap();
         assert_eq!(raw.len(), 64);
     }
 
     #[test]
     fn test_sign_differs_on_namespace() {
-        let seed = hex!(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        );
+        let seed = hex!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         let a = sign_request_b64("retrieve", 0, 1_700_000_000_000, &seed).unwrap();
         let b = sign_request_b64("retrieve", 11, 1_700_000_000_000, &seed).unwrap();
         assert_ne!(a, b);
@@ -201,16 +199,15 @@ mod tests {
 
     #[test]
     fn test_sign_round_trips_with_verify() {
-        let seed = hex!(
-            "1111111111111111111111111111111111111111111111111111111111111111"
-        );
+        let seed = hex!("1111111111111111111111111111111111111111111111111111111111111111");
         let (pk, _sk) = ed25519::ed25519_key_pair_from_seed(&seed).unwrap();
         let msg = canonical_sign_string("retrieve", 11, 1_700_000_000_000);
-        let sig_b64 =
-            sign_request_b64("retrieve", 11, 1_700_000_000_000, &seed).unwrap();
+        let sig_b64 = sign_request_b64("retrieve", 11, 1_700_000_000_000, &seed).unwrap();
 
         use base64::Engine;
-        let sig = base64::engine::general_purpose::STANDARD.decode(&sig_b64).unwrap();
+        let sig = base64::engine::general_purpose::STANDARD
+            .decode(&sig_b64)
+            .unwrap();
         assert!(ed25519::verify(&sig, &pk, msg.as_bytes()).unwrap());
     }
 

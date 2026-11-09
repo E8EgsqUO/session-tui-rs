@@ -83,9 +83,7 @@ impl Default for RequestQueue {
 mod tests {
     use super::*;
     use crate::network::key_types::X25519Pubkey;
-    use crate::network::types::{
-        NetworkDestination, RequestCategory, ServerDestination,
-    };
+    use crate::network::types::{NetworkDestination, RequestCategory, ServerDestination};
 
     fn make_request(id: &str) -> Request {
         Request {

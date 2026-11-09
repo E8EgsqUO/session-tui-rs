@@ -16,15 +16,15 @@
 //! - [`proto`] -- Generated protobuf bindings for Session message envelopes.
 //! - [`util`] -- Shared utilities: bencode, compression, validation, logging.
 
+/// Distributed configuration management for multi-device sync.
+pub mod config;
 /// Cryptographic primitives and message encryption.
 pub mod crypto;
-/// Shared utilities: bencode, compression, Session ID validation, logging.
-pub mod util;
+/// Onion-routed networking through the Session service node network.
+pub mod network;
 /// Generated protobuf bindings for Session message envelopes and WebSocket messages.
 pub mod proto;
 /// Protocol constants, Session Pro proof types, and message padding.
 pub mod protocol;
-/// Distributed configuration management for multi-device sync.
-pub mod config;
-/// Onion-routed networking through the Session service node network.
-pub mod network;
+/// Shared utilities: bencode, compression, Session ID validation, logging.
+pub mod util;

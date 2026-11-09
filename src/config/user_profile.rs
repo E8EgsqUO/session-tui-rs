@@ -17,8 +17,8 @@
 //!   Q - re-uploaded profile pic key
 //!   T - re-uploaded profile pic timestamp (seconds)
 
-use crate::config::config_base::field_helpers::*;
 use crate::config::config_base::ConfigType;
+use crate::config::config_base::field_helpers::*;
 use crate::config::config_message::{ConfigData, ConfigValue, ScalarValue};
 use crate::config::namespaces::Namespace;
 use crate::config::profile_pic::ProfilePic;
@@ -120,9 +120,10 @@ impl ConfigType for UserProfile {
             self.profile_pic.url = url;
         }
         if let Some(key) = get_bytes(data, b"q")
-            && key.len() == 32 {
-                self.profile_pic.key = key;
-            }
+            && key.len() == 32
+        {
+            self.profile_pic.key = key;
+        }
 
         // Load re-upload profile pic
         self.reupload_pic = ProfilePic::default();
@@ -130,9 +131,10 @@ impl ConfigType for UserProfile {
             self.reupload_pic.url = url;
         }
         if let Some(key) = get_bytes(data, b"Q")
-            && key.len() == 32 {
-                self.reupload_pic.key = key;
-            }
+            && key.len() == 32
+        {
+            self.reupload_pic.key = key;
+        }
 
         self.profile_updated = t;
         self.reupload_updated = t_reupload;
@@ -152,9 +154,11 @@ impl ConfigType for UserProfile {
                 let mut bits = 0u64;
                 for item in items {
                     if let ScalarValue::Integer(v) = item
-                        && *v >= 0 && *v < 64 {
-                            bits |= 1 << *v;
-                        }
+                        && *v >= 0
+                        && *v < 64
+                    {
+                        bits |= 1 << *v;
+                    }
                 }
                 bits
             }
@@ -317,9 +321,8 @@ mod tests {
 
     #[test]
     fn test_config_base_with_user_profile() {
-        let seed = hex_literal::hex!(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000"
-        );
+        let seed =
+            hex_literal::hex!("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let base: ConfigBase<UserProfile> = ConfigBase::new(&seed, None).unwrap();
         assert!(base.get().name.is_none());
         assert!(!base.needs_push());
@@ -327,9 +330,8 @@ mod tests {
 
     #[test]
     fn test_config_base_set_and_push() {
-        let seed = hex_literal::hex!(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000"
-        );
+        let seed =
+            hex_literal::hex!("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let mut base: ConfigBase<UserProfile> = ConfigBase::new(&seed, None).unwrap();
         base.get_mut().set_name("Test").unwrap();
         assert!(base.needs_push());

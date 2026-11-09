@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::config_base::field_helpers::*;
 use crate::config::config_base::ConfigType;
+use crate::config::config_base::field_helpers::*;
 use crate::config::config_message::{ConfigData, ConfigValue};
 use crate::config::namespaces::Namespace;
 use crate::config::notify::NotifyContent;
@@ -148,15 +148,20 @@ impl ConfigType for Local {
         if let Some(ConfigValue::Dict(settings_dict)) = data.get(b"settings".as_ref()) {
             for (key, value) in settings_dict {
                 if let ConfigValue::Integer(v) = value
-                    && let Ok(key_str) = String::from_utf8(key.clone()) {
-                        self.settings.insert(key_str, *v != 0);
-                    }
+                    && let Ok(key_str) = String::from_utf8(key.clone())
+                {
+                    self.settings.insert(key_str, *v != 0);
+                }
             }
         }
     }
 
     fn store_to_data(&self, data: &mut ConfigData) {
-        set_positive_int(data, b"notify_content", self.notification_content as i32 as i64);
+        set_positive_int(
+            data,
+            b"notify_content",
+            self.notification_content as i32 as i64,
+        );
         set_positive_int(data, b"notify_sound", self.ios_notification_sound);
         set_positive_int(data, b"theme", self.theme as i32 as i64);
         set_positive_int(
@@ -171,10 +176,7 @@ impl ConfigType for Local {
             let mut settings_dict = ConfigData::new();
             for (key, value) in &self.settings {
                 if *value {
-                    settings_dict.insert(
-                        key.as_bytes().to_vec(),
-                        ConfigValue::Integer(1),
-                    );
+                    settings_dict.insert(key.as_bytes().to_vec(), ConfigValue::Integer(1));
                 }
                 // false values are stored as flag=1 (presence) in C++ via set_flag,
                 // but for settings we store 0/1 explicitly
@@ -253,9 +255,8 @@ mod tests {
 
     #[test]
     fn test_local_never_pushes() {
-        let seed = hex_literal::hex!(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000"
-        );
+        let seed =
+            hex_literal::hex!("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let mut base: ConfigBase<Local> = ConfigBase::new(&seed, None).unwrap();
         base.get_mut().theme = Theme::ClassicDark;
         // Even after mutation, needs_push should be false for local configs

@@ -1,7 +1,10 @@
-mod session_tui_media;
+mod session_tui_account;
 mod session_tui_group;
 mod session_tui_input;
-mod session_tui_account;
+mod session_tui_media;
+mod session_tui_netdiag;
+mod session_tui_search;
+mod session_tui_separators;
 
 use std::time::Instant;
 use std::{
@@ -21,8 +24,7 @@ type DataQuote = libsession::proto::session_protos::data_message::Quote;
 
 use libsession::{
     config::{
-        config_base::ConfigBase,
-        groups::info::GroupInfo as SharedGroupInfo,
+        config_base::ConfigBase, groups::info::GroupInfo as SharedGroupInfo,
         user_groups::GroupInfo as UserGroupInfo,
     },
     crypto::{curve25519, ed25519, random, session_encrypt},
@@ -42,9 +44,8 @@ use libsession::{
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -63,6 +64,15 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+#[path = "session_tui_logic.rs"]
+mod session_tui_logic;
+use session_tui_logic::{
+    format_duration, outbox_backoff_ms, parse_duration, split_args, validated_expiry_reply,
+};
+
+#[cfg(test)]
+use session_tui_logic::parse_expiry;
+
 use session_tui_media::{AttachmentMeta, ImagePreview};
 
 const BG: Color = Color::Rgb(10, 17, 23);
@@ -131,7 +141,7 @@ struct Message {
     links: Vec<(String, Option<String>)>,
     /// Control/notice line (call, screenshot, group change…) rather than chat text.
     system: bool,
-    /// Outgoing delivery state; not persisted (only sent messages are stored).
+    /// Outgoing delivery state, persisted together with the message and outbox work.
     send_state: SendState,
     /// Hashes of our own copies of this message in this account's swarm
     /// (1:1 sync copies), deleted from the swarm when the message is unsent.
@@ -208,29 +218,6 @@ impl Expiration {
     }
 }
 
-fn parse_duration(text: &str) -> Option<u32> {
-    let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
-    let number: u32 = number.parse().ok()?;
-    let scale = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        "w" => 604_800,
-        _ => return None,
-    };
-    number.checked_mul(scale).filter(|seconds| *seconds > 0)
-}
-
-fn format_duration(seconds: u32) -> String {
-    for (unit, size) in [("w", 604_800), ("d", 86_400), ("h", 3600), ("m", 60)] {
-        if seconds >= size && seconds % size == 0 {
-            return format!("{}{unit}", seconds / size);
-        }
-    }
-    format!("{seconds}s")
-}
-
 impl Message {
     fn new(body: String, timestamp_ms: u64, outgoing: bool) -> Self {
         Self {
@@ -263,6 +250,15 @@ impl Message {
     }
 
     /// Session ID of whoever wrote this message.
+    /// Identity of this message for search jumps and the unread line.
+    fn key(&self, conversation_id: &str, local_id: &str) -> session_tui_separators::MessageKey {
+        session_tui_separators::MessageKey {
+            timestamp_ms: self.timestamp_ms,
+            outgoing: self.outgoing,
+            author: self.author(conversation_id, local_id).to_owned(),
+        }
+    }
+
     fn author<'a>(&'a self, conversation_id: &'a str, local_id: &'a str) -> &'a str {
         if self.outgoing {
             local_id
@@ -339,19 +335,59 @@ const QUICK_REACTIONS: [&str; 6] = ["😂", "🥰", "😢", "😡", "😮", "�
 
 /// `:name:` shortcodes expanded in messages and `/react`.
 const EMOJI_SHORTCODES: &[(&str, &str)] = &[
-    ("+1", "👍"), ("thumbsup", "👍"), ("-1", "👎"), ("thumbsdown", "👎"),
-    ("joy", "😂"), ("haha", "😂"), ("lol", "😂"), ("xd", "😆"), ("rofl", "🤣"), ("smile", "😄"), ("grin", "😁"),
-    ("laughing", "😆"), ("sweat_smile", "😅"), ("wink", "😉"), ("blush", "😊"),
-    ("love", "🥰"), ("heart_eyes", "😍"), ("kiss", "😘"), ("thinking", "🤔"),
-    ("neutral", "😐"), ("cry", "😢"), ("sob", "😭"), ("angry", "😠"),
-    ("rage", "😡"), ("scream", "😱"), ("open_mouth", "😮"), ("sunglasses", "😎"),
-    ("sleepy", "😴"), ("party", "🥳"), ("hug", "🤗"), ("shrug", "🤷"),
-    ("facepalm", "🤦"), ("devil", "😈"), ("skull", "💀"), ("poop", "💩"),
-    ("ok", "👌"), ("clap", "👏"), ("pray", "🙏"), ("wave", "👋"),
-    ("muscle", "💪"), ("eyes", "👀"), ("heart", "❤️"), ("broken_heart", "💔"),
-    ("fire", "🔥"), ("star", "⭐"), ("sparkles", "✨"), ("tada", "🎉"),
-    ("100", "💯"), ("check", "✅"), ("x", "❌"), ("rocket", "🚀"),
-    ("coffee", "☕"), ("beer", "🍺"),
+    ("+1", "👍"),
+    ("thumbsup", "👍"),
+    ("-1", "👎"),
+    ("thumbsdown", "👎"),
+    ("joy", "😂"),
+    ("haha", "😂"),
+    ("lol", "😂"),
+    ("xd", "😆"),
+    ("rofl", "🤣"),
+    ("smile", "😄"),
+    ("grin", "😁"),
+    ("laughing", "😆"),
+    ("sweat_smile", "😅"),
+    ("wink", "😉"),
+    ("blush", "😊"),
+    ("love", "🥰"),
+    ("heart_eyes", "😍"),
+    ("kiss", "😘"),
+    ("thinking", "🤔"),
+    ("neutral", "😐"),
+    ("cry", "😢"),
+    ("sob", "😭"),
+    ("angry", "😠"),
+    ("rage", "😡"),
+    ("scream", "😱"),
+    ("open_mouth", "😮"),
+    ("sunglasses", "😎"),
+    ("sleepy", "😴"),
+    ("party", "🥳"),
+    ("hug", "🤗"),
+    ("shrug", "🤷"),
+    ("facepalm", "🤦"),
+    ("devil", "😈"),
+    ("skull", "💀"),
+    ("poop", "💩"),
+    ("ok", "👌"),
+    ("clap", "👏"),
+    ("pray", "🙏"),
+    ("wave", "👋"),
+    ("muscle", "💪"),
+    ("eyes", "👀"),
+    ("heart", "❤️"),
+    ("broken_heart", "💔"),
+    ("fire", "🔥"),
+    ("star", "⭐"),
+    ("sparkles", "✨"),
+    ("tada", "🎉"),
+    ("100", "💯"),
+    ("check", "✅"),
+    ("x", "❌"),
+    ("rocket", "🚀"),
+    ("coffee", "☕"),
+    ("beer", "🍺"),
 ];
 
 /// Replace known `:name:` shortcodes with emoji; unknown ones stay as typed.
@@ -450,6 +486,32 @@ impl Conversation {
             .unwrap_or_else(|| "Start a conversation".into());
     }
 
+    /// Index of the message with `key`, if it is (still) in this chat.
+    fn position_of(
+        &self,
+        key: &session_tui_separators::MessageKey,
+        local_id: &str,
+    ) -> Option<usize> {
+        // Messages are in timestamp order: look only at that millisecond.
+        let start = self
+            .messages
+            .partition_point(|m| m.timestamp_ms < key.timestamp_ms);
+        self.messages[start..]
+            .iter()
+            .take_while(|m| m.timestamp_ms == key.timestamp_ms)
+            .position(|m| m.key(&self.id, local_id) == *key)
+            .map(|offset| start + offset)
+    }
+
+    /// End / Ctrl+End: select the newest message and follow the bottom.
+    fn jump_to_bottom(&mut self) {
+        if let Some(last) = session_tui_separators::last_index(self.messages.len()) {
+            self.selected_message = last;
+        }
+        self.scroll = None;
+        self.follow_selection = false;
+    }
+
     fn clamp_selection(&mut self) {
         self.selected_message = self
             .selected_message
@@ -540,6 +602,22 @@ struct App {
     /// Top header (shows our own ID) and the chat's title bar.
     header_area: Option<Rect>,
     chat_title_area: Option<Rect>,
+    /// The composer, for double-click to copy its text.
+    composer_area: Option<Rect>,
+    /// `/search` panel, and the search running for it.
+    search: Option<session_tui_search::SearchView>,
+    /// Results of the last search, reopened by `/search` without arguments.
+    last_search: Option<session_tui_search::SearchView>,
+    search_task: Option<tokio::task::JoinHandle<(Vec<session_tui_search::SearchHit>, bool)>>,
+    /// Message a search jumped to, highlighted until the instant.
+    highlight: Option<(String, session_tui_separators::MessageKey, Instant)>,
+    /// Unread boundary of the current visit to the open chat.
+    unread_marker: Option<session_tui_separators::UnreadMarker>,
+    /// `/net` page, and the snapshot being taken for it.
+    net_view: Option<session_tui_netdiag::NetView>,
+    net_task: Option<tokio::task::JoinHandle<libsession::network::NetworkDiagnostics>>,
+    /// When a sync last finished and was saved.
+    last_sync_ok: Option<std::time::SystemTime>,
 }
 
 impl App {
@@ -584,6 +662,15 @@ impl App {
             last_outgoing_ms: 0,
             header_area: None,
             chat_title_area: None,
+            composer_area: None,
+            search: None,
+            last_search: None,
+            search_task: None,
+            highlight: None,
+            unread_marker: None,
+            net_view: None,
+            net_task: None,
+            last_sync_ok: None,
         }
     }
 
@@ -600,8 +687,7 @@ impl App {
             .filter(|c| self.is_request(c))
             .map(|c| c.id.clone())
             .collect();
-        self.conversations
-            .sort_by_key(|c| requests.contains(&c.id));
+        self.conversations.sort_by_key(|c| requests.contains(&c.id));
         if let Some(id) = selected_id
             && let Some(index) = self.conversations.iter().position(|c| c.id == id)
         {
@@ -744,7 +830,8 @@ fn open_selected_image(app: &mut App, index: Option<usize>) -> Result<(), String
         &metadata.digest,
         metadata.deterministic,
     )?;
-    let image = session_tui_media::decode_image(&plaintext).map_err(|e| format!("decode image: {e}"))?;
+    let image =
+        session_tui_media::decode_image(&plaintext).map_err(|e| format!("decode image: {e}"))?;
 
     let mut picker = Picker::from_fontsize((8, 16));
     let protocol = std::env::var("SESSION_TUI_IMAGE_PROTOCOL")
@@ -793,23 +880,17 @@ fn sender_key(message: &Message) -> &str {
     message.sender.as_deref().unwrap_or("")
 }
 
-/// A message's expiry in a `get_expiries` reply: `{"expiries": {hash: ms}}`,
-/// possibly per swarm node under `"swarm"`. Missing means already expired.
-fn parse_expiry(body: &Value, hash: &str) -> Option<u64> {
-    let direct = body.get("expiries").and_then(|e| e.get(hash)).and_then(Value::as_u64);
-    direct.or_else(|| {
-        body.get("swarm")?
-            .as_object()?
-            .values()
-            .filter_map(|node| node.get("expiries")?.get(hash)?.as_u64())
-            .min()
-    })
-}
-
 /// Short description of what a Content carries, for the debug log.
 fn content_kind(content: &Content) -> String {
     if let Some(receipt) = &content.receipt_message {
-        return format!("receipt:{}", if receipt.r#type == 0 { "delivery" } else { "read" });
+        return format!(
+            "receipt:{}",
+            if receipt.r#type == 0 {
+                "delivery"
+            } else {
+                "read"
+            }
+        );
     }
     if content.typing_message.is_some() {
         return "typing".into();
@@ -855,7 +936,12 @@ fn message_blob_owner(peer: &str, message: &Message) -> String {
 }
 
 /// Write an attachment's encrypted blob to the local cache.
-fn write_attachment_blob(owner: &str, timestamp: u64, index: usize, bytes: &[u8]) -> Result<(), String> {
+fn write_attachment_blob(
+    owner: &str,
+    timestamp: u64,
+    index: usize,
+    bytes: &[u8],
+) -> Result<(), String> {
     let root = session_data_dir()?;
     let path = session_tui_media::attachment_blob_path(&root, owner, timestamp, index);
     let parent = path.parent().ok_or("invalid attachment cache path")?;
@@ -941,9 +1027,7 @@ fn copy_to_clipboard(out: &mut impl Write, text: &str) {
             if tool[0] == "wl-copy" && std::env::var_os("WAYLAND_DISPLAY").is_none() {
                 continue;
             }
-            if tool[0] != "wl-copy"
-                && tool[0] != "pbcopy"
-                && std::env::var_os("DISPLAY").is_none()
+            if tool[0] != "wl-copy" && tool[0] != "pbcopy" && std::env::var_os("DISPLAY").is_none()
             {
                 continue;
             }
@@ -1010,6 +1094,13 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         }
         return;
     }
+    if double_click && hit(app.composer_area) {
+        if !app.input.is_empty() {
+            app.clipboard = Some(app.input.clone());
+            app.status = "INPUT COPIED".into();
+        }
+        return;
+    }
     if double_click && hit(app.message_viewport) {
         let text = app
             .message_hitboxes
@@ -1017,9 +1108,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
             .find(|(start, end, _, attachment)| {
                 attachment.is_none() && mouse.row >= *start && mouse.row <= *end
             })
-            .and_then(|(_, _, index, _)| {
-                app.conversations.get(app.selected)?.messages.get(*index)
-            })
+            .and_then(|(_, _, index, _)| app.conversations.get(app.selected)?.messages.get(*index))
             .map(|message| message.body.clone())
             .filter(|body| !body.is_empty());
         if let Some(text) = text {
@@ -1341,7 +1430,10 @@ enum ChatEvent {
     /// Disappearing-messages setting changed (1:1 chats).
     TimerChanged(Option<Expiration>),
     /// Group membership changes; names are resolved when displayed.
-    Members { action: &'static str, ids: Vec<String> },
+    Members {
+        action: &'static str,
+        ids: Vec<String>,
+    },
     /// Group invite received in a 1:1 chat.
     Invite(LocalGroup),
     /// An admin removed everything these members posted.
@@ -1466,9 +1558,12 @@ fn parse_content(
                 Ok(Type::Avatar) => ChatEvent::Notice("changed the group picture".into()),
                 _ => ChatEvent::Notice(format!(
                     "set disappearing messages to {}",
-                    Expiration::describe(change.updated_expiration.filter(|s| *s > 0).map(
-                        |seconds| Expiration { kind: 2, seconds }
-                    ))
+                    Expiration::describe(
+                        change
+                            .updated_expiration
+                            .filter(|s| *s > 0)
+                            .map(|seconds| Expiration { kind: 2, seconds })
+                    )
                 )),
             })
         } else if let Some(change) = update.member_change_message {
@@ -1522,7 +1617,10 @@ fn parse_content(
     // re-routed; anything else stays in the sender's chat.
     if !is_group
         && message.outgoing
-        && let Some(target) = data_message.sync_target.clone().filter(|target| is_chat_id(target))
+        && let Some(target) = data_message
+            .sync_target
+            .clone()
+            .filter(|target| is_chat_id(target))
     {
         message.contact_id = target;
         message.sender_name = None;
@@ -1540,7 +1638,10 @@ fn parse_content(
 
     let mut body = data_message.body.unwrap_or_default();
     if let Some(invitation) = data_message.open_group_invitation {
-        body = format!("[Community invite] {} · {}", invitation.name, invitation.url);
+        body = format!(
+            "[Community invite] {} · {}",
+            invitation.name, invitation.url
+        );
     }
     message.attachments = data_message
         .attachments
@@ -1554,7 +1655,12 @@ fn parse_content(
             quote
                 .attachments
                 .first()
-                .map(|a| format!("[{}]", a.file_name.clone().unwrap_or_else(|| "attachment".into())))
+                .map(|a| {
+                    format!(
+                        "[{}]",
+                        a.file_name.clone().unwrap_or_else(|| "attachment".into())
+                    )
+                })
                 .unwrap_or_default()
         }),
     });
@@ -1695,7 +1801,10 @@ struct SessionClient {
 }
 
 fn node_cursor_key(pubkey: &str, namespace: i32, node: &ServiceNode) -> String {
-    format!("{pubkey}/{namespace}/{}", hex::encode(node.ed25519_pubkey.0))
+    format!(
+        "{pubkey}/{namespace}/{}",
+        hex::encode(node.ed25519_pubkey.0)
+    )
 }
 
 /// Result of mirroring an outgoing message to this account's own swarm.
@@ -1990,7 +2099,10 @@ impl LocalStore {
         let batch = self.batch.borrow_mut().take().unwrap_or_default();
         let result = match batch.error {
             Some(error) => Err(error),
-            None => self.connection.execute_batch("COMMIT").map_err(|e| e.to_string()),
+            None => self
+                .connection
+                .execute_batch("COMMIT")
+                .map_err(|e| e.to_string()),
         };
         match result {
             Ok(()) => {
@@ -2132,24 +2244,28 @@ impl LocalStore {
                         continue;
                     }
                     for old_owner in &old_owners {
-                    let old_path =
-                        session_tui_media::attachment_blob_path(root, old_owner, timestamp_ms, index);
-                    if !old_path.exists() {
-                        continue;
-                    }
-                    let belongs = std::fs::read(&old_path).is_ok_and(|blob| {
-                        session_tui_media::decrypt_attachment(
-                            &blob,
-                            &meta.key,
-                            &meta.digest,
-                            meta.deterministic,
-                        )
-                        .is_ok()
-                    });
-                    if belongs {
-                        let _ = std::fs::rename(&old_path, &new_path);
-                        break;
-                    }
+                        let old_path = session_tui_media::attachment_blob_path(
+                            root,
+                            old_owner,
+                            timestamp_ms,
+                            index,
+                        );
+                        if !old_path.exists() {
+                            continue;
+                        }
+                        let belongs = std::fs::read(&old_path).is_ok_and(|blob| {
+                            session_tui_media::decrypt_attachment(
+                                &blob,
+                                &meta.key,
+                                &meta.digest,
+                                meta.deterministic,
+                            )
+                            .is_ok()
+                        });
+                        if belongs {
+                            let _ = std::fs::rename(&old_path, &new_path);
+                            break;
+                        }
                     }
                 }
             }
@@ -2167,7 +2283,9 @@ impl LocalStore {
                     timestamp_ms,
                     index,
                 );
-                let Ok(blob) = std::fs::read(path) else { continue };
+                let Ok(blob) = std::fs::read(path) else {
+                    continue;
+                };
                 // Saved, so this decrypt + decode happens once, not every start.
                 // An image that can't be decoded gets an empty preview.
                 message.image_previews[index] = Some(
@@ -2219,7 +2337,9 @@ impl LocalStore {
             .prepare("SELECT key, value FROM settings WHERE key LIKE 'disappearing:%'")
             .map_err(|e| e.to_string())?;
         let settings = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| e.to_string())?;
         for setting in settings {
             let (key, value) = setting.map_err(|e| e.to_string())?;
@@ -2305,7 +2425,9 @@ impl LocalStore {
 
     fn get_setting(&self, key: &str) -> Option<String> {
         self.connection
-            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
             .optional()
             .ok()
             .flatten()
@@ -2337,10 +2459,10 @@ impl LocalStore {
 
     fn save_contact(&self, id: &str) -> Result<(), String> {
         self.exec(
-                "INSERT OR IGNORE INTO contacts(session_id) VALUES (?1)",
-                [id],
-            )
-            .map_err(|e| e.to_string())?;
+            "INSERT OR IGNORE INTO contacts(session_id) VALUES (?1)",
+            [id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -2449,14 +2571,20 @@ impl LocalStore {
     }
 
     fn set_group_joined(&self, group_id: &str) -> Result<(), String> {
-        self.exec("UPDATE group_invites SET joined = 1 WHERE group_id = ?1", [group_id])
-            .map_err(|e| e.to_string())?;
+        self.exec(
+            "UPDATE group_invites SET joined = 1 WHERE group_id = ?1",
+            [group_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn set_group_responded(&self, group_id: &str) -> Result<(), String> {
-        self.exec("UPDATE group_invites SET responded = 1 WHERE group_id = ?1", [group_id])
-            .map_err(|e| e.to_string())?;
+        self.exec(
+            "UPDATE group_invites SET responded = 1 WHERE group_id = ?1",
+            [group_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -2519,7 +2647,8 @@ impl LocalStore {
     }
 
     fn mark_seen(&self, hash: &str) -> Result<bool, String> {
-        let inserted = self.exec(
+        let inserted = self
+            .exec(
                 "INSERT OR IGNORE INTO seen_hashes(hash) VALUES (?1)",
                 [hash],
             )
@@ -2528,7 +2657,13 @@ impl LocalStore {
     }
 
     /// Queue network work that must survive a restart (see [`OutboxKind`]).
-    fn outbox_add(&self, kind: OutboxKind, peer: &str, timestamp_ms: u64, payload: &[u8]) -> Result<(), String> {
+    fn outbox_add(
+        &self,
+        kind: OutboxKind,
+        peer: &str,
+        timestamp_ms: u64,
+        payload: &[u8],
+    ) -> Result<(), String> {
         // Each step of a message is queued once (unique index); queuing it
         // again is a no-op.
         self.exec(
@@ -2540,6 +2675,26 @@ impl LocalStore {
     }
 
     /// Entries due at `now_ms`, oldest first.
+    /// Outbox work by state, for `/net`. Parked entries wait for `/retry`.
+    fn outbox_counts(&self) -> Option<session_tui_netdiag::OutboxCounts> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(SUM(attempts = 0 AND next_attempt_ms < ?1), 0),
+                        COALESCE(SUM(attempts > 0 AND next_attempt_ms < ?1), 0),
+                        COALESCE(SUM(next_attempt_ms >= ?1), 0)
+                 FROM outbox",
+                [i64::MAX],
+                |row| {
+                    Ok(session_tui_netdiag::OutboxCounts {
+                        waiting: row.get::<_, i64>(0)? as usize,
+                        retrying: row.get::<_, i64>(1)? as usize,
+                        failed: row.get::<_, i64>(2)? as usize,
+                    })
+                },
+            )
+            .ok()
+    }
+
     fn outbox_due(&self, now_ms: u64) -> Vec<OutboxEntry> {
         let Ok(mut statement) = self.connection.prepare(
             "SELECT id, kind, peer, timestamp_ms, payload, attempts FROM outbox
@@ -2581,10 +2736,21 @@ impl LocalStore {
         Ok(())
     }
 
-    fn outbox_failed(&self, id: i64, attempts: u32, next_attempt_ms: u64, error: &str) -> Result<(), String> {
+    fn outbox_failed(
+        &self,
+        id: i64,
+        attempts: u32,
+        next_attempt_ms: u64,
+        error: &str,
+    ) -> Result<(), String> {
         self.exec(
             "UPDATE outbox SET attempts = ?2, next_attempt_ms = ?3, last_error = ?4 WHERE id = ?1",
-            params![id, attempts, next_attempt_ms.min(i64::MAX as u64) as i64, error],
+            params![
+                id,
+                attempts,
+                next_attempt_ms.min(i64::MAX as u64) as i64,
+                error
+            ],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -2604,7 +2770,12 @@ impl LocalStore {
     }
 
     /// Keep a receipt whose message hasn't arrived yet (highest status wins).
-    fn save_pending_receipt(&self, peer: &str, timestamp_ms: u64, status: u8) -> Result<(), String> {
+    fn save_pending_receipt(
+        &self,
+        peer: &str,
+        timestamp_ms: u64,
+        status: u8,
+    ) -> Result<(), String> {
         self.exec(
             "INSERT INTO pending_receipts(peer, timestamp_ms, status, received_ms) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(peer, timestamp_ms) DO UPDATE SET status = MAX(status, excluded.status)",
@@ -2641,11 +2812,16 @@ impl LocalStore {
 
     /// Per-node message cursors, see `SessionClient::node_cursors`.
     fn node_cursors(&self) -> HashMap<String, String> {
-        let Ok(mut statement) = self.connection.prepare("SELECT key, hash FROM node_cursors") else {
+        let Ok(mut statement) = self
+            .connection
+            .prepare("SELECT key, hash FROM node_cursors")
+        else {
             return HashMap::new();
         };
         statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default()
     }
@@ -2694,7 +2870,9 @@ impl LocalStore {
             "('expire_read', 'fetch_expiry')"
         };
         self.exec(
-            &format!("DELETE FROM outbox WHERE peer = ?1 AND timestamp_ms = ?2 AND kind IN {kinds}"),
+            &format!(
+                "DELETE FROM outbox WHERE peer = ?1 AND timestamp_ms = ?2 AND kind IN {kinds}"
+            ),
             params![peer, message.timestamp_ms as i64],
         )
         .map_err(|e| e.to_string())?;
@@ -2912,8 +3090,11 @@ impl SessionClient {
                 params.insert("signature".to_owned(), Value::String(signature));
             }
             GroupAuth::Member { auth_data } => {
-                let message =
-                    libsession::network::auth::canonical_sign_string(method, namespace, timestamp_ms);
+                let message = libsession::network::auth::canonical_sign_string(
+                    method,
+                    namespace,
+                    timestamp_ms,
+                );
                 let signed = session_tui_group::subaccount_sign(
                     &self.identity.ed_secret,
                     auth_data,
@@ -2940,7 +3121,9 @@ impl SessionClient {
             .map_err(|e| e.to_string())?;
         let mut chosen = self.poll_nodes.lock().map_err(|_| "poll node lock")?;
         if let Some(node) = chosen.get(pubkey)
-            && swarm.iter().any(|n| n.ed25519_pubkey == node.ed25519_pubkey)
+            && swarm
+                .iter()
+                .any(|n| n.ed25519_pubkey == node.ed25519_pubkey)
         {
             return Ok(node.clone());
         }
@@ -3015,7 +3198,13 @@ impl SessionClient {
             .or_else(|| cursor.map(str::to_owned));
         for _ in 0..MAX_RETRIEVE_PAGES {
             let page = self
-                .retrieve_namespace_page(pubkey, namespace, auth, last_hash.as_deref(), node.as_ref())
+                .retrieve_namespace_page(
+                    pubkey,
+                    namespace,
+                    auth,
+                    last_hash.as_deref(),
+                    node.as_ref(),
+                )
                 .await;
             let (page, more) = match page {
                 Ok(page) => page,
@@ -3061,8 +3250,16 @@ impl SessionClient {
                 params.insert("last_hash".to_owned(), Value::String(last_hash.to_owned()));
             }
             match node {
-                Some(node) => self.network.send_rpc_to(node, "retrieve", Value::Object(params)).await,
-                None => self.network.send_rpc("retrieve", Value::Object(params), Some(pubkey)).await,
+                Some(node) => {
+                    self.network
+                        .send_rpc_to(node, "retrieve", Value::Object(params))
+                        .await
+                }
+                None => {
+                    self.network
+                        .send_rpc("retrieve", Value::Object(params), Some(pubkey))
+                        .await
+                }
             }
             .map_err(|error| error.to_string())?
         } else {
@@ -3089,18 +3286,16 @@ impl SessionClient {
                 .and_then(|value| {
                     ["message", "error", "result", "reason"]
                         .iter()
-                        .find_map(|key| {
-                            value
-                                .get(*key)
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        })
+                        .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned))
                 })
                 .unwrap_or_else(|| "no_json_error_detail".to_owned());
             let detail: String = detail.chars().take(240).collect();
             debug_log(
                 "namespace.retrieve.rejected",
-                &format!("namespace={namespace} status={} detail={detail:?}", response.status_code),
+                &format!(
+                    "namespace={namespace} status={} detail={detail:?}",
+                    response.status_code
+                ),
             );
             return Err(format!(
                 "namespace {namespace} retrieve HTTP {}",
@@ -3189,9 +3384,9 @@ impl SessionClient {
         let mut runtime_groups = HashMap::new();
         let mut discovered_groups = Vec::new();
         for (id, config_name, admin_seed, auth_data) in candidates {
-            let Ok(public_key) = <[u8; 32]>::try_from(
-                hex::decode(&id[2..]).unwrap_or_default().as_slice(),
-            ) else {
+            let Ok(public_key) =
+                <[u8; 32]>::try_from(hex::decode(&id[2..]).unwrap_or_default().as_slice())
+            else {
                 continue;
             };
             let mut discovered = DiscoveredGroup {
@@ -3207,7 +3402,10 @@ impl SessionClient {
                 let (derived_pk, secret_key) =
                     ed25519::ed25519_key_pair_from_seed(&admin_seed).map_err(|e| e.to_string())?;
                 if derived_pk != public_key {
-                    debug_log("group.config.invalid", "admin_seed_does_not_match_group_id=true");
+                    debug_log(
+                        "group.config.invalid",
+                        "admin_seed_does_not_match_group_id=true",
+                    );
                     discovered_groups.push(discovered);
                     continue;
                 }
@@ -3292,7 +3490,8 @@ impl SessionClient {
                 GroupAuth::Admin { secret_key, .. } => Some(secret_key.as_slice()),
                 GroupAuth::Member { .. } => None,
             };
-            let mut info = ConfigBase::<SharedGroupInfo>::new_group(&public_key, admin_secret, None)?;
+            let mut info =
+                ConfigBase::<SharedGroupInfo>::new_group(&public_key, admin_secret, None)?;
             for key in keys.iter().rev() {
                 info.add_key(key.key, true);
             }
@@ -3301,7 +3500,12 @@ impl SessionClient {
                 .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
                 .collect();
             let _ = info.merge(&info_merge);
-            if let Some(name) = info.config_type.name.clone().filter(|name| !name.is_empty()) {
+            if let Some(name) = info
+                .config_type
+                .name
+                .clone()
+                .filter(|name| !name.is_empty())
+            {
                 discovered.name = name;
             }
             debug_log(
@@ -3415,7 +3619,10 @@ impl SessionClient {
         }
         debug_log(
             "account.merged",
-            &format!("namespace={namespace} messages={} understood={good}", messages.len()),
+            &format!(
+                "namespace={namespace} messages={} understood={good}",
+                messages.len()
+            ),
         );
         messages.is_empty() || good > 0
     }
@@ -3474,7 +3681,10 @@ impl SessionClient {
             }
         }
         let Some(hash) = last_hash else {
-            debug_log("account.push_failed", &format!("namespace={namespace} reason=no_hash"));
+            debug_log(
+                "account.push_failed",
+                &format!("namespace={namespace} reason=no_hash"),
+            );
             return false;
         };
         config.confirm_pushed(pushed.seqno, &hash);
@@ -3496,10 +3706,13 @@ impl SessionClient {
         changes: Vec<session_tui_account::AccountChange>,
     ) -> Result<AccountSyncResult, String> {
         use session_tui_account::AccountChange;
-        let mut configs = session_tui_account::AccountConfigs::new(&self.identity.ed_secret, &dumps)?;
+        let mut configs =
+            session_tui_account::AccountConfigs::new(&self.identity.ed_secret, &dumps)?;
         let safe = [
-            self.merge_config_namespace(&mut configs.profile, 2, 1).await,
-            self.merge_config_namespace(&mut configs.contacts, 3, 2).await,
+            self.merge_config_namespace(&mut configs.profile, 2, 1)
+                .await,
+            self.merge_config_namespace(&mut configs.contacts, 3, 2)
+                .await,
             self.merge_config_namespace(&mut configs.convos, 4, 3).await,
             self.merge_config_namespace(&mut configs.groups, 5, 4).await,
         ];
@@ -3601,7 +3814,8 @@ impl SessionClient {
             expiration_timer: expiration.map(|e| e.seconds),
             ..Default::default()
         };
-        self.send_content(recipient_id, content, timestamp_ms).await?;
+        self.send_content(recipient_id, content, timestamp_ms)
+            .await?;
         Ok(self
             .send_sync_copy(recipient_id, data_message, timestamp_ms, expiration)
             .await)
@@ -3654,11 +3868,14 @@ impl SessionClient {
             .await
             .map_err(|e| e.to_string())?;
         if response.status_code != 200 {
-            return Err(format!("get_expiries returned HTTP {}", response.status_code));
+            return Err(format!(
+                "get_expiries returned HTTP {}",
+                response.status_code
+            ));
         }
         let body: Value = serde_json::from_str(response.body.as_deref().unwrap_or(""))
             .map_err(|e| format!("get_expiries: {e}"))?;
-        Ok(parse_expiry(&body, hash))
+        validated_expiry_reply(&body, hash)
     }
 
     /// Send a DataMessage to its chat only (the sync copy is a separate
@@ -3677,7 +3894,9 @@ impl SessionClient {
             expiration_timer: expiration.map(|e| e.seconds),
             ..Default::default()
         };
-        self.send_content(recipient_id, content, timestamp_ms).await.map(|_| ())
+        self.send_content(recipient_id, content, timestamp_ms)
+            .await
+            .map(|_| ())
     }
 
     /// Typing indicator for a 1:1 chat (Session does not send them to groups).
@@ -3687,7 +3906,11 @@ impl SessionClient {
         let content = Content {
             typing_message: Some(TypingMessage {
                 timestamp: timestamp_ms,
-                action: if started { Action::Started } else { Action::Stopped } as i32,
+                action: if started {
+                    Action::Started
+                } else {
+                    Action::Stopped
+                } as i32,
             }),
             sig_timestamp: Some(timestamp_ms),
             ..Default::default()
@@ -3720,7 +3943,15 @@ impl SessionClient {
     async fn upload_attachment(
         &self,
         path: &std::path::Path,
-    ) -> Result<(AttachmentPointer, AttachmentMeta, Vec<u8>, Option<ImagePreview>), String> {
+    ) -> Result<
+        (
+            AttachmentPointer,
+            AttachmentMeta,
+            Vec<u8>,
+            Option<ImagePreview>,
+        ),
+        String,
+    > {
         debug_log("attachment.begin", "reading local file");
         // Refuse oversized files before reading and encrypting them (the
         // encrypted size is checked again below; it is slightly larger).
@@ -3857,7 +4088,9 @@ impl SessionClient {
             return Err("no files given".into());
         }
         if paths.len() > MAX_ATTACHMENTS {
-            return Err(format!("Session allows at most {MAX_ATTACHMENTS} files per message"));
+            return Err(format!(
+                "Session allows at most {MAX_ATTACHMENTS} files per message"
+            ));
         }
         let mut pointers = Vec::with_capacity(paths.len());
         let mut files = Vec::with_capacity(paths.len());
@@ -4083,7 +4316,8 @@ impl SessionClient {
             }),
             ..Default::default()
         };
-        self.send_content(recipient_id, content.clone(), sent_at).await?;
+        self.send_content(recipient_id, content.clone(), sent_at)
+            .await?;
         if !recipient_id.starts_with("03") && recipient_id != self.identity.session_id {
             self.send_content(&self.identity.session_id, content, sent_at)
                 .await
@@ -4151,10 +4385,7 @@ impl SessionClient {
             let encoded = STANDARD.encode(wire);
             let mut params =
                 self.group_auth_params(&group.auth, &group.id, "store", 11, now_ms())?;
-            params.insert(
-                "ttl".to_owned(),
-                Value::from(ttl_ms),
-            );
+            params.insert("ttl".to_owned(), Value::from(ttl_ms));
             params.insert("data".to_owned(), Value::String(encoded));
             let response = self
                 .network
@@ -4162,10 +4393,7 @@ impl SessionClient {
                 .await
                 .map_err(|error| error.to_string())?;
             if response.status_code != 200 {
-                let detail = response
-                    .body
-                    .as_deref()
-                    .unwrap_or("no_response_body");
+                let detail = response.body.as_deref().unwrap_or("no_response_body");
                 let detail: String = detail.chars().take(240).collect();
                 debug_log(
                     "group.send.response",
@@ -4241,8 +4469,8 @@ impl SessionClient {
         for hash in hashes {
             to_sign.extend_from_slice(hash.as_bytes());
         }
-        let signature = ed25519::sign(&self.identity.ed_secret, &to_sign)
-            .map_err(|error| error.to_string())?;
+        let signature =
+            ed25519::sign(&self.identity.ed_secret, &to_sign).map_err(|error| error.to_string())?;
         let params = serde_json::json!({
             "pubkey": self.identity.session_id,
             "pubkey_ed25519": hex::encode(self.identity.ed_public),
@@ -4256,10 +4484,17 @@ impl SessionClient {
             .map_err(|error| error.to_string())?;
         debug_log(
             "swarm.delete",
-            &format!("hashes={} http_status={}", hashes.len(), response.status_code),
+            &format!(
+                "hashes={} http_status={}",
+                hashes.len(),
+                response.status_code
+            ),
         );
         if response.status_code != 200 {
-            return Err(format!("swarm delete returned HTTP {}", response.status_code));
+            return Err(format!(
+                "swarm delete returned HTTP {}",
+                response.status_code
+            ));
         }
         Ok(())
     }
@@ -4315,7 +4550,10 @@ impl SessionClient {
                 Ok(response) if response.status_code == 200 => response,
                 Ok(response) => {
                     self.drop_poll_node(&self.identity.session_id).await;
-                    return Err(format!("Session retrieve returned HTTP {}", response.status_code));
+                    return Err(format!(
+                        "Session retrieve returned HTTP {}",
+                        response.status_code
+                    ));
                 }
                 Err(error) => {
                     self.drop_poll_node(&self.identity.session_id).await;
@@ -4547,8 +4785,14 @@ fn prompt_identity() -> Result<Identity, Box<dyn std::error::Error>> {
             Err(error) => return Err(error.into()),
         }
     }
-    if let Some(seed) = load_protected_seed(&saved_seed_path)? {
-        return identity_from_seed(seed, None);
+    match load_protected_seed(&saved_seed_path) {
+        Ok(Some(seed)) => return identity_from_seed(seed, None),
+        Ok(None) => {}
+        // E.g. the data folder was copied from another computer or Windows
+        // user: the saved seed can't be unlocked here. Ask for the seed or
+        // recovery phrase instead; saving it then replaces the old file,
+        // and the copied history opens again (its key comes from the seed).
+        Err(error) => println!("{error}. Enter your seed or recovery phrase instead."),
     }
     let entered = rpassword::prompt_password(
         "Session seed (64 hex) or 13-word recovery phrase (blank creates account): ",
@@ -4763,7 +5007,10 @@ fn save_protected_seed(
         .mode(0o600)
         .open(path)?;
     file.write_all(&data)?;
-    println!("Seed saved to {} (use --forget-seed to remove it).", path.display());
+    println!(
+        "Seed saved to {} (use --forget-seed to remove it).",
+        path.display()
+    );
     Ok(())
 }
 
@@ -4901,9 +5148,9 @@ fn restore_terminal() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = LOCAL_OFFSET.set(
-        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC),
-    );
+    let _ =
+        LOCAL_OFFSET.set(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
+    session_tui_separators::init_local_time();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -4976,7 +5223,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 type SyncTask = tokio::task::JoinHandle<Result<RetrieveResult, String>>;
-type DownloadTask = tokio::task::JoinHandle<Result<DownloadedAttachment, (PendingDownload, String)>>;
+type DownloadTask =
+    tokio::task::JoinHandle<Result<DownloadedAttachment, (PendingDownload, String)>>;
 
 type NetworkJob =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> + Send>;
@@ -5031,36 +5279,6 @@ where
     })
 }
 
-/// Split command arguments on whitespace, honouring double quotes.
-fn split_args(input: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut has_token = false;
-    for c in input.chars() {
-        match c {
-            '"' => {
-                quoted = !quoted;
-                has_token = true;
-            }
-            c if c.is_whitespace() && !quoted => {
-                if has_token {
-                    args.push(std::mem::take(&mut current));
-                    has_token = false;
-                }
-            }
-            c => {
-                current.push(c);
-                has_token = true;
-            }
-        }
-    }
-    if has_token {
-        args.push(current);
-    }
-    args
-}
-
 /// `path`, or `name (1).ext`, `name (2).ext`… if it already exists.
 /// Write `bytes` to `path` via a temporary file in the same folder, renamed
 /// into place only when complete: a full disk or a crash never leaves a
@@ -5072,7 +5290,10 @@ fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), Str
         .ok_or("invalid file name")?;
     let temporary = path.with_file_name(format!(".{name}.{}.part", now_ms()));
     let result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -5095,7 +5316,10 @@ fn unique_path(path: std::path::PathBuf) -> std::path::PathBuf {
         .unwrap_or("attachment")
         .to_owned();
     let extension = path.extension().and_then(|s| s.to_str()).map(str::to_owned);
-    let parent = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let parent = path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
     for n in 1.. {
         let name = match &extension {
             Some(extension) => format!("{stem} ({n}).{extension}"),
@@ -5126,10 +5350,7 @@ fn attachment_file_name(meta: &AttachmentMeta) -> String {
 }
 
 /// Queue every attachment that is not in the local cache yet.
-fn enqueue_missing_downloads(
-    app: &App,
-    queue: &mut std::collections::VecDeque<PendingDownload>,
-) {
+fn enqueue_missing_downloads(app: &App, queue: &mut std::collections::VecDeque<PendingDownload>) {
     let Ok(root) = session_data_dir() else {
         return;
     };
@@ -5211,7 +5432,10 @@ fn finish_download(
         return;
     };
     let Some(message) = conversation.messages.iter_mut().find(|m| job.is_for(m)) else {
-        debug_log("attachment.download.orphan", "message_gone=true discarded=true");
+        debug_log(
+            "attachment.download.orphan",
+            "message_gone=true discarded=true",
+        );
         return;
     };
     if let Err(error) = store.save_attachment_blob(
@@ -5224,7 +5448,9 @@ fn finish_download(
         return;
     }
     if message.image_previews.len() < message.attachments.len() {
-        message.image_previews.resize(message.attachments.len(), None);
+        message
+            .image_previews
+            .resize(message.attachments.len(), None);
     }
     if let Some(slot) = message.image_previews.get_mut(job.index)
         && downloaded.preview.is_some()
@@ -5253,8 +5479,10 @@ async fn run(
     enqueue_missing_downloads(app, &mut download_queue);
     // Outgoing text/reaction/timer sends: (task, chat, message timestamp).
     // Outbox work in flight (see `OutboxKind`), at most OUTBOX_PARALLEL.
-    let mut outbox_tasks: Vec<(tokio::task::JoinHandle<Result<Option<String>, String>>, OutboxEntry)> =
-        Vec::new();
+    let mut outbox_tasks: Vec<(
+        tokio::task::JoinHandle<Result<Option<String>, String>>,
+        OutboxEntry,
+    )> = Vec::new();
     let mut last_outbox_check: Option<Instant> = None;
     let mut exit_warned = false;
     let mut background_tasks: Vec<(tokio::task::JoinHandle<Result<(), String>>, &'static str)> =
@@ -5288,7 +5516,10 @@ async fn run(
                 if outbox_tasks.len() >= OUTBOX_PARALLEL {
                     break;
                 }
-                if outbox_tasks.iter().any(|(_, running)| running.id == entry.id) {
+                if outbox_tasks
+                    .iter()
+                    .any(|(_, running)| running.id == entry.id)
+                {
                     continue;
                 }
                 match start_outbox(client, app, &entry) {
@@ -5328,7 +5559,9 @@ async fn run(
                 Err(error) => format!("SAVE FAILED · {error}"),
             };
         }
-        if download_task.as_ref().is_some_and(|task| task.is_finished())
+        if download_task
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
             && let Some(task) = download_task.take()
         {
             match task.await {
@@ -5393,7 +5626,12 @@ async fn run(
                             // Retried from the outbox (rebuilt from the
                             // stored message and its attachment pointers).
                             if peer.starts_with("05") && peer != app.local_id {
-                                let _ = store.outbox_add(OutboxKind::SyncCopy, &peer, sent.timestamp_ms, &[]);
+                                let _ = store.outbox_add(
+                                    OutboxKind::SyncCopy,
+                                    &peer,
+                                    sent.timestamp_ms,
+                                    &[],
+                                );
                                 last_outbox_check = None;
                             }
                             "ATTACHMENT SENT · DEVICE SYNC COPY WILL BE RETRIED".into()
@@ -5421,8 +5659,24 @@ async fn run(
             };
             let _ = execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(title));
         }
+        if app
+            .search_task
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+            && let Some(task) = app.search_task.take()
+        {
+            let (hits, truncated) = task.await.unwrap_or_default();
+            if let Some(view) = app.search.as_mut().filter(|v| v.running) {
+                view.finish(hits, truncated);
+            }
+        }
+        session_tui_netdiag::poll(app, client, store).await;
+        // Fix this visit's unread boundary before anything is marked read.
+        update_unread_marker(app);
         if app.recovery_seed.is_none()
             && !app.show_help
+            && app.search.is_none()
+            && app.net_view.is_none()
             && app.window_focused
             && mark_current_conversation_read(app, store)
         {
@@ -5592,6 +5846,14 @@ async fn run(
             app.show_emoji = false;
             continue;
         }
+        if app.net_view.is_some() {
+            session_tui_netdiag::handle_key(app, client, store, key.code);
+            continue;
+        }
+        if app.search.is_some() {
+            session_tui_search::handle_key(app, key.code);
+            continue;
+        }
         if app.show_help {
             match key.code {
                 KeyCode::Up => app.help_scroll = app.help_scroll.saturating_sub(1),
@@ -5632,6 +5894,12 @@ async fn run(
             KeyCode::Left if editing => session_tui_input::left(&app.input, &mut app.cursor),
             KeyCode::Right if editing => session_tui_input::right(&app.input, &mut app.cursor),
             KeyCode::Home if editing => session_tui_input::home(&app.input, &mut app.cursor),
+            // End in the message list (Ctrl+End anywhere): newest message.
+            KeyCode::End if ctrl || app.focus == FocusArea::Messages => {
+                if let Some(conversation) = app.conversations.get_mut(app.selected) {
+                    conversation.jump_to_bottom();
+                }
+            }
             KeyCode::End if editing => session_tui_input::end(&app.input, &mut app.cursor),
             KeyCode::Up if editing && app.focus == FocusArea::Composer => {
                 session_tui_input::vertical(&app.input, &mut app.cursor, true);
@@ -5775,10 +6043,12 @@ async fn run(
                     if let Err(error) = store.save_contact(&contact.id) {
                         app.status = format!("LOCAL CONTACT ERROR · {error}");
                     }
-                    store.queue_account_change(session_tui_account::AccountChange::ApproveContact {
-                        id: contact.id.clone(),
-                        name: None,
-                    });
+                    store.queue_account_change(
+                        session_tui_account::AccountChange::ApproveContact {
+                            id: contact.id.clone(),
+                            name: None,
+                        },
+                    );
                 }
             }
             KeyCode::Enter => {
@@ -5844,11 +6114,13 @@ async fn run(
                             continue;
                         }
                         if paths.len() > MAX_ATTACHMENTS {
-                            app.status =
-                                format!("TOO MANY FILES · SESSION ALLOWS {MAX_ATTACHMENTS} PER MESSAGE");
+                            app.status = format!(
+                                "TOO MANY FILES · SESSION ALLOWS {MAX_ATTACHMENTS} PER MESSAGE"
+                            );
                             continue;
                         }
-                        let Some(recipient) = app.conversations.get(app.selected).map(|c| c.id.clone())
+                        let Some(recipient) =
+                            app.conversations.get(app.selected).map(|c| c.id.clone())
                         else {
                             app.status = "ADD A CONTACT FIRST WITH CTRL+N".into();
                             continue;
@@ -5897,8 +6169,11 @@ async fn run(
                             .and_then(|c| c.disappearing);
                         let paths: Vec<std::path::PathBuf> =
                             paths.into_iter().map(std::path::PathBuf::from).collect();
-                        let pasted: Vec<std::path::PathBuf> =
-                            paths.iter().filter(|p| is_pasted_image(p)).cloned().collect();
+                        let pasted: Vec<std::path::PathBuf> = paths
+                            .iter()
+                            .filter(|p| is_pasted_image(p))
+                            .cloned()
+                            .collect();
                         attachment_task = Some((
                             spawn_network(move || async move {
                                 let result = task_client
@@ -5965,9 +6240,10 @@ async fn run(
                             None => (0..attachments.len()).collect(),
                         };
                         let cwd = std::env::current_dir().unwrap_or_default();
-                        let target_path = (!target.is_empty()).then(|| std::path::PathBuf::from(&target));
-                        let into_dir = selected.len() > 1
-                            || target_path.as_ref().is_none_or(|p| p.is_dir());
+                        let target_path =
+                            (!target.is_empty()).then(|| std::path::PathBuf::from(&target));
+                        let into_dir =
+                            selected.len() > 1 || target_path.as_ref().is_none_or(|p| p.is_dir());
                         if selected.len() > 1
                             && let Some(dir) = target_path.as_ref()
                             && !dir.is_dir()
@@ -6080,7 +6356,9 @@ async fn run(
                                 session_tui_account::AccountChange::ProfileName(rest.to_owned()),
                             );
                             app.status = match store.save_profile_name(&app.profile_name) {
-                                Ok(()) => "PROFILE NAME SAVED · SYNCING TO YOUR OTHER DEVICES".into(),
+                                Ok(()) => {
+                                    "PROFILE NAME SAVED · SYNCING TO YOUR OTHER DEVICES".into()
+                                }
                                 Err(error) => format!("PROFILE SAVE FAILED · {error}"),
                             };
                         }
@@ -6137,12 +6415,12 @@ async fn run(
                         } else {
                             app.blocked.remove(&id);
                         }
-                        store.queue_account_change(session_tui_account::AccountChange::SetBlocked {
-                            id,
-                            blocked,
-                        });
+                        store.queue_account_change(
+                            session_tui_account::AccountChange::SetBlocked { id, blocked },
+                        );
                         app.status = if blocked {
-                            "CONTACT BLOCKED · THEIR MESSAGES ARE IGNORED ON ALL YOUR DEVICES".into()
+                            "CONTACT BLOCKED · THEIR MESSAGES ARE IGNORED ON ALL YOUR DEVICES"
+                                .into()
                         } else {
                             "CONTACT UNBLOCKED".into()
                         };
@@ -6180,10 +6458,18 @@ async fn run(
                                 continue;
                             }
                         }
-                        app.status = format!(
-                            "NEW-MESSAGE BELL {}",
-                            if app.bell { "ON" } else { "OFF" }
-                        );
+                        app.status =
+                            format!("NEW-MESSAGE BELL {}", if app.bell { "ON" } else { "OFF" });
+                    }
+                    "/net" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_netdiag::open(app, client, store);
+                    }
+                    "/search" => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        session_tui_search::command(app, rest);
                     }
                     "/emoji" if rest.is_empty() => {
                         app.input.clear();
@@ -6204,20 +6490,28 @@ async fn run(
                         // is queued for it (a sent message is not resent).
                         let selected = app.conversations.get(app.selected).and_then(|c| {
                             let message = c.messages.get(c.selected_message)?;
-                            (message.outgoing && !message.system).then(|| (c.id.clone(), message.clone()))
+                            (message.outgoing && !message.system)
+                                .then(|| (c.id.clone(), message.clone()))
                         });
                         let Some((peer, mut message)) = selected else {
                             app.status = "SELECT ONE OF YOUR MESSAGES TO RETRY".into();
                             continue;
                         };
-                        let queued = store.outbox_retry_now(&peer, message.timestamp_ms).unwrap_or(false);
+                        let queued = store
+                            .outbox_retry_now(&peer, message.timestamp_ms)
+                            .unwrap_or(false);
                         if message.send_state == SendState::Failed {
                             message.send_state = SendState::Sending;
                             let saved = store.begin_batch().and_then(|()| {
                                 let _ = store.update_message(&peer, &message);
                                 if !queued {
                                     // Failed in an older build: queue it now.
-                                    let _ = store.outbox_add(OutboxKind::Text, &peer, message.timestamp_ms, &[]);
+                                    let _ = store.outbox_add(
+                                        OutboxKind::Text,
+                                        &peer,
+                                        message.timestamp_ms,
+                                        &[],
+                                    );
                                 }
                                 store.end_batch()
                             });
@@ -6285,10 +6579,12 @@ async fn run(
                         conversation.messages.push(notice);
                         conversation.selected_message = conversation.messages.len() - 1;
                         let _ = store.set_disappearing(&peer, setting);
-                        store.queue_account_change(session_tui_account::AccountChange::ContactExpiry {
-                            id: peer.clone(),
-                            expiry: setting.map(|e| (e.kind, e.seconds)),
-                        });
+                        store.queue_account_change(
+                            session_tui_account::AccountChange::ContactExpiry {
+                                id: peer.clone(),
+                                expiry: setting.map(|e| (e.kind, e.seconds)),
+                            },
+                        );
                         let task_client = Arc::clone(client);
                         let data_message = DataMessage {
                             timestamp: Some(timestamp),
@@ -6304,10 +6600,8 @@ async fn run(
                             }),
                             "timer update",
                         ));
-                        app.status = format!(
-                            "DISAPPEARING MESSAGES · {}",
-                            Expiration::describe(setting)
-                        );
+                        app.status =
+                            format!("DISAPPEARING MESSAGES · {}", Expiration::describe(setting));
                     }
                     "/accept" | "/decline"
                         if app
@@ -6336,9 +6630,8 @@ async fn run(
                                 let _ = store.delete_message(&peer, message);
                             }
                             let _ = store.delete_empty_contact(&peer);
-                            app.selected = app
-                                .selected
-                                .min(app.conversations.len().saturating_sub(1));
+                            app.selected =
+                                app.selected.min(app.conversations.len().saturating_sub(1));
                             app.status =
                                 "REQUEST DECLINED · /block STOPS THEM WRITING AGAIN".into();
                         }
@@ -6434,7 +6727,11 @@ async fn run(
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.focus = FocusArea::Composer;
                 let mut buffer = [0u8; 4];
-                session_tui_input::insert(&mut app.input, &mut app.cursor, c.encode_utf8(&mut buffer));
+                session_tui_input::insert(
+                    &mut app.input,
+                    &mut app.cursor,
+                    c.encode_utf8(&mut buffer),
+                );
                 // Session-style typing indicator for 1:1 chats, at most every 10 s.
                 if app.input_mode == InputMode::Message
                     && !app.input.starts_with('/')
@@ -6443,14 +6740,16 @@ async fn run(
                         .get(app.selected)
                         .map(|c| c.id.clone())
                         .filter(|id| id.starts_with("05") && *id != client.identity.session_id)
-                    && last_typing
-                        .as_ref()
-                        .is_none_or(|(last_peer, at)| *last_peer != peer || at.elapsed() > Duration::from_secs(10))
+                    && last_typing.as_ref().is_none_or(|(last_peer, at)| {
+                        *last_peer != peer || at.elapsed() > Duration::from_secs(10)
+                    })
                 {
                     last_typing = Some((peer.clone(), Instant::now()));
                     let task_client = Arc::clone(client);
                     background_tasks.push((
-                        spawn_network(move || async move { task_client.send_typing(&peer, true).await }),
+                        spawn_network(
+                            move || async move { task_client.send_typing(&peer, true).await },
+                        ),
                         "typing",
                     ));
                 }
@@ -6543,7 +6842,10 @@ fn start_outbox(
         OutboxKind::ReadReceipt => {
             let timestamps: Vec<u64> = serde_json::from_slice(&entry.payload).ok()?;
             Some(spawn_network(move || async move {
-                task_client.send_receipt(&peer, 1, timestamps).await.map(|()| None)
+                task_client
+                    .send_receipt(&peer, 1, timestamps)
+                    .await
+                    .map(|()| None)
             }))
         }
         OutboxKind::ExpireRead | OutboxKind::FetchExpiry => {
@@ -6552,7 +6854,10 @@ fn start_outbox(
             if entry.kind == OutboxKind::ExpireRead {
                 let expiry = message.expires_at?;
                 Some(spawn_network(move || async move {
-                    task_client.expire_shorten(&hash, expiry).await.map(|()| None)
+                    task_client
+                        .expire_shorten(&hash, expiry)
+                        .await
+                        .map(|()| None)
                 }))
             } else {
                 // Some(deadline), or None when the swarm no longer has it.
@@ -6611,7 +6916,12 @@ fn finish_outbox(
                     let _ = store.update_message(&entry.peer, message);
                     // Then its copy for our other devices, as its own step.
                     if entry.peer.starts_with("05") && entry.peer != local_id {
-                        let _ = store.outbox_add(OutboxKind::SyncCopy, &entry.peer, entry.timestamp_ms, &[]);
+                        let _ = store.outbox_add(
+                            OutboxKind::SyncCopy,
+                            &entry.peer,
+                            entry.timestamp_ms,
+                            &[],
+                        );
                     }
                     Some("SENT".to_owned())
                 }
@@ -6644,7 +6954,10 @@ fn finish_outbox(
             let parked = attempts >= entry.kind.max_attempts();
             debug_log(
                 "outbox.failed",
-                &format!("kind={} attempt={attempts} parked={parked} error={error}", entry.kind.as_str()),
+                &format!(
+                    "kind={} attempt={attempts} parked={parked} error={error}",
+                    entry.kind.as_str()
+                ),
             );
             if parked
                 && matches!(
@@ -6656,7 +6969,11 @@ fn finish_outbox(
                 let _ = store.outbox_done(entry.id);
             } else {
                 // Out of automatic attempts: wait for /retry.
-                let next = if parked { u64::MAX } else { now_ms() + outbox_backoff_ms(attempts) };
+                let next = if parked {
+                    u64::MAX
+                } else {
+                    now_ms() + outbox_backoff_ms(attempts)
+                };
                 let _ = store.outbox_failed(entry.id, attempts, next, error);
             }
             status = match (entry.kind, updated.as_mut()) {
@@ -6888,7 +7205,9 @@ fn apply_account_state(
             conversation.name = name.to_owned();
             let _ = store.save_contact_name(&contact.id, name);
         }
-        let expiry = contact.expiry.map(|(kind, seconds)| Expiration { kind, seconds });
+        let expiry = contact
+            .expiry
+            .map(|(kind, seconds)| Expiration { kind, seconds });
         let pending_expiry = pending.iter().any(|c| {
             matches!(c, session_tui_account::AccountChange::ContactExpiry { id, .. } if *id == contact.id)
         });
@@ -6900,7 +7219,10 @@ fn apply_account_state(
     // Messages read on another device.
     let now = now_ms();
     for (conversation_id, last_read) in &state.last_read {
-        let Some(conversation) = app.conversations.iter_mut().find(|c| c.id == *conversation_id)
+        let Some(conversation) = app
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == *conversation_id)
         else {
             continue;
         };
@@ -6915,13 +7237,25 @@ fn apply_account_state(
                     // one; else start now, shorten it ourselves and ask the
                     // swarm (the earlier deadline wins), as the official
                     // clients do.
-                    let timer = message.expiration.map_or(0, |e| u64::from(e.seconds) * 1000);
+                    let timer = message
+                        .expiration
+                        .map_or(0, |e| u64::from(e.seconds) * 1000);
                     match message.swarm_expiry.filter(|at| *at <= now + timer) {
                         Some(deadline) => message.expires_at = Some(deadline),
                         None => {
                             message.start_expiry(Some(now));
-                            let _ = store.outbox_add(OutboxKind::ExpireRead, &peer, message.timestamp_ms, &[]);
-                            let _ = store.outbox_add(OutboxKind::FetchExpiry, &peer, message.timestamp_ms, &[]);
+                            let _ = store.outbox_add(
+                                OutboxKind::ExpireRead,
+                                &peer,
+                                message.timestamp_ms,
+                                &[],
+                            );
+                            let _ = store.outbox_add(
+                                OutboxKind::FetchExpiry,
+                                &peer,
+                                message.timestamp_ms,
+                                &[],
+                            );
                         }
                     }
                     let _ = store.update_message(&peer, message);
@@ -6950,9 +7284,11 @@ fn start_sync(
         store.get_group_cursors(),
         store.local_groups(true),
     ) {
-        (Ok(hash), Ok(groups), Ok(local)) => {
-            (hash, groups, local.into_iter().map(|(group, _)| group).collect())
-        }
+        (Ok(hash), Ok(groups), Ok(local)) => (
+            hash,
+            groups,
+            local.into_iter().map(|(group, _)| group).collect(),
+        ),
         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
             app.status = format!("SYNC CURSOR ERROR · {error}");
             return;
@@ -7030,6 +7366,25 @@ fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) 
 /// transaction and only then applied on screen: either all of it happens,
 /// or none of it and it is tried again on the next pass. Returns true when
 /// a read receipt was queued.
+/// Keep the "Unread Messages" boundary of the open chat (see
+/// [`session_tui_separators::UnreadMarker`]). Only reads state.
+fn update_unread_marker(app: &mut App) {
+    let Some(conversation) = app.conversations.get(app.selected) else {
+        app.unread_marker = None;
+        return;
+    };
+    let first_unread = conversation
+        .messages
+        .iter()
+        .find(|m| !m.outgoing && !m.is_read && !m.system)
+        .map(|m| m.key(&conversation.id, &app.local_id));
+    session_tui_separators::UnreadMarker::update(
+        &mut app.unread_marker,
+        &conversation.id,
+        first_unread,
+    );
+}
+
 fn mark_current_conversation_read(app: &mut App, store: &LocalStore) -> bool {
     let Some(conversation) = app.conversations.get(app.selected) else {
         return false;
@@ -7101,7 +7456,9 @@ fn expires_after_read_on_our_swarm(peer: &str, message: &Message) -> bool {
         && message.sender.is_none()
         && peer.starts_with("05")
         && message.server_hash.is_some()
-        && message.expiration.is_some_and(|e| e.kind == 1 && e.seconds > 0)
+        && message
+            .expiration
+            .is_some_and(|e| e.kind == 1 && e.seconds > 0)
 }
 
 /// Which messages a group "delete content" command removes.
@@ -7164,7 +7521,11 @@ fn verify_delete_content_signature(
     let Ok(signature) = Signature::from_slice(signature) else {
         return false;
     };
-    let signed = format!("DELETE_CONTENT{timestamp_ms}{}{}", ids.concat(), hashes.concat());
+    let signed = format!(
+        "DELETE_CONTENT{timestamp_ms}{}{}",
+        ids.concat(),
+        hashes.concat()
+    );
     key.verify(signed.as_bytes(), &signature).is_ok()
 }
 
@@ -7200,7 +7561,10 @@ fn apply_unsend(
                     message.outgoing
                 } else {
                     !message.outgoing
-                        && message.sender.as_deref().is_none_or(|sender| sender == author)
+                        && message
+                            .sender
+                            .as_deref()
+                            .is_none_or(|sender| sender == author)
                 };
             if matches {
                 let removed = conversation.messages.remove(index);
@@ -7275,13 +7639,6 @@ struct OutboxEntry {
     attempts: u32,
 }
 
-/// Wait before automatic attempt `attempts + 1`: 5 s, 15 s, 45 s … up to
-/// 15 minutes, so a flaky connection is retried quickly and a dead one
-/// isn't hammered.
-fn outbox_backoff_ms(attempts: u32) -> u64 {
-    (5_000u64.saturating_mul(3u64.saturating_pow(attempts.saturating_sub(1)))).min(15 * 60 * 1000)
-}
-
 /// The DataMessage of a stored outgoing message, rebuilt for (re)sending:
 /// same timestamp, so a repeat is recognised as the same message.
 fn outgoing_data_message(profile_name: &str, message: &Message) -> DataMessage {
@@ -7289,7 +7646,11 @@ fn outgoing_data_message(profile_name: &str, message: &Message) -> DataMessage {
         body: (!message.body.is_empty() || message.attachments.is_empty())
             .then(|| message.body.clone()),
         timestamp: Some(message.timestamp_ms),
-        attachments: message.attachments.iter().map(attachment_pointer_from_meta).collect(),
+        attachments: message
+            .attachments
+            .iter()
+            .map(attachment_pointer_from_meta)
+            .collect(),
         profile: profile_for(profile_name, message.timestamp_ms),
         quote: message.quote.clone().map(data_quote),
         ..Default::default()
@@ -7455,7 +7816,11 @@ fn finish_sync(
                     .conversations
                     .iter()
                     .find(|c| c.id == message.sender_id)
-                    .is_some_and(|c| c.messages.iter().any(|m| m.outgoing && m.timestamp_ms == *timestamp));
+                    .is_some_and(|c| {
+                        c.messages
+                            .iter()
+                            .any(|m| m.outgoing && m.timestamp_ms == *timestamp)
+                    });
                 if !known {
                     let _ = store.save_pending_receipt(&message.sender_id, *timestamp, status);
                 }
@@ -7492,19 +7857,23 @@ fn finish_sync(
         }
         if let Some(started) = message.typing {
             if !message.outgoing
-                && let Some(conversation) =
-                    app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+                && let Some(conversation) = app
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == message.contact_id)
             {
                 let fresh = now_ms().saturating_sub(message.timestamp_ms) < 20_000;
-                conversation.typing_until = (started && fresh)
-                    .then(|| Instant::now() + Duration::from_secs(15));
+                conversation.typing_until =
+                    (started && fresh).then(|| Instant::now() + Duration::from_secs(15));
             }
             continue;
         }
         if let Some((target, target_author, emoji, remove)) = message.reaction.take() {
             let author = message.sender_id.clone();
-            if let Some(conversation) =
-                app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+            if let Some(conversation) = app
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == message.contact_id)
             {
                 let peer = conversation.id.clone();
                 if let Some(target_message) = conversation.messages.iter_mut().find(|m| {
@@ -7520,15 +7889,22 @@ fn finish_sync(
         if let Some(name) = message.sender_name.as_deref()
             && !message.outgoing
         {
-            if app.display_names.get(&message.sender_id).map(String::as_str) != Some(name) {
+            if app
+                .display_names
+                .get(&message.sender_id)
+                .map(String::as_str)
+                != Some(name)
+            {
                 app.display_names
                     .insert(message.sender_id.clone(), name.to_owned());
                 let _ = store.save_display_name(&message.sender_id, name);
             }
             // A group's title comes from its config, never from a member.
             if !is_group
-                && let Some(conversation) =
-                    app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+                && let Some(conversation) = app
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == message.contact_id)
                 && conversation.name != name
             {
                 conversation.name = name.to_owned();
@@ -7587,7 +7963,10 @@ fn finish_sync(
                                 &hashes,
                                 signature,
                             ) {
-                                debug_log("group.delete_content", "invalid_signature=true dropped=true");
+                                debug_log(
+                                    "group.delete_content",
+                                    "invalid_signature=true dropped=true",
+                                );
                                 continue;
                             }
                             true
@@ -7601,8 +7980,10 @@ fn finish_sync(
                         before_ms: message.timestamp_ms,
                     };
                     let mut removed = 0usize;
-                    if let Some(conversation) =
-                        app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+                    if let Some(conversation) = app
+                        .conversations
+                        .iter_mut()
+                        .find(|c| c.id == message.contact_id)
                     {
                         let peer = conversation.id.clone();
                         conversation.messages.retain(|m| {
@@ -7647,8 +8028,10 @@ fn finish_sync(
         if body.is_empty() && message.attachments.is_empty() {
             continue;
         }
-        if let Some(conversation) =
-            app.conversations.iter_mut().find(|c| c.id == message.contact_id)
+        if let Some(conversation) = app
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == message.contact_id)
             && !message.outgoing
         {
             conversation.typing_until = None;
@@ -7706,7 +8089,8 @@ fn finish_sync(
         local_message.start_expiry(None);
         local_message.image_previews = vec![None; message.attachments.len()];
         if local_message.outgoing
-            && let Some(status) = store.take_pending_receipt(&message.contact_id, message.timestamp_ms)
+            && let Some(status) =
+                store.take_pending_receipt(&message.contact_id, message.timestamp_ms)
         {
             local_message.receipt_status = local_message.receipt_status.max(status);
         }
@@ -7789,6 +8173,7 @@ fn finish_sync(
     if added > 0 {
         app.sort_conversations();
     }
+    app.last_sync_ok = Some(std::time::SystemTime::now());
     app.status = format!(
         "SYNC · {added} NEW · {groups_found} GROUPS · {} QUEUED · {} DECRYPT FAIL · {} BAD ENVELOPE · {} BAD CONTENT",
         result.queued, result.undecryptable, result.bad_envelope, result.bad_content
@@ -7962,6 +8347,16 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
     if app.show_help {
         draw_help(frame, area, app.help_scroll);
     }
+    if let Some(view) = app.net_view.as_ref() {
+        session_tui_netdiag::draw(frame, area, view);
+        return None;
+    }
+    if let Some(mut view) = app.search.take() {
+        session_tui_search::draw(frame, area, &mut view, format_time, |hit| {
+            session_tui_search::exists(app, hit)
+        });
+        app.search = Some(view);
+    }
     if let Some(can_unsend) = app.delete_prompt {
         let text = if can_unsend {
             "  1 Delete on this device only    2 Delete for everyone    Esc cancel"
@@ -8000,7 +8395,9 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
             ),
             ChatAction::Remove => (
                 " Remove contact ",
-                format!("  Remove {name} from your contacts and delete the chat?    Y yes    Esc no"),
+                format!(
+                    "  Remove {name} from your contacts and delete the chat?    Y yes    Esc no"
+                ),
             ),
         };
         let width = (text.chars().count() as u16 + 4).min(area.width);
@@ -8033,8 +8430,14 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
         frame.render_widget(Clear, popup);
         let mut spans = Vec::new();
         for (index, emoji) in QUICK_REACTIONS.iter().enumerate() {
-            spans.push(Span::styled(format!(" {}", index + 1), Style::default().fg(TEAL)));
-            spans.push(Span::styled(format!(" {emoji} "), Style::default().fg(TEXT)));
+            spans.push(Span::styled(
+                format!(" {}", index + 1),
+                Style::default().fg(TEAL),
+            ));
+            spans.push(Span::styled(
+                format!(" {emoji} "),
+                Style::default().fg(TEXT),
+            ));
         }
         frame.render_widget(
             Paragraph::new(Line::from(spans)).block(
@@ -8067,7 +8470,9 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
         frame.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
-                    .title(" Emoji shortcodes · type :name: in a message or /react · any key closes ")
+                    .title(
+                        " Emoji shortcodes · type :name: in a message or /react · any key closes ",
+                    )
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(TEAL))
                     .style(Style::default().bg(PANEL)),
@@ -8146,7 +8551,11 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
     let active = app.focus == FocusArea::Contacts;
     // Room for text: minus the marker, padding and the right border.
     let text_width = (area.width as usize).saturating_sub(4);
-    let requests = app.conversations.iter().filter(|c| app.is_request(c)).count();
+    let requests = app
+        .conversations
+        .iter()
+        .filter(|c| app.is_request(c))
+        .count();
     let focus_border = if active {
         Style::default().fg(TEAL)
     } else {
@@ -8172,7 +8581,10 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
         ),
         Span::styled(
             if requests > 0 {
-                format!("  {requests} request{}", if requests == 1 { "" } else { "s" })
+                format!(
+                    "  {requests} request{}",
+                    if requests == 1 { "" } else { "s" }
+                )
             } else {
                 String::new()
             },
@@ -8216,7 +8628,11 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
                         format!(
                             " {}{}{}",
                             // The number `/N` switches to.
-                            if i < 9 { format!("{} ", i + 1) } else { "  ".to_owned() },
+                            if i < 9 {
+                                format!("{} ", i + 1)
+                            } else {
+                                "  ".to_owned()
+                            },
                             if c.id.starts_with("03") { "# " } else { "" },
                             c.title(&app.local_id)
                         ),
@@ -8235,7 +8651,10 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
                     Line::from(Span::styled(
                         format!(
                             "   {}",
-                            c.preview.chars().take(text_width.saturating_sub(1)).collect::<String>()
+                            c.preview
+                                .chars()
+                                .take(text_width.saturating_sub(1))
+                                .collect::<String>()
                         ),
                         Style::default().fg(MUTED),
                     ))
@@ -8258,7 +8677,13 @@ fn draw_conversations(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App)
 
 /// Every Line is exactly one screen row: text is wrapped here, so scroll
 /// positions and click targets are exact.
-fn push_wrapped(lines: &mut Vec<Line<'static>>, width: usize, indent: &str, text: &str, style: Style) {
+fn push_wrapped(
+    lines: &mut Vec<Line<'static>>,
+    width: usize,
+    indent: &str,
+    text: &str,
+    style: Style,
+) {
     let (rows, _) = session_tui_input::wrap(text, 0, width.saturating_sub(indent.len()).max(4));
     for row in rows {
         lines.push(Line::from(Span::styled(format!("{indent}{row}"), style)));
@@ -8375,7 +8800,10 @@ fn message_lines(
                 })
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format_time(message.timestamp_ms), Style::default().fg(MUTED)),
+        Span::styled(
+            format_time(message.timestamp_ms),
+            Style::default().fg(MUTED),
+        ),
     ];
     if message.outgoing {
         // Like the official apps, delivery/read ticks are shown only on
@@ -8486,6 +8914,23 @@ fn message_lines(
     (lines, attachment_ranges)
 }
 
+const HIGHLIGHT: Color = Color::Rgb(28, 64, 58);
+const UNREAD: Color = Color::Rgb(233, 170, 91);
+
+/// A date header or the unread line, centred across the transcript.
+fn separator_line(separator: &session_tui_separators::Separator, width: usize) -> Line<'static> {
+    use session_tui_separators::Separator;
+    let (label, color) = match separator {
+        Separator::Date(label) => (format!(" {label} "), MUTED),
+        Separator::Unread => (" Unread Messages ".to_owned(), UNREAD),
+    };
+    let width = width.saturating_sub(4).max(label.chars().count());
+    Line::from(Span::styled(
+        format!("  {label:─^width$}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
 fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     // The composer grows with its content (2–8 rows) and soft-wraps.
     let composer_width = area.width.saturating_sub(4).max(2) as usize;
@@ -8577,7 +9022,9 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     // Only the messages on screen are laid out; the rest are measured from
     // a cache of row counts, so long chats cost the same as short ones.
     let mut heights = std::mem::take(&mut app.layout_heights);
-    let mut message_ranges = Vec::new();
+    // (separators start, message start, end, message index)
+    let mut message_ranges: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut separators: Vec<Vec<session_tui_separators::Separator>> = Vec::new();
     let mut total = 1; // blank first row
     let mut last_sent = None;
     if let Some(c) = selected {
@@ -8588,20 +9035,34 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             .messages
             .iter()
             .rposition(|m| m.outgoing && !m.system && m.send_state == SendState::Sent);
+        // Date and unread lines are drawn between messages (display only).
+        let dates: Vec<_> = c
+            .messages
+            .iter()
+            .map(|m| session_tui_separators::local_date(m.timestamp_ms))
+            .collect();
+        let unread_at = app
+            .unread_marker
+            .as_ref()
+            .filter(|marker| marker.conversation == c.id)
+            .and_then(|marker| marker.first_unread.as_ref())
+            .and_then(|key| c.position_of(key, &app.local_id));
+        if let Some(today) = session_tui_separators::today() {
+            separators = session_tui_separators::separators(&dates, unread_at, today);
+        }
         let mut live = HashMap::with_capacity(c.messages.len());
         for (message_index, message) in c.messages.iter().enumerate() {
             let key = message_layout_key(app, message, text_width);
             let height = match heights.1.get(&key) {
                 Some(&height) => height,
-                None => {
-                    message_lines(app, c, message_index, text_width, message_active, last_sent)
-                        .0
-                        .len()
-                }
+                None => message_lines(app, c, message_index, text_width, message_active, last_sent)
+                    .0
+                    .len(),
             };
             live.insert(key, height);
-            message_ranges.push((total, total + height, message_index));
-            total += height;
+            let above = separators.get(message_index).map_or(0, Vec::len);
+            message_ranges.push((total, total + above, total + above + height, message_index));
+            total += above + height;
         }
         heights.1 = live;
     }
@@ -8621,8 +9082,8 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             max_scroll
         };
         selected
-            .and_then(|c| message_ranges.get(c.selected_message).copied())
-            .map(|(start, end, _)| {
+            .and_then(|c| message_ranges.get(c.selected_message))
+            .map(|&(start, _, end, _)| {
                 if start < previous {
                     start
                 } else if end > previous + visible_height {
@@ -8651,19 +9112,39 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 first_row = message_ranges
                     .iter()
-                    .find(|(_, end, _)| *end > scroll)
-                    .map_or(total, |(start, _, _)| *start);
+                    .find(|(_, _, end, _)| *end > scroll)
+                    .map_or(total, |(start, _, _, _)| *start);
             }
-            for &(start, end, message_index) in &message_ranges {
-                if end <= scroll || start >= visible_end {
+            let highlight = app
+                .highlight
+                .as_ref()
+                .filter(|(chat, _, until)| *chat == c.id && *until > Instant::now())
+                .map(|(_, key, _)| key);
+            for &(block_start, _, end, message_index) in &message_ranges {
+                if end <= scroll || block_start >= visible_end {
                     continue;
                 }
-                let (message_lines, attachments) =
+                for separator in separators.get(message_index).into_iter().flatten() {
+                    lines.push(separator_line(separator, text_width));
+                }
+                let (mut message_lines, attachments) =
                     message_lines(app, c, message_index, text_width, message_active, last_sent);
+                if highlight
+                    .is_some_and(|key| c.messages[message_index].key(&c.id, &app.local_id) == *key)
+                {
+                    for line in &mut message_lines {
+                        line.style = line.style.bg(HIGHLIGHT);
+                    }
+                }
                 let base = first_row + lines.len();
                 hitboxes.push((base, base + message_lines.len(), message_index, None));
                 for (a_start, a_end, attachment) in attachments {
-                    hitboxes.push((base + a_start, base + a_end, message_index, Some(attachment)));
+                    hitboxes.push((
+                        base + a_start,
+                        base + a_end,
+                        message_index,
+                        Some(attachment),
+                    ));
                 }
                 lines.extend(message_lines);
             }
@@ -8685,14 +9166,20 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         if end <= scroll || start >= visible_end {
             continue;
         }
-        let y_start = transcript_area.y + (start.max(scroll) - scroll).min(u16::MAX as usize) as u16;
+        let y_start =
+            transcript_area.y + (start.max(scroll) - scroll).min(u16::MAX as usize) as u16;
         let y_end = transcript_area.y
-            + (end.min(visible_end) - scroll).saturating_sub(1).min(u16::MAX as usize) as u16;
+            + (end.min(visible_end) - scroll)
+                .saturating_sub(1)
+                .min(u16::MAX as usize) as u16;
         app.message_hitboxes
             .push((y_start, y_end, message_index, attachment_index));
     }
     let transcript = Paragraph::new(lines)
-        .scroll(((scroll - first_row.min(scroll)).min(u16::MAX as usize) as u16, 0))
+        .scroll((
+            (scroll - first_row.min(scroll)).min(u16::MAX as usize) as u16,
+            0,
+        ))
         .style(Style::default().bg(BG))
         .block(transcript_block);
     frame.render_widget(transcript, rows[1]);
@@ -8749,8 +9236,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             rows[2].y + 1 + (cursor_row - first_row) as u16,
         ));
     }
-    let prompt = Paragraph::new(prompt_lines)
-    .block(
+    let prompt = Paragraph::new(prompt_lines).block(
         Block::default()
             .title(match app.reply_to.as_ref() {
                 Some(quote) => format!(
@@ -8772,6 +9258,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             .style(Style::default().bg(PANEL)),
     );
     frame.render_widget(prompt, rows[2]);
+    app.composer_area = Some(rows[2]);
 }
 
 const HELP: &[(&str, &[(&str, &str)])] = &[
@@ -8781,7 +9268,10 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("Tab / Shift+Tab", "Move focus: chats → messages → composer"),
             ("← / →", "Previous / next chat (when the composer is empty)"),
             ("↑ / ↓", "Move in the focused list"),
-            ("Mouse", "Click a chat, message or image; wheel moves the selection"),
+            (
+                "Mouse",
+                "Click a chat, message or image; wheel moves the selection",
+            ),
             ("/? · Esc", "Open / close this help (↑/↓ scroll)"),
             ("/exit · Ctrl+C", "Quit"),
         ],
@@ -8791,11 +9281,17 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Enter", "Send"),
             ("Shift+Enter · Alt+Enter · Ctrl+J", "New line"),
-            ("← → ↑ ↓ Home End", "Move the cursor (Ctrl+A / Ctrl+E: line start / end)"),
+            (
+                "← → ↑ ↓ Home End",
+                "Move the cursor (Ctrl+A / Ctrl+E: line start / end)",
+            ),
             ("Backspace · Delete", "Delete before / after the cursor"),
             ("Ctrl+W · Ctrl+U", "Delete previous word · clear everything"),
             ("Paste", "Inserted at the cursor, line breaks kept"),
-            (":joy: :heart: :+1:", "Emoji shortcodes (/emoji lists them; Win+. on Windows)"),
+            (
+                ":joy: :heart: :+1:",
+                "Emoji shortcodes (/emoji lists them; Win+. on Windows)",
+            ),
         ],
     ),
     (
@@ -8804,8 +9300,14 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("r", "Reply to the selected message (Esc cancels)"),
             ("e  then 1-6", "Reaction bar: 😂 🥰 😢 😡 😮 😈"),
             ("+", "React 👍"),
-            ("/react EMOJI", "React with any emoji or :shortcode: (again removes it)"),
-            ("Delete", "Delete: 1 on this device only · 2 for everyone (your messages)"),
+            (
+                "/react EMOJI",
+                "React with any emoji or :shortcode: (again removes it)",
+            ),
+            (
+                "Delete",
+                "Delete: 1 on this device only · 2 for everyone (your messages)",
+            ),
             ("/retry", "Resend the selected failed message"),
             ("✓ / ✓✓ / teal ✓✓", "Sent / delivered / read"),
         ],
@@ -8813,31 +9315,79 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Attachments",
         &[
-            ("/attach P1 [P2…] [-- caption]", "Send files as one message (max 32; quote paths with spaces)"),
-            ("/view [N]", "Open image N of the selected message; ←/→ next/previous"),
-            ("/paste [-- caption]", "Send the image on the clipboard (e.g. a screenshot)"),
-            ("/save [N] [PATH]", "Save attachment N, or all, to PATH or the current folder"),
+            (
+                "/attach P1 [P2…] [-- caption]",
+                "Send files as one message (max 32; quote paths with spaces)",
+            ),
+            (
+                "/view [N]",
+                "Open image N of the selected message; ←/→ next/previous",
+            ),
+            (
+                "/paste [-- caption]",
+                "Send the image on the clipboard (e.g. a screenshot)",
+            ),
+            (
+                "/save [N] [PATH]",
+                "Save attachment N, or all, to PATH or the current folder",
+            ),
         ],
     ),
     (
         "Chats and groups",
         &[
             ("Ctrl+N", "Start a chat with a Session ID"),
-            ("/disappear off | read 12h | send 1d", "Disappearing messages for this 1:1 chat"),
-            ("/1 … /9", "Switch to chat N (the number shown in the chat list)"),
-            ("/accept", "Accept a message request, or join the group you were invited to"),
+            (
+                "/disappear off | read 12h | send 1d",
+                "Disappearing messages for this 1:1 chat",
+            ),
+            (
+                "/1 … /9",
+                "Switch to chat N (the number shown in the chat list)",
+            ),
+            (
+                "/accept",
+                "Accept a message request, or join the group you were invited to",
+            ),
             ("/decline", "Decline a message request (deletes it)"),
-            ("/delete", "Delete this chat and its messages (the contact stays)"),
-            ("/remove", "Remove this contact from your account and delete the chat"),
-            ("/block · /unblock", "Block / unblock this 1:1 contact on all your devices"),
+            (
+                "/delete",
+                "Delete this chat and its messages (the contact stays)",
+            ),
+            (
+                "/remove",
+                "Remove this contact from your account and delete the chat",
+            ),
+            (
+                "/block · /unblock",
+                "Block / unblock this 1:1 contact on all your devices",
+            ),
             ("/rsync", "Fetch messages now (also automatic)"),
+            (
+                "/search [--all | --chat ID|NAME] WORD",
+                "Search messages (--from/--to YYYY-MM-DD); Enter opens one",
+            ),
+            (
+                "End · Ctrl+End",
+                "Jump to the newest message (message list)",
+            ),
+            (
+                "/net",
+                "Network diagnostics (paths, nodes, outbox; R refresh)",
+            ),
         ],
     ),
     (
         "Settings",
         &[
-            ("/name [NAME]", "Show / set your display name (synced to your other devices)"),
-            ("/bell on|off", "Terminal bell for new messages (title shows unread count)"),
+            (
+                "/name [NAME]",
+                "Show / set your display name (synced to your other devices)",
+            ),
+            (
+                "/bell on|off",
+                "Terminal bell for new messages (title shows unread count)",
+            ),
             ("--debug", "Start with a debug log (session-tui-debug.log)"),
             ("--forget-seed", "Start and delete the saved seed"),
         ],
@@ -8862,7 +9412,10 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect, scroll: u16) {
         )));
         for (key, description) in *entries {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<key_width$}  "), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("  {key:<key_width$}  "),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::styled(*description, Style::default().fg(TEXT)),
             ]));
         }
@@ -8936,7 +9489,10 @@ mod tests {
     fn preview_text_summarises_albums() {
         let photos = [meta("a.jpg", "image/jpeg"), meta("b.jpg", "image/jpeg")];
         assert_eq!(message_preview_text("", &photos), "[2 Photos]");
-        let mixed = [meta("a.jpg", "image/jpeg"), meta("b.pdf", "application/pdf")];
+        let mixed = [
+            meta("a.jpg", "image/jpeg"),
+            meta("b.pdf", "application/pdf"),
+        ];
         assert_eq!(message_preview_text("", &mixed), "[Photo] a.jpg +1");
         assert_eq!(message_preview_text("caption\nmore", &photos), "caption");
         assert_eq!(message_preview_text("", &[]), "");
@@ -8953,9 +9509,18 @@ mod tests {
 
     #[test]
     fn attachment_file_name_is_sanitised() {
-        assert_eq!(attachment_file_name(&meta("../../etc/x", "text/plain")), "x.txt");
-        assert_eq!(attachment_file_name(&meta("voice", "audio/aac")), "voice.aac");
-        assert_eq!(attachment_file_name(&meta("", "image/png")), "attachment.png");
+        assert_eq!(
+            attachment_file_name(&meta("../../etc/x", "text/plain")),
+            "x.txt"
+        );
+        assert_eq!(
+            attachment_file_name(&meta("voice", "audio/aac")),
+            "voice.aac"
+        );
+        assert_eq!(
+            attachment_file_name(&meta("", "image/png")),
+            "attachment.png"
+        );
     }
 
     #[test]
@@ -8990,7 +9555,10 @@ mod seed_file_tests {
         assert_eq!(format_duration(90), "90s");
         assert_eq!(
             Expiration::parse("read 5m").unwrap(),
-            Some(Expiration { kind: 1, seconds: 300 })
+            Some(Expiration {
+                kind: 1,
+                seconds: 300
+            })
         );
         assert_eq!(Expiration::parse("off").unwrap(), None);
         assert!(Expiration::parse("later").is_err());
@@ -9010,7 +9578,7 @@ mod seed_file_tests {
     #[test]
     fn content_parser_handles_session_message_types() {
         use libsession::proto::session_protos::{
-            data_message::Reaction, DataExtractionNotification, ReceiptMessage,
+            DataExtractionNotification, ReceiptMessage, data_message::Reaction,
         };
         let me = "05".to_owned() + &"11".repeat(32);
         let peer = "05".to_owned() + &"22".repeat(32);
@@ -9045,7 +9613,13 @@ mod seed_file_tests {
         assert_eq!(album.attachments.len(), 3);
         assert_eq!(album.body.as_deref(), Some("look"));
         assert_eq!(album.quote.as_ref().unwrap().id, 3);
-        assert_eq!(album.expiration, Some(Expiration { kind: 2, seconds: 60 }));
+        assert_eq!(
+            album.expiration,
+            Some(Expiration {
+                kind: 2,
+                seconds: 60
+            })
+        );
         // Reaction.
         let reaction = parse(Content {
             data_message: Some(DataMessage {
@@ -9095,7 +9669,10 @@ mod seed_file_tests {
         .unwrap();
         assert!(matches!(
             timer.event,
-            Some(ChatEvent::TimerChanged(Some(Expiration { kind: 1, seconds: 3600 })))
+            Some(ChatEvent::TimerChanged(Some(Expiration {
+                kind: 1,
+                seconds: 3600
+            })))
         ));
     }
 }
@@ -9107,7 +9684,10 @@ mod emoji_tests {
     #[test]
     fn shortcodes_expand_only_known_names() {
         assert_eq!(expand_shortcodes("ok :+1: :joy:"), "ok 👍 😂");
-        assert_eq!(expand_shortcodes("time 12:30 :nope: x"), "time 12:30 :nope: x");
+        assert_eq!(
+            expand_shortcodes("time 12:30 :nope: x"),
+            "time 12:30 :nope: x"
+        );
         assert_eq!(expand_shortcodes(":heart::fire:"), "❤️🔥");
         assert_eq!(expand_shortcodes("a:"), "a:");
     }
@@ -9154,7 +9734,9 @@ mod scroll_tests {
             } else {
                 format!("message {i}")
             };
-            app.conversations[index].messages.push(Message::new(body, 1_000 + i, i % 2 == 0));
+            app.conversations[index]
+                .messages
+                .push(Message::new(body, 1_000 + i, i % 2 == 0));
         }
         app.selected = index;
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -9173,9 +9755,14 @@ mod scroll_tests {
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         }
         assert_eq!(app.transcript_scroll.0, max_scroll);
-        assert_eq!(app.conversations[index].scroll, None, "follows new messages again");
+        assert_eq!(
+            app.conversations[index].scroll, None,
+            "follows new messages again"
+        );
         // A new message keeps the view at the bottom.
-        app.conversations[index].messages.push(Message::new("new".into(), 9_999, false));
+        app.conversations[index]
+            .messages
+            .push(Message::new("new".into(), 9_999, false));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.transcript_scroll.0, app.transcript_scroll.1);
     }
@@ -9191,20 +9778,47 @@ mod scroll_tests {
             } else {
                 format!("message {i}\nsecond line")
             };
-            app.conversations[index].messages.push(Message::new(body, 1_000 + i, i % 3 == 0));
+            // Seven hours apart: date lines between days; the newest
+            // incoming messages are unread, so the unread line shows too.
+            let mut message = Message::new(body, 1_000 + i * 7 * 3_600_000, i % 3 == 0);
+            message.is_read = i < 100;
+            app.conversations[index].messages.push(message);
         }
         app.selected = index;
+        update_unread_marker(&mut app);
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let area = app.message_viewport.unwrap();
         let width = area.width.max(8) as usize;
         let row_text = |line: &Line<'_>| -> String {
-            line.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
         };
         let conversation = &app.conversations[index];
         let last_sent = conversation.messages.iter().rposition(|m| m.outgoing);
+        let dates: Vec<_> = conversation
+            .messages
+            .iter()
+            .map(|m| session_tui_separators::local_date(m.timestamp_ms))
+            .collect();
+        let unread_at = conversation
+            .messages
+            .iter()
+            .position(|m| !m.outgoing && !m.is_read);
+        assert!(unread_at.is_some());
+        let separators = session_tui_separators::separators(
+            &dates,
+            unread_at,
+            session_tui_separators::today().unwrap(),
+        );
+        assert!(separators.iter().filter(|s| !s.is_empty()).count() > 30);
         let mut full = vec![" ".to_owned()];
-        for i in 0..conversation.messages.len() {
+        for (i, above) in separators.iter().enumerate() {
+            for separator in above {
+                full.push(row_text(&separator_line(separator, width)));
+            }
             full.extend(
                 message_lines(&app, conversation, i, width, false, last_sent)
                     .0
@@ -9223,16 +9837,170 @@ mod scroll_tests {
                     .map(|x| buffer[(area.x + x, area.y + row)].symbol().to_owned())
                     .collect();
                 let expected = full.get(top + row as usize).cloned().unwrap_or_default();
-                assert_eq!(shown.trim_end(), expected.trim_end(), "scroll {top} row {row}");
+                assert_eq!(
+                    shown.trim_end(),
+                    expected.trim_end(),
+                    "scroll {top} row {row}"
+                );
             }
         }
     }
 }
 
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn screen_text(terminal: &Terminal<TestBackend>, area: Rect) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|x| buffer[(area.x + x, area.y + row)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A long two-chat history; the group has two senders at the same ms.
+    fn app_with_history() -> (App, usize, usize) {
+        let local = "05".to_owned() + &"11".repeat(32);
+        let peer = "05".to_owned() + &"22".repeat(32);
+        let group = "03".to_owned() + &"33".repeat(32);
+        let mut app = App::new(local);
+        let chat = app.ensure_contact(&peer);
+        for i in 0..300u64 {
+            let body = if i == 7 {
+                "the Ärger with the old printer".to_owned()
+            } else {
+                format!("line {i}\nmore text")
+            };
+            let mut message = Message::new(body, 1_000 + i * 3_600_000, i % 2 == 0);
+            message.is_read = i % 2 == 0 || i < 296;
+            app.conversations[chat].messages.push(message);
+        }
+        let group_index = app.ensure_contact(&group);
+        for sender in ["05aa", "05bb"] {
+            let mut message = Message::new(format!("ärger from {sender}"), 5_000, false);
+            message.sender = Some(sender.to_owned() + &"00".repeat(31));
+            app.conversations[group_index].messages.push(message);
+        }
+        app.selected = chat;
+        (app, chat, group_index)
+    }
+
+    async fn search(app: &mut App, args: &str) {
+        session_tui_search::command(app, args);
+        let task = app.search_task.take().expect("search started");
+        let (hits, truncated) = task.await.unwrap();
+        app.search.as_mut().unwrap().finish(hits, truncated);
+    }
+
+    #[tokio::test]
+    async fn search_jumps_to_old_message_and_highlights_it() {
+        let (mut app, chat, group) = app_with_history();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let unread_before = app.conversations[chat].unread();
+
+        search(&mut app, "--all ÄRGER").await;
+        let view = app.search.as_ref().unwrap();
+        // Newest first; both same-ms group messages are distinct hits.
+        assert_eq!(view.hits.len(), 3);
+        assert_eq!(view.hits[0].key.timestamp_ms, 1_000 + 7 * 3_600_000);
+        assert_ne!(view.hits[1].key, view.hits[2].key);
+        assert!(
+            view.hits[1..]
+                .iter()
+                .all(|h| h.conversation == app.conversations[group].id)
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        // Jump far back into the history (not on screen before).
+        assert!(session_tui_search::jump(&mut app).is_ok());
+        assert!(app.search.is_none() && app.last_search.is_some());
+        assert_eq!(app.selected, chat);
+        assert_eq!(app.conversations[chat].selected_message, 7);
+        assert!(app.focus == FocusArea::Messages);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.message_viewport.unwrap();
+        assert!(screen_text(&terminal, area).contains("the Ärger with the old printer"));
+        let buffer = terminal.backend().buffer();
+        let highlighted =
+            (area.y..area.y + area.height).any(|y| buffer[(area.x + 3, y)].bg == HIGHLIGHT);
+        assert!(highlighted);
+        // Only the view changed.
+        assert_eq!(app.conversations[chat].unread(), unread_before);
+        assert_eq!(app.conversations[chat].messages.len(), 300);
+
+        // End: back to the newest message, past date and unread lines.
+        app.conversations[chat].jump_to_bottom();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.transcript_scroll.0, app.transcript_scroll.1);
+        assert_eq!(app.conversations[chat].selected_message, 299);
+        assert!(screen_text(&terminal, area).contains("line 299"));
+    }
+
+    #[tokio::test]
+    async fn search_skips_disappeared_messages_and_scopes_to_chat() {
+        let (mut app, chat, group) = app_with_history();
+        app.conversations[chat].messages[7].expires_at = Some(1);
+        search(&mut app, "ärger").await;
+        assert!(app.search.as_ref().unwrap().hits.is_empty());
+        let group_name = app.conversations[group].id[..10].to_owned();
+        search(&mut app, &format!("--chat {group_name} ärger")).await;
+        assert_eq!(app.search.as_ref().unwrap().hits.len(), 2);
+        // A hit whose message disappears later can't be opened.
+        search(&mut app, "--all printer").await;
+        assert!(app.search.as_ref().unwrap().hits.is_empty());
+        app.conversations[chat].messages[7].expires_at = None;
+        search(&mut app, "--all printer").await;
+        app.conversations[chat].messages.remove(7);
+        assert!(session_tui_search::jump(&mut app).is_err());
+    }
+
+    #[test]
+    fn unread_line_stays_while_reading_and_is_not_saved() {
+        let (mut app, chat, _) = app_with_history();
+        update_unread_marker(&mut app);
+        let first_unread = app.conversations[chat]
+            .messages
+            .iter()
+            .position(|m| !m.outgoing && !m.is_read)
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.message_viewport.unwrap();
+        assert!(screen_text(&terminal, area).contains("Unread Messages"));
+        // Drawing it didn't mark anything read.
+        assert!(!app.conversations[chat].messages[first_unread].is_read);
+        // Marked read (as reading does): the line stays for this visit.
+        for message in &mut app.conversations[chat].messages {
+            message.is_read = true;
+        }
+        update_unread_marker(&mut app);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(screen_text(&terminal, area).contains("Unread Messages"));
+        // Leave and come back: recomputed, nothing unread, no line.
+        app.selected = (chat + 1) % app.conversations.len();
+        update_unread_marker(&mut app);
+        app.selected = chat;
+        update_unread_marker(&mut app);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!screen_text(&terminal, area).contains("Unread Messages"));
+        assert_eq!(app.conversations[chat].messages.len(), 300);
+    }
+}
 
 #[cfg(test)]
 mod history_key_tests {
     use super::*;
+
+    // Store tests that read process environment share this lock with the
+    // failure-boundary fixtures, including the one-time XDG setup below.
+    pub(super) static STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn group_message(sender: &str, body: &str) -> Message {
         let mut message = Message::new(body.into(), 5_000, false);
@@ -9243,12 +10011,11 @@ mod history_key_tests {
     /// Tests with a real store share one data folder (set once) and run one
     /// at a time; each uses its own account, so its own database file.
     fn test_store(account: u8) -> (std::sync::MutexGuard<'static, ()>, Identity, LocalStore) {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
-        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DIR.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!("stui-store-test-{}", std::process::id()));
-            // SAFETY: set once, before any store is opened, under LOCK.
+            // SAFETY: store tests that access these variables share STORE_TEST_LOCK.
             unsafe {
                 std::env::remove_var("APPDATA");
                 std::env::set_var("XDG_DATA_HOME", &dir);
@@ -9277,7 +10044,15 @@ mod history_key_tests {
             }),
             ..Default::default()
         };
-        parse_content(&me, hash.into(), peer.into(), peer.into(), timestamp_ms, content).unwrap()
+        parse_content(
+            &me,
+            hash.into(),
+            peer.into(),
+            peer.into(),
+            timestamp_ms,
+            content,
+        )
+        .unwrap()
     }
 
     fn retrieved(messages: Vec<IncomingMessage>, cursor: &str) -> RetrieveResult {
@@ -9303,7 +10078,10 @@ mod history_key_tests {
         let mut app = App::new(identity.session_id.clone());
         let mut downloads = std::collections::VecDeque::new();
         let count = |store: &LocalStore| -> i64 {
-            store.connection.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap()
+            store
+                .connection
+                .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+                .unwrap()
         };
         // Inject a failing write, as a full disk would.
         store
@@ -9313,16 +10091,43 @@ mod history_key_tests {
             )
             .unwrap();
         let first = retrieved(vec![incoming(&peer, "hash-1", 1_000)], "cursor-1");
-        assert_eq!(finish_sync(&mut app, &store, &identity.session_id, Ok(first), &mut downloads, None), 0);
+        assert_eq!(
+            finish_sync(
+                &mut app,
+                &store,
+                &identity.session_id,
+                Ok(first),
+                &mut downloads,
+                None
+            ),
+            0
+        );
         assert_eq!(count(&store), 0);
-        assert_eq!(store.get_last_hash().unwrap(), None, "cursor must not advance");
-        assert!(app.conversations.iter().all(|c| c.messages.is_empty()), "memory rolled back");
+        assert_eq!(
+            store.get_last_hash().unwrap(),
+            None,
+            "cursor must not advance"
+        );
+        assert!(
+            app.conversations.iter().all(|c| c.messages.is_empty()),
+            "memory rolled back"
+        );
         assert!(app.status.contains("WILL RETRY"));
 
         // Same messages again after the problem is gone: saved this time.
-        store.connection.execute_batch("DROP TRIGGER fail;").unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail;")
+            .unwrap();
         let retry = retrieved(vec![incoming(&peer, "hash-1", 1_000)], "cursor-1");
-        finish_sync(&mut app, &store, &identity.session_id, Ok(retry), &mut downloads, None);
+        finish_sync(
+            &mut app,
+            &store,
+            &identity.session_id,
+            Ok(retry),
+            &mut downloads,
+            None,
+        );
         assert_eq!(count(&store), 1);
         assert_eq!(store.get_last_hash().unwrap().as_deref(), Some("cursor-1"));
     }
@@ -9343,7 +10148,12 @@ mod history_key_tests {
         let mut app = App::new(identity.session_id.clone());
         store.load(&mut app).unwrap();
         let state = |app: &App, peer: &str| {
-            app.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].send_state
+            app.conversations
+                .iter()
+                .find(|c| c.id == peer)
+                .unwrap()
+                .messages[0]
+                .send_state
         };
         assert_eq!(state(&app, &peer), SendState::Sending);
         let due = store.outbox_due(now_ms());
@@ -9355,33 +10165,59 @@ mod history_key_tests {
         finish_outbox(&mut app, &store, &entry, Err("offline".into()));
         assert_eq!(state(&app, &peer), SendState::Failed);
         assert!(store.outbox_due(now_ms()).iter().all(|e| e.id != entry.id));
-        assert!(store.outbox_due(now_ms() + outbox_backoff_ms(1)).iter().any(|e| e.id == entry.id));
+        assert!(
+            store
+                .outbox_due(now_ms() + outbox_backoff_ms(1))
+                .iter()
+                .any(|e| e.id == entry.id)
+        );
         assert!(app.status.contains("RETRYING IN 5 S"), "{}", app.status);
 
         // Out of automatic attempts: parked until /retry.
         let mut last = entry.clone();
         last.attempts = OutboxKind::Text.max_attempts() - 1;
         finish_outbox(&mut app, &store, &last, Err("offline".into()));
-        assert!(store.outbox_due(now_ms() + 10 * 365 * 24 * 3_600_000).iter().all(|e| e.id != entry.id));
+        assert!(
+            store
+                .outbox_due(now_ms() + 10 * 365 * 24 * 3_600_000)
+                .iter()
+                .all(|e| e.id != entry.id)
+        );
         assert!(app.status.contains("/retry"));
         assert!(store.outbox_retry_now(&peer, 7_000).unwrap());
-        let retried = store.outbox_due(now_ms()).into_iter().find(|e| e.id == entry.id).unwrap();
+        let retried = store
+            .outbox_due(now_ms())
+            .into_iter()
+            .find(|e| e.id == entry.id)
+            .unwrap();
         assert_eq!(retried.attempts, 0);
 
         // Success: sent, saved as sent, and the sync copy queued (1:1 only).
         finish_outbox(&mut app, &store, &retried, Ok(None));
         assert_eq!(state(&app, &peer), SendState::Sent);
         let due = store.outbox_due(now_ms());
-        assert!(due.iter().any(|e| e.peer == peer && e.kind == OutboxKind::SyncCopy));
+        assert!(
+            due.iter()
+                .any(|e| e.peer == peer && e.kind == OutboxKind::SyncCopy)
+        );
         let group_entry = due.iter().find(|e| e.peer == group).unwrap().clone();
         finish_outbox(&mut app, &store, &group_entry, Ok(None));
-        assert!(store.outbox_due(now_ms()).iter().all(|e| e.peer != group), "no sync copy for groups");
+        assert!(
+            store.outbox_due(now_ms()).iter().all(|e| e.peer != group),
+            "no sync copy for groups"
+        );
         let mut reloaded = App::new(identity.session_id.clone());
         store.load(&mut reloaded).unwrap();
         assert_eq!(state(&reloaded, &peer), SendState::Sent);
 
         // Deleting the message drops its remaining work.
-        let sent = reloaded.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].clone();
+        let sent = reloaded
+            .conversations
+            .iter()
+            .find(|c| c.id == peer)
+            .unwrap()
+            .messages[0]
+            .clone();
         store.delete_message(&peer, &sent).unwrap();
         assert!(store.outbox_due(now_ms()).iter().all(|e| e.peer != peer));
     }
@@ -9403,7 +10239,13 @@ mod history_key_tests {
         finish_outbox(&mut app, &store, &copy, Err("offline".into()));
         assert!(app.status.contains("/retry"));
         // Still sent; /retry reschedules only the copy.
-        let state = app.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].send_state;
+        let state = app
+            .conversations
+            .iter()
+            .find(|c| c.id == peer)
+            .unwrap()
+            .messages[0]
+            .send_state;
         assert_eq!(state, SendState::Sent);
         assert!(store.outbox_retry_now(&peer, 8_000).unwrap());
         let due = store.outbox_due(now_ms());
@@ -9423,16 +10265,25 @@ mod history_key_tests {
         store.load(&mut app).unwrap();
         app.selected = app.conversations.iter().position(|c| c.id == peer).unwrap();
         let read_in_db = |store: &LocalStore| -> bool {
-            store.connection.query_row("SELECT is_read FROM messages", [], |r| r.get(0)).unwrap()
+            store
+                .connection
+                .query_row("SELECT is_read FROM messages", [], |r| r.get(0))
+                .unwrap()
         };
         store
             .connection
             .execute_batch("CREATE TRIGGER fail BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk full'); END;")
             .unwrap();
         assert!(!mark_current_conversation_read(&mut app, &store));
-        assert!(!read_in_db(&store), "no receipt queued, so not marked read either");
+        assert!(
+            !read_in_db(&store),
+            "no receipt queued, so not marked read either"
+        );
         assert!(!app.conversations[app.selected].messages[0].is_read);
-        store.connection.execute_batch("DROP TRIGGER fail;").unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail;")
+            .unwrap();
         assert!(mark_current_conversation_read(&mut app, &store));
         assert!(read_in_db(&store));
         assert!(app.conversations[app.selected].messages[0].is_read);
@@ -9449,7 +10300,11 @@ mod history_key_tests {
         let peer = "05".to_owned() + &"29".repeat(32);
         queue_outgoing(&store, &peer, &Message::new("one".into(), 123, true)).unwrap();
         assert!(queue_outgoing(&store, &peer, &Message::new("two".into(), 123, true)).is_err());
-        assert_eq!(store.outbox_due(now_ms()).len(), 1, "the clash queued nothing");
+        assert_eq!(
+            store.outbox_due(now_ms()).len(),
+            1,
+            "the clash queued nothing"
+        );
     }
 
     #[test]
@@ -9467,7 +10322,13 @@ mod history_key_tests {
             .execute_batch("CREATE TRIGGER fail BEFORE UPDATE ON messages BEGIN SELECT RAISE(ABORT, 'disk full'); END;")
             .unwrap();
         finish_outbox(&mut app, &store, &entry, Ok(None));
-        let state = app.conversations.iter().find(|c| c.id == peer).unwrap().messages[0].send_state;
+        let state = app
+            .conversations
+            .iter()
+            .find(|c| c.id == peer)
+            .unwrap()
+            .messages[0]
+            .send_state;
         assert_eq!(state, SendState::Sending, "screen unchanged");
         assert_eq!(store.outbox_due(now_ms()).len(), 1, "still queued");
         assert!(app.status.contains("NOT SAVED"));
@@ -9484,7 +10345,14 @@ mod history_key_tests {
         // 1st sync: the peer's read receipt for our message 100 …
         let mut receipt = IncomingMessage::control("r1".into(), peer.clone(), peer.clone(), 150);
         receipt.receipt = Some((1, vec![100]));
-        finish_sync(&mut app, &store, &me, Ok(retrieved(vec![receipt], "c1")), &mut downloads, None);
+        finish_sync(
+            &mut app,
+            &store,
+            &me,
+            Ok(retrieved(vec![receipt], "c1")),
+            &mut downloads,
+            None,
+        );
         // … a restart …
         let mut app = App::new(me.clone());
         store.load(&mut app).unwrap();
@@ -9499,10 +10367,21 @@ mod history_key_tests {
             ..Default::default()
         };
         let copy = parse_content(&me, "s1".into(), me.clone(), me.clone(), 100, content).unwrap();
-        finish_sync(&mut app, &store, &me, Ok(retrieved(vec![copy], "c2")), &mut downloads, None);
+        finish_sync(
+            &mut app,
+            &store,
+            &me,
+            Ok(retrieved(vec![copy], "c2")),
+            &mut downloads,
+            None,
+        );
         let status: u8 = store
             .connection
-            .query_row("SELECT receipt_status FROM messages WHERE timestamp_ms = 100", [], |r| r.get(0))
+            .query_row(
+                "SELECT receipt_status FROM messages WHERE timestamp_ms = 100",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(status, 2, "read");
         let left: i64 = store
@@ -9526,7 +10405,9 @@ mod history_key_tests {
         let peer = "05".to_owned() + &"2c".repeat(32);
         let mut app = App::new(identity.session_id.clone());
         app.approved.insert(peer.clone());
-        store.save_message(&peer, &after_read("h-dar", 11_000, 60)).unwrap();
+        store
+            .save_message(&peer, &after_read("h-dar", 11_000, 60))
+            .unwrap();
         let mut plain = Message::new("stays".into(), 11_001, false);
         plain.is_read = false;
         plain.server_hash = Some("h-plain".into());
@@ -9535,7 +10416,10 @@ mod history_key_tests {
         app.selected = app.conversations.iter().position(|c| c.id == peer).unwrap();
         mark_current_conversation_read(&mut app, &store);
         let due = store.outbox_due(now_ms());
-        let expire: Vec<_> = due.iter().filter(|e| e.kind == OutboxKind::ExpireRead).collect();
+        let expire: Vec<_> = due
+            .iter()
+            .filter(|e| e.kind == OutboxKind::ExpireRead)
+            .collect();
         assert_eq!(expire.len(), 1, "only the after-read message");
         assert_eq!(expire[0].timestamp_ms, 11_000);
         let message = outbox_message(&mut app, expire[0]).unwrap();
@@ -9563,16 +10447,38 @@ mod history_key_tests {
             ..Default::default()
         };
         apply_account_state(&mut app, &store, &state);
-        let messages = &app.conversations.iter().find(|c| c.id == peer).unwrap().messages;
+        let messages = &app
+            .conversations
+            .iter()
+            .find(|c| c.id == peer)
+            .unwrap()
+            .messages;
         assert_eq!(messages[0].expires_at, Some(now + 20_000));
         assert!(messages[1].expires_at.unwrap() <= now_ms() + 60_000);
         let due = store.outbox_due(now_ms());
-        assert!(due.iter().all(|e| e.timestamp_ms == 12_001), "nothing to do for the first");
+        assert!(
+            due.iter().all(|e| e.timestamp_ms == 12_001),
+            "nothing to do for the first"
+        );
         assert!(due.iter().any(|e| e.kind == OutboxKind::ExpireRead));
-        let fetch = due.iter().find(|e| e.kind == OutboxKind::FetchExpiry).unwrap().clone();
+        let fetch = due
+            .iter()
+            .find(|e| e.kind == OutboxKind::FetchExpiry)
+            .unwrap()
+            .clone();
         // The swarm reports an earlier deadline (set by the other device): adopted.
-        finish_outbox(&mut app, &store, &fetch, Ok(Some((now + 5_000).to_string())));
-        let messages = &app.conversations.iter().find(|c| c.id == peer).unwrap().messages;
+        finish_outbox(
+            &mut app,
+            &store,
+            &fetch,
+            Ok(Some((now + 5_000).to_string())),
+        );
+        let messages = &app
+            .conversations
+            .iter()
+            .find(|c| c.id == peer)
+            .unwrap()
+            .messages;
         assert_eq!(messages[1].expires_at, Some(now + 5_000));
     }
 
@@ -9589,11 +10495,17 @@ mod history_key_tests {
     fn receipts_are_dropped_after_their_attempts_and_backoff_is_capped() {
         let (_guard, identity, store) = test_store(0x66);
         let mut app = App::new(identity.session_id.clone());
-        store.outbox_add(OutboxKind::ReadReceipt, "05ab", 0, b"[1,2]").unwrap();
+        store
+            .outbox_add(OutboxKind::ReadReceipt, "05ab", 0, b"[1,2]")
+            .unwrap();
         let mut entry = store.outbox_due(now_ms()).pop().unwrap();
         entry.attempts = OutboxKind::ReadReceipt.max_attempts() - 1;
         finish_outbox(&mut app, &store, &entry, Err("offline".into()));
-        assert!(store.outbox_due(now_ms() + 10 * 365 * 24 * 3_600_000).is_empty());
+        assert!(
+            store
+                .outbox_due(now_ms() + 10 * 365 * 24 * 3_600_000)
+                .is_empty()
+        );
         assert_eq!(outbox_backoff_ms(1), 5_000);
         assert_eq!(outbox_backoff_ms(2), 15_000);
         assert_eq!(outbox_backoff_ms(50), 15 * 60 * 1000);
@@ -9604,12 +10516,17 @@ mod history_key_tests {
         let root = std::path::Path::new("/cache");
         let path = |owner: &str| session_tui_media::attachment_blob_path(root, owner, 7, 0);
         let peer = "05ab";
-        assert_ne!(path(&blob_owner(peer, None, true)), path(&blob_owner(peer, None, false)));
+        assert_ne!(
+            path(&blob_owner(peer, None, true)),
+            path(&blob_owner(peer, None, false))
+        );
         assert_ne!(
             path(&blob_owner(peer, Some("05x"), false)),
             path(&blob_owner(peer, Some("05y"), false))
         );
-        assert!(blob_owner(peer, None, false).contains(BLOB_ACCOUNT.get().map_or("", String::as_str)));
+        assert!(
+            blob_owner(peer, None, false).contains(BLOB_ACCOUNT.get().map_or("", String::as_str))
+        );
     }
 
     #[test]
@@ -9644,7 +10561,15 @@ mod history_key_tests {
             4_242,
             0,
         );
-        finish_download(&mut app, &store, Ok(DownloadedAttachment { job, encrypted, preview: None }));
+        finish_download(
+            &mut app,
+            &store,
+            Ok(DownloadedAttachment {
+                job,
+                encrypted,
+                preview: None,
+            }),
+        );
         assert!(!path.exists(), "no message, no cache file");
     }
 
@@ -9664,7 +10589,10 @@ mod history_key_tests {
     fn node_cursors_move_only_when_the_sync_commits() {
         let (_guard, identity, store) = test_store(0x62);
         let peer = "05".to_owned() + &"23".repeat(32);
-        let committed = Mutex::new(HashMap::from([("me/0/node".to_owned(), "old-hash".to_owned())]));
+        let committed = Mutex::new(HashMap::from([(
+            "me/0/node".to_owned(),
+            "old-hash".to_owned(),
+        )]));
         let mut app = App::new(identity.session_id.clone());
         let mut downloads = std::collections::VecDeque::new();
         store
@@ -9675,14 +10603,35 @@ mod history_key_tests {
             .unwrap();
         let mut first = retrieved(vec![incoming(&peer, "hash-n1", 2_000)], "cursor-n1");
         first.node_cursors = vec![("me/0/node".into(), "new-hash".into())];
-        finish_sync(&mut app, &store, &identity.session_id, Ok(first), &mut downloads, Some(&committed));
-        assert_eq!(committed.lock().unwrap()["me/0/node"], "old-hash", "failed sync keeps the start point");
+        finish_sync(
+            &mut app,
+            &store,
+            &identity.session_id,
+            Ok(first),
+            &mut downloads,
+            Some(&committed),
+        );
+        assert_eq!(
+            committed.lock().unwrap()["me/0/node"],
+            "old-hash",
+            "failed sync keeps the start point"
+        );
         assert!(store.node_cursors().is_empty());
 
-        store.connection.execute_batch("DROP TRIGGER fail;").unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail;")
+            .unwrap();
         let mut retry = retrieved(vec![incoming(&peer, "hash-n1", 2_000)], "cursor-n1");
         retry.node_cursors = vec![("me/0/node".into(), "new-hash".into())];
-        finish_sync(&mut app, &store, &identity.session_id, Ok(retry), &mut downloads, Some(&committed));
+        finish_sync(
+            &mut app,
+            &store,
+            &identity.session_id,
+            Ok(retry),
+            &mut downloads,
+            Some(&committed),
+        );
         assert_eq!(committed.lock().unwrap()["me/0/node"], "new-hash");
         assert_eq!(store.node_cursors()["me/0/node"], "new-hash");
     }
@@ -9700,10 +10649,24 @@ mod history_key_tests {
             .unwrap();
         let group = "03".to_owned() + &"55".repeat(32);
         let mut result = retrieved(Vec::new(), "cursor-g");
-        result.groups = vec![DiscoveredGroup { id: group.clone(), name: "New group".into(), can_write: true }];
-        finish_sync(&mut app, &store, &identity.session_id, Ok(result), &mut downloads, None);
+        result.groups = vec![DiscoveredGroup {
+            id: group.clone(),
+            name: "New group".into(),
+            can_write: true,
+        }];
+        finish_sync(
+            &mut app,
+            &store,
+            &identity.session_id,
+            Ok(result),
+            &mut downloads,
+            None,
+        );
         assert!(app.status.contains("WILL RETRY"), "{}", app.status);
-        assert!(app.conversations.iter().all(|c| c.id != group), "group rolled back in memory too");
+        assert!(
+            app.conversations.iter().all(|c| c.id != group),
+            "group rolled back in memory too"
+        );
     }
 
     #[test]
@@ -9720,7 +10683,11 @@ mod history_key_tests {
         let load = |store: &LocalStore| {
             let mut app = App::new(identity.session_id.clone());
             store.load(&mut app).unwrap();
-            let index = app.conversations.iter().position(|c| c.id == group).unwrap();
+            let index = app
+                .conversations
+                .iter()
+                .position(|c| c.id == group)
+                .unwrap();
             let mut bodies: Vec<(String, bool)> = app.conversations[index]
                 .messages
                 .iter()
@@ -9738,7 +10705,9 @@ mod history_key_tests {
 
         // An old-format table (no sender column) is rebuilt with the author
         // read back from the encrypted rows.
-        let body = store.encrypted_payload(&group_message("05cc", "old row")).unwrap();
+        let body = store
+            .encrypted_payload(&group_message("05cc", "old row"))
+            .unwrap();
         store
             .connection
             .execute_batch(
@@ -9762,7 +10731,9 @@ mod history_key_tests {
             .query_row("SELECT sender FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(sender, "05cc");
-        store.save_message(&group, &group_message("05dd", "new row")).unwrap();
+        store
+            .save_message(&group, &group_message("05dd", "new row"))
+            .unwrap();
         assert_eq!(load(&store).len(), 2);
     }
 }
@@ -9779,14 +10750,28 @@ mod delete_content_tests {
         let ids = vec!["05aa".to_owned(), "05bb".to_owned()];
         let hashes = vec!["h1".to_owned()];
         let signed = admin.sign(b"DELETE_CONTENT12305aa05bbh1").to_bytes();
-        assert!(verify_delete_content_signature(&group, 123, &ids, &hashes, &signed));
+        assert!(verify_delete_content_signature(
+            &group, 123, &ids, &hashes, &signed
+        ));
         // Different timestamp, members, or a member's own key: rejected.
-        assert!(!verify_delete_content_signature(&group, 124, &ids, &hashes, &signed));
-        assert!(!verify_delete_content_signature(&group, 123, &ids[..1], &hashes, &signed));
+        assert!(!verify_delete_content_signature(
+            &group, 124, &ids, &hashes, &signed
+        ));
+        assert!(!verify_delete_content_signature(
+            &group,
+            123,
+            &ids[..1],
+            &hashes,
+            &signed
+        ));
         let member = SigningKey::from_bytes(&[3; 32]);
         let forged = member.sign(b"DELETE_CONTENT12305aa05bbh1").to_bytes();
-        assert!(!verify_delete_content_signature(&group, 123, &ids, &hashes, &forged));
-        assert!(!verify_delete_content_signature(&group, 123, &ids, &hashes, &[0; 10]));
+        assert!(!verify_delete_content_signature(
+            &group, 123, &ids, &hashes, &forged
+        ));
+        assert!(!verify_delete_content_signature(
+            &group, 123, &ids, &hashes, &[0; 10]
+        ));
     }
 
     fn message(sender: &str, timestamp: u64, hash: &str) -> Message {
@@ -9806,19 +10791,39 @@ mod delete_content_tests {
         let new_bb = message("05bb", 200, "h-new-bb");
         let cc = message("05cc", 100, "h-cc");
         // A member (no admin signature) deletes only their own, by hash.
-        let member = DeleteContent { admin: false, author: "05bb", ids: &ids, hashes: &hashes, before_ms: 150 };
+        let member = DeleteContent {
+            admin: false,
+            author: "05bb",
+            ids: &ids,
+            hashes: &hashes,
+            before_ms: 150,
+        };
         assert!(member.matches(&old_bb, me));
         assert!(!member.matches(&other_bb, me), "not named by hash");
         assert!(!member.matches(&cc, me), "someone else's message");
         // An admin deletes the member's messages and hashed ones, up to the
         // command time only.
-        let admin = DeleteContent { admin: true, author: "05ad", ids: &ids, hashes: &hashes, before_ms: 150 };
-        assert!(admin.matches(&old_bb, me) && admin.matches(&other_bb, me) && admin.matches(&cc, me));
+        let admin = DeleteContent {
+            admin: true,
+            author: "05ad",
+            ids: &ids,
+            hashes: &hashes,
+            before_ms: 150,
+        };
+        assert!(
+            admin.matches(&old_bb, me) && admin.matches(&other_bb, me) && admin.matches(&cc, me)
+        );
         assert!(!admin.matches(&new_bb, me), "sent after the command");
         let mut mine = Message::new("mine".into(), 100, true);
         mine.server_hash = Some("h-mine".into());
         assert!(!admin.matches(&mine, me));
-        let admin_me = DeleteContent { admin: true, author: "05ad", ids: &[me.to_owned()], hashes: &[], before_ms: 150 };
+        let admin_me = DeleteContent {
+            admin: true,
+            author: "05ad",
+            ids: &[me.to_owned()],
+            hashes: &[],
+            before_ms: 150,
+        };
         assert!(admin_me.matches(&mine, me));
     }
 }
@@ -9833,8 +10838,16 @@ mod control_char_tests {
         let mut app = App::new("05".to_owned() + &"11".repeat(32));
         let i = app.ensure_contact(&("05".to_owned() + &"22".repeat(32)));
         app.conversations[i].name = "evil\x1b]0;title\x07name".into();
-        let mut message = Message::new("hi\x1b[2J\x1b]52;c;ZXZpbA==\x07there\r\x08x".into(), 1, false);
-        message.quote = Some(QuoteRef { id: 0, author: "x".into(), text: "\x1b[31mred".into() });
+        let mut message = Message::new(
+            "hi\x1b[2J\x1b]52;c;ZXZpbA==\x07there\r\x08x".into(),
+            1,
+            false,
+        );
+        message.quote = Some(QuoteRef {
+            id: 0,
+            author: "x".into(),
+            text: "\x1b[31mred".into(),
+        });
         app.conversations[i].messages.push(message);
         app.conversations[i].refresh_preview();
         app.selected = i;
@@ -9870,13 +10883,23 @@ mod routing_tests {
             ..Default::default()
         };
         // Our sync copy of a group message goes to the group.
-        let mine = parse_content(&me, "h".into(), me.clone(), me.clone(), 1, content(&group)).unwrap();
+        let mine =
+            parse_content(&me, "h".into(), me.clone(), me.clone(), 1, content(&group)).unwrap();
         assert_eq!(mine.contact_id, group);
         // Someone else cannot redirect their message into another chat.
-        let theirs = parse_content(&me, "h".into(), peer.clone(), peer.clone(), 1, content(&group)).unwrap();
+        let theirs = parse_content(
+            &me,
+            "h".into(),
+            peer.clone(),
+            peer.clone(),
+            1,
+            content(&group),
+        )
+        .unwrap();
         assert_eq!(theirs.contact_id, peer);
         // Malformed targets are ignored.
-        let bad = parse_content(&me, "h".into(), me.clone(), me.clone(), 1, content("03zz")).unwrap();
+        let bad =
+            parse_content(&me, "h".into(), me.clone(), me.clone(), 1, content("03zz")).unwrap();
         assert_eq!(bad.contact_id, me);
         assert!(!is_chat_id("04".to_owned().as_str()));
     }
@@ -9930,3 +10953,6 @@ mod delete_prompt_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "session_tui_quality_tests.rs"]
+mod session_tui_quality_tests;

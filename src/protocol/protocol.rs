@@ -93,8 +93,7 @@ pub static PROTOCOL_STRINGS: ProtocolStrings = ProtocolStrings {
     url_feedback: "https://getsession.org/feedback",
     url_network: "https://docs.getsession.org/session-network",
     url_privacy_policy: "https://getsession.org/privacy-policy",
-    url_pro_access_not_found:
-        "https://sessionapp.zendesk.com/hc/sections/4416517450649-Support",
+    url_pro_access_not_found: "https://sessionapp.zendesk.com/hc/sections/4416517450649-Support",
     url_pro_faq: "https://getsession.org/pro#faq",
     url_pro_page: "https://getsession.org/pro",
     url_pro_privacy_policy: "https://getsession.org/pro-privacy",
@@ -246,9 +245,10 @@ impl ProProof {
 
         // Check if the message was signed by the rotating key
         if let Some(sm) = signed_msg
-            && !self.verify_message(sm.sig, sm.msg)? {
-                return Ok(ProStatus::InvalidUserSig);
-            }
+            && !self.verify_message(sm.sig, sm.msg)?
+        {
+            return Ok(ProStatus::InvalidUserSig);
+        }
 
         // Check if the proof has expired
         if !self.is_active(unix_ts_ms) {
@@ -821,11 +821,11 @@ pub fn encode_for_destination(
     ed25519_privkey: &[u8],
     dest: &Destination,
 ) -> Result<Vec<u8>, EnvelopeError> {
-    use prost::Message as _;
-    use crate::proto::session_protos::{envelope, Content, Envelope as PbEnvelope};
+    use crate::proto::session_protos::{Content, Envelope as PbEnvelope, envelope};
     use crate::proto::web_socket_protos::{
-        web_socket_message, WebSocketMessage as PbWsMsg, WebSocketRequestMessage as PbWsReq,
+        WebSocketMessage as PbWsMsg, WebSocketRequestMessage as PbWsReq, web_socket_message,
     };
+    use prost::Message as _;
 
     let dest_type = dest
         .dest_type
@@ -1090,9 +1090,9 @@ pub fn decode_envelope(
     envelope_payload: &[u8],
     pro_backend_pubkey: &[u8; 32],
 ) -> Result<DecodedEnvelope, EnvelopeError> {
-    use prost::Message as _;
     use crate::proto::session_protos::{Content, Envelope as PbEnvelope};
     use crate::proto::web_socket_protos::WebSocketMessage as PbWsMsg;
+    use prost::Message as _;
 
     let mut result_envelope = Envelope::default();
     let mut sender_ed25519_pubkey = [0u8; 32];
@@ -1204,8 +1204,9 @@ pub fn decode_envelope(
             }
         }
         if !success {
-            return Err(last_err
-                .unwrap_or(EnvelopeError::DecryptionFailed(keys.decrypt_keys.len())));
+            return Err(
+                last_err.unwrap_or(EnvelopeError::DecryptionFailed(keys.decrypt_keys.len()))
+            );
         }
 
         // Strip padding
@@ -1245,10 +1246,9 @@ pub fn decode_envelope(
 
             result_envelope.flags |= envelope_flags::PRO_SIG;
 
-            let proto_proof = pro_msg
-                .proof
-                .as_ref()
-                .ok_or_else(|| EnvelopeError::MalformedProProof("pro_message missing proof".into()))?;
+            let proto_proof = pro_msg.proof.as_ref().ok_or_else(|| {
+                EnvelopeError::MalformedProProof("pro_message missing proof".into())
+            })?;
 
             let version = proto_proof
                 .version
@@ -1269,10 +1269,9 @@ pub fn decode_envelope(
                 ));
             }
 
-            let rotating_pk_bytes = proto_proof
-                .rotating_public_key
-                .as_ref()
-                .ok_or_else(|| EnvelopeError::MalformedProProof("missing rotatingPublicKey".into()))?;
+            let rotating_pk_bytes = proto_proof.rotating_public_key.as_ref().ok_or_else(|| {
+                EnvelopeError::MalformedProProof("missing rotatingPublicKey".into())
+            })?;
             if rotating_pk_bytes.len() != 32 {
                 return Err(EnvelopeError::MalformedProProof(
                     "rotatingPublicKey wrong size".into(),
@@ -1348,8 +1347,8 @@ pub fn decode_for_community(
     unix_ts_ms: u64,
     pro_backend_pubkey: &[u8; 32],
 ) -> Result<DecodedCommunityMessage, EnvelopeError> {
-    use prost::Message as _;
     use crate::proto::session_protos::{Content, Envelope as PbEnvelope};
+    use prost::Message as _;
 
     let mut result = DecodedCommunityMessage {
         envelope: None,
@@ -1416,8 +1415,8 @@ pub fn decode_for_community(
 
     // Parse content (unpad then decode)
     let unpadded = unpad_message(&result.content_plaintext);
-    let pb_content = Content::decode(unpadded)
-        .map_err(|e| EnvelopeError::ProtobufDecode(e.to_string()))?;
+    let pb_content =
+        Content::decode(unpadded).map_err(|e| EnvelopeError::ProtobufDecode(e.to_string()))?;
 
     // Resolve which pro signature to use
     let mut effective_pro_sig: Option<Vec<u8>> = pro_sig_from_envelope.clone();
@@ -1446,10 +1445,9 @@ pub fn decode_for_community(
         }
 
         if let Some(pro_msg) = pb_content.pro_message.as_ref() {
-            let proto_proof = pro_msg
-                .proof
-                .as_ref()
-                .ok_or_else(|| EnvelopeError::MalformedProProof("pro_message missing proof".into()))?;
+            let proto_proof = pro_msg.proof.as_ref().ok_or_else(|| {
+                EnvelopeError::MalformedProProof("pro_message missing proof".into())
+            })?;
 
             let version = proto_proof
                 .version
@@ -1463,10 +1461,9 @@ pub fn decode_for_community(
                 .gen_index_hash
                 .as_ref()
                 .ok_or_else(|| EnvelopeError::MalformedProProof("missing genIndexHash".into()))?;
-            let rotating_pk_bytes = proto_proof
-                .rotating_public_key
-                .as_ref()
-                .ok_or_else(|| EnvelopeError::MalformedProProof("missing rotatingPublicKey".into()))?;
+            let rotating_pk_bytes = proto_proof.rotating_public_key.as_ref().ok_or_else(|| {
+                EnvelopeError::MalformedProProof("missing rotatingPublicKey".into())
+            })?;
             let expiry = proto_proof
                 .expiry_unix_ts
                 .ok_or_else(|| EnvelopeError::MalformedProProof("missing expiryUnixTs".into()))?;
@@ -1557,9 +1554,9 @@ mod tests {
 
     #[test]
     fn test_encode_decode_1o1_roundtrip() {
-        use prost::Message as _;
         use crate::crypto::{curve25519, ed25519};
         use crate::proto::session_protos::{Content, DataMessage};
+        use prost::Message as _;
 
         // Sender and recipient keypairs
         let (_sender_ed_pk, sender_ed_sk) = ed25519::ed25519_key_pair();
@@ -1602,16 +1599,16 @@ mod tests {
             decrypt_keys: &[&recipient_ed_sk],
         };
         let pro_backend_pk = [0u8; 32]; // not used since message has no Pro
-        let decoded = decode_envelope(&keys, &wire, &pro_backend_pk)
-            .expect("decode_envelope should succeed");
+        let decoded =
+            decode_envelope(&keys, &wire, &pro_backend_pk).expect("decode_envelope should succeed");
 
         // Envelope timestamp and flags
         assert_eq!(decoded.envelope.timestamp, ts_ms);
         assert!(decoded.envelope.flags & envelope_flags::TIMESTAMP != 0);
 
         // Content round-trips
-        let parsed_content = Content::decode(decoded.content_plaintext.as_slice())
-            .expect("content should parse");
+        let parsed_content =
+            Content::decode(decoded.content_plaintext.as_slice()).expect("content should parse");
         let dm = parsed_content.data_message.expect("data_message present");
         assert_eq!(dm.body.as_deref(), Some(body_text.as_str()));
 
@@ -1621,8 +1618,8 @@ mod tests {
 
     #[test]
     fn test_encode_decode_for_community_roundtrip() {
-        use prost::Message as _;
         use crate::proto::session_protos::{Content, DataMessage};
+        use prost::Message as _;
 
         let content = Content {
             data_message: Some(DataMessage {
@@ -1713,10 +1710,7 @@ mod tests {
             PROTOCOL_STRINGS.url_pro_faq,
             "https://getsession.org/pro#faq"
         );
-        assert_eq!(
-            PROTOCOL_STRINGS.url_pro_page,
-            "https://getsession.org/pro"
-        );
+        assert_eq!(PROTOCOL_STRINGS.url_pro_page, "https://getsession.org/pro");
         assert_eq!(
             PROTOCOL_STRINGS.url_pro_privacy_policy,
             "https://getsession.org/pro-privacy"
@@ -1745,10 +1739,7 @@ mod tests {
             PROTOCOL_STRINGS.url_support,
             "https://getsession.org/support"
         );
-        assert_eq!(
-            PROTOCOL_STRINGS.url_survey,
-            "https://getsession.org/survey"
-        );
+        assert_eq!(PROTOCOL_STRINGS.url_survey, "https://getsession.org/survey");
         assert_eq!(
             PROTOCOL_STRINGS.url_terms_of_service,
             "https://getsession.org/terms-of-service"
@@ -1845,7 +1836,10 @@ mod tests {
     fn test_pro_features_for_utf8_above_pro_limit() {
         let msg: String = "a".repeat(PRO_HIGHER_CHARACTER_LIMIT + 1);
         let result = pro_features_for_utf8(&msg);
-        assert_eq!(result.status, ProFeaturesForMsgStatus::ExceedsCharacterLimit);
+        assert_eq!(
+            result.status,
+            ProFeaturesForMsgStatus::ExceedsCharacterLimit
+        );
         assert!(result.error.is_some());
     }
 
@@ -2016,10 +2010,7 @@ mod tests {
             .status(
                 &backend_pk,
                 0,
-                Some(ProSignedMessage {
-                    sig: &msg_sig,
-                    msg,
-                }),
+                Some(ProSignedMessage { sig: &msg_sig, msg }),
             )
             .unwrap();
         assert_eq!(status, ProStatus::Valid);

@@ -21,17 +21,15 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::network::key_types::X25519Pubkey;
-use crate::network::service_node::ServiceNode;
 use crate::network::onionreq::response_parser::DecryptedResponse;
 use crate::network::routing::onion_request::{
     OnionRequestRouter, OnionRequestRouterConfig, OnionRouteError,
 };
-use crate::network::routing::path_manager::{
-    PathCategory, PathManager, PathManagerConfig,
-};
+use crate::network::routing::path_manager::{PathCategory, PathManager, PathManagerConfig};
 use crate::network::rpc;
+use crate::network::service_node::ServiceNode;
 use crate::network::snode_pool::{
-    SnodePool, SnodePoolConfig, SnodePoolNetworkError, DEFAULT_SEED_URLS,
+    DEFAULT_SEED_URLS, SnodePool, SnodePoolConfig, SnodePoolNetworkError,
 };
 use crate::network::transport::Transport;
 use crate::network::types::{NetworkDestination, ServerDestination};
@@ -98,6 +96,53 @@ pub struct Network<T: Transport + Clone + 'static> {
     router: OnionRequestRouter,
     /// Swarm members per account/group key, with when they were looked up.
     swarms: Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<ServiceNode>)>>>,
+    /// Onion round-trip samples for diagnostics (see [`crate::network::metrics`]).
+    metrics: Arc<std::sync::Mutex<crate::network::metrics::NetworkMetrics>>,
+}
+
+/// One hop of an onion path, without its address or full key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HopSummary {
+    /// First 4 hex characters of the node's Ed25519 key.
+    pub key_prefix: String,
+    pub version: [u16; 3],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathSummary {
+    /// Guard first.
+    pub hops: Vec<HopSummary>,
+    /// Failures recorded against the path (it is dropped at `strike_limit`).
+    pub strikes: u8,
+}
+
+/// Read-only snapshot for the diagnostics page. Taking it sends nothing.
+#[derive(Clone, Debug)]
+pub struct NetworkDiagnostics {
+    pub pool_size: usize,
+    pub standard_paths: Vec<PathSummary>,
+    pub file_paths: Vec<PathSummary>,
+    pub target_paths: u8,
+    pub strike_limit: u8,
+    /// Cached swarms: (key prefix, node count, age).
+    pub swarms: Vec<(String, usize, Duration)>,
+    pub summary: crate::network::metrics::MetricsSummary,
+    pub last_success: Option<std::time::SystemTime>,
+    pub recent_errors: Vec<(std::time::SystemTime, String)>,
+}
+
+fn summarize_path(path: &crate::network::routing::path_manager::OnionPath) -> PathSummary {
+    PathSummary {
+        hops: path
+            .hops
+            .iter()
+            .map(|node| HopSummary {
+                key_prefix: node.ed25519_pubkey.hex().chars().take(4).collect(),
+                version: node.storage_server_version,
+            })
+            .collect(),
+        strikes: path.strikes,
+    }
 }
 
 /// How long a looked-up swarm is reused before asking again. Swarms change
@@ -119,6 +164,61 @@ impl<T: Transport + Clone + 'static> Network<T> {
             paths: Arc::new(Mutex::new(paths)),
             router,
             swarms: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            metrics: Arc::new(std::sync::Mutex::new(Default::default())),
+        }
+    }
+
+    fn record(&self, round_trip: Option<Duration>, error: Option<String>) {
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record(round_trip, error.as_deref());
+        }
+    }
+
+    /// Snapshot of pool, paths, cached swarms and request metrics. Only
+    /// reads local state (each lock briefly); never builds paths or sends.
+    pub async fn diagnostics(&self) -> NetworkDiagnostics {
+        let (standard_paths, file_paths) = {
+            let paths = self.paths.lock().await;
+            (
+                paths
+                    .paths(PathCategory::Standard)
+                    .iter()
+                    .map(summarize_path)
+                    .collect(),
+                paths
+                    .paths(PathCategory::File)
+                    .iter()
+                    .map(summarize_path)
+                    .collect(),
+            )
+        };
+        let pool_size = self.pool.lock().await.size();
+        let mut swarms: Vec<(String, usize, Duration)> = self
+            .swarms
+            .lock()
+            .await
+            .iter()
+            .map(|(key, (at, nodes))| (key.chars().take(6).collect(), nodes.len(), at.elapsed()))
+            .collect();
+        swarms.sort_by_key(|(_, _, age)| *age);
+        let (summary, last_success, recent_errors) = match self.metrics.lock() {
+            Ok(metrics) => (
+                metrics.summary(),
+                metrics.last_success(),
+                metrics.recent_errors(),
+            ),
+            Err(_) => Default::default(),
+        };
+        NetworkDiagnostics {
+            pool_size,
+            standard_paths,
+            file_paths,
+            target_paths: self.config.paths.target_paths_per_category,
+            strike_limit: self.config.paths.path_strike_threshold,
+            swarms,
+            summary,
+            last_success,
+            recent_errors,
         }
     }
 
@@ -137,10 +237,10 @@ impl<T: Transport + Clone + 'static> Network<T> {
                 crate::network::swarm::SwarmFetchError::Parse("empty swarm".into()),
             ));
         }
-        self.swarms
-            .lock()
-            .await
-            .insert(pubkey_hex.to_owned(), (std::time::Instant::now(), nodes.clone()));
+        self.swarms.lock().await.insert(
+            pubkey_hex.to_owned(),
+            (std::time::Instant::now(), nodes.clone()),
+        );
         Ok(nodes)
     }
 
@@ -156,9 +256,8 @@ impl<T: Transport + Clone + 'static> Network<T> {
         node: &ServiceNode,
         params: &rpc::RetrieveParams<'_>,
     ) -> Result<DecryptedResponse, NetworkError> {
-        let body = rpc::build_retrieve_params(params).map_err(|e| {
-            NetworkError::Encode(format!("build retrieve params: {e}"))
-        })?;
+        let body = rpc::build_retrieve_params(params)
+            .map_err(|e| NetworkError::Encode(format!("build retrieve params: {e}")))?;
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| NetworkError::Encode(e.to_string()))?;
         self.send_with_retry(
@@ -211,9 +310,8 @@ impl<T: Transport + Clone + 'static> Network<T> {
         &self,
         params: &rpc::StoreParams<'_>,
     ) -> Result<DecryptedResponse, NetworkError> {
-        let body = rpc::build_store_params(params).map_err(|e| {
-            NetworkError::Encode(format!("build store params: {e}"))
-        })?;
+        let body = rpc::build_store_params(params)
+            .map_err(|e| NetworkError::Encode(format!("build store params: {e}")))?;
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| NetworkError::Encode(e.to_string()))?;
 
@@ -233,9 +331,8 @@ impl<T: Transport + Clone + 'static> Network<T> {
         &self,
         params: &rpc::RetrieveParams<'_>,
     ) -> Result<DecryptedResponse, NetworkError> {
-        let body = rpc::build_retrieve_params(params).map_err(|e| {
-            NetworkError::Encode(format!("build retrieve params: {e}"))
-        })?;
+        let body = rpc::build_retrieve_params(params)
+            .map_err(|e| NetworkError::Encode(format!("build retrieve params: {e}")))?;
         let body_bytes =
             serde_json::to_vec(&body).map_err(|e| NetworkError::Encode(e.to_string()))?;
 
@@ -347,23 +444,44 @@ impl<T: Transport + Clone + 'static> Network<T> {
                 .map(NetworkDestination::ServiceNode)
                 .ok_or(NetworkError::Swarm(SwarmFetchError::PoolEmpty))?;
             self.router
-                .prepare(&pool, &mut paths, PathCategory::Standard, &destination, rpc::METHOD_GET_SWARM, &body)
-                .map_err(|e| NetworkError::Swarm(SwarmFetchError::Onion(Box::new(e))))?
+                .prepare(
+                    &pool,
+                    &mut paths,
+                    PathCategory::Standard,
+                    &destination,
+                    rpc::METHOD_GET_SWARM,
+                    &body,
+                )
+                .map_err(|e| {
+                    self.record(None, Some(e.to_string()));
+                    NetworkError::Swarm(SwarmFetchError::Onion(Box::new(e)))
+                })?
         };
+        let started = std::time::Instant::now();
         let response = self.transport.send_request(&prepared.request).await;
         let mut failed_guard = None;
         let response = prepared.finish(response, |guard| failed_guard = Some(*guard));
+        self.record(
+            Some(started.elapsed()),
+            response.as_ref().err().map(ToString::to_string),
+        );
         if let Some(guard) = failed_guard {
-            self.paths.lock().await.record_failure(PathCategory::Standard, &guard);
+            self.paths
+                .lock()
+                .await
+                .record_failure(PathCategory::Standard, &guard);
         }
-        let response = response.map_err(|e| NetworkError::Swarm(SwarmFetchError::Onion(Box::new(e))))?;
+        let response =
+            response.map_err(|e| NetworkError::Swarm(SwarmFetchError::Onion(Box::new(e))))?;
         if response.status_code < 200 || response.status_code >= 300 {
             return Err(NetworkError::Swarm(SwarmFetchError::BadStatus(
                 response.status_code.max(0) as u16,
             )));
         }
-        crate::network::swarm::parse_swarm_response(response.body.as_deref().unwrap_or("").as_bytes())
-            .map_err(NetworkError::Swarm)
+        crate::network::swarm::parse_swarm_response(
+            response.body.as_deref().unwrap_or("").as_bytes(),
+        )
+        .map_err(NetworkError::Swarm)
     }
 
     async fn any_snode_destination(&self) -> Result<NetworkDestination, NetworkError> {
@@ -407,15 +525,23 @@ impl<T: Transport + Clone + 'static> Network<T> {
             };
             let result = match prepared {
                 Ok(prepared) => {
+                    let started = std::time::Instant::now();
                     let response = self.transport.send_request(&prepared.request).await;
                     let mut failed_guard = None;
                     let result = prepared.finish(response, |guard| failed_guard = Some(*guard));
+                    self.record(
+                        Some(started.elapsed()),
+                        result.as_ref().err().map(ToString::to_string),
+                    );
                     if let Some(guard) = failed_guard {
                         self.paths.lock().await.record_failure(category, &guard);
                     }
                     result
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    self.record(None, Some(error.to_string()));
+                    Err(error)
+                }
             };
 
             match result {
@@ -450,11 +576,11 @@ impl<T: Transport + Clone + 'static> Network<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::ed25519 as ed;
     use crate::network::key_types::Ed25519Pubkey;
     use crate::network::service_node::ServiceNode;
     use crate::network::swarm::INVALID_SWARM_ID;
     use crate::network::transport::{MockRoute, MockTransport, TransportResponse};
-    use crate::crypto::ed25519 as ed;
 
     fn make_node_with_seed(seed_byte: u8) -> ServiceNode {
         let mut seed = [0u8; 32];
@@ -510,6 +636,55 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn diagnostics_read_state_and_record_failed_round_trips() {
+        let nodes: Vec<ServiceNode> = (1..=20).map(make_node_with_seed).collect();
+        let t = MockTransport::new();
+        t.route_ok_json("seed1", seed_response_body(&nodes));
+        t.route(MockRoute {
+            url_contains: "onion_req".into(),
+            body_contains: None,
+            response: TransportResponse {
+                status_code: 502,
+                body: b"no".to_vec(),
+                headers: Vec::new(),
+            },
+        });
+        let cfg = NetworkConfig {
+            seed_urls: vec!["https://seed1.example:4443/json_rpc".to_string()],
+            max_attempts: 2,
+            retry_base_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let net = Network::new(cfg, t);
+        // Fresh: nothing measured, nothing built, and asking builds nothing.
+        let fresh = net.diagnostics().await;
+        assert_eq!(fresh.pool_size, 0);
+        assert!(fresh.standard_paths.is_empty());
+        assert_eq!(fresh.summary.requests, 0);
+        assert_eq!(fresh.summary.success_rate, None);
+        assert_eq!(net.diagnostics().await.pool_size, 0);
+
+        let _ = net
+            .send_rpc(
+                "retrieve",
+                serde_json::json!({"pubkey": "05aaaa"}),
+                Some("05aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await;
+        let after = net.diagnostics().await;
+        assert!(after.pool_size >= 20);
+        assert!(after.summary.requests >= 1);
+        assert_eq!(after.summary.failures, after.summary.requests);
+        assert_eq!(after.summary.success_rate, Some(0.0));
+        assert_eq!(after.last_success, None);
+        assert!(!after.recent_errors.is_empty());
+        for path in after.standard_paths.iter().chain(&after.file_paths) {
+            assert_eq!(path.hops.len(), 3);
+            assert!(path.hops.iter().all(|hop| hop.key_prefix.len() == 4));
+        }
     }
 
     #[tokio::test]

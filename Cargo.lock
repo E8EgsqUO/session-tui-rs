@@ -1705,6 +1705,7 @@ dependencies = [
  "hex-literal",
  "hmac",
  "image",
+ "libc",
  "poly1305",
  "proptest",
  "prost",

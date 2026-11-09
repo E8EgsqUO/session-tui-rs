@@ -9,11 +9,7 @@ use crate::network::types::{NetworkResponseCallback, Request};
 #[allow(async_fn_in_trait)]
 pub trait Router: Send + Sync {
     /// Sends a request through the network using this routing strategy.
-    async fn send_request(
-        &self,
-        request: Request,
-        callback: NetworkResponseCallback,
-    );
+    async fn send_request(&self, request: Request, callback: NetworkResponseCallback);
 
     /// Returns true if the router is ready to send requests.
     fn is_ready(&self) -> bool;

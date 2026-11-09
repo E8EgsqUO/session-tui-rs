@@ -149,7 +149,10 @@ pub struct GroupKey {
     pub key: [u8; 32],
 }
 
-fn dict_bytes<'a>(dict: &'a std::collections::BTreeMap<Vec<u8>, BtValue>, key: &[u8]) -> Option<&'a [u8]> {
+fn dict_bytes<'a>(
+    dict: &'a std::collections::BTreeMap<Vec<u8>, BtValue>,
+    key: &[u8],
+) -> Option<&'a [u8]> {
     match dict.get(key) {
         Some(BtValue::String(bytes)) => Some(bytes),
         _ => None,
@@ -200,7 +203,8 @@ pub fn decrypt_key_message(
     };
 
     if let Some(admin_seed) = admin_seed
-        && let (Some(generation), Some(encrypted)) = (dict_int(&dict, b"G"), dict_bytes(&dict, b"K"))
+        && let (Some(generation), Some(encrypted)) =
+            (dict_int(&dict, b"G"), dict_bytes(&dict, b"K"))
     {
         let admin_key = blake2b_simd::Params::new()
             .hash_length(32)
@@ -292,7 +296,9 @@ mod tests {
     #[test]
     fn subaccount_signature_verifies_like_a_swarm_node() {
         let group_seed = [1u8; 32];
-        let group_pk = SigningKey::from_bytes(&group_seed).verifying_key().to_bytes();
+        let group_pk = SigningKey::from_bytes(&group_seed)
+            .verifying_key()
+            .to_bytes();
         for seed in [[2u8; 32], [3u8; 32], [0x44; 32], [0x91; 32]] {
             let member = keypair(seed);
             let auth = make_auth_data(group_seed, &member, SUBACC_FLAG_READ | SUBACC_FLAG_WRITE);
@@ -320,7 +326,9 @@ mod tests {
     #[test]
     fn auth_data_for_another_member_is_rejected() {
         let group_seed = [1u8; 32];
-        let group_pk = SigningKey::from_bytes(&group_seed).verifying_key().to_bytes();
+        let group_pk = SigningKey::from_bytes(&group_seed)
+            .verifying_key()
+            .to_bytes();
         let alice = keypair([2u8; 32]);
         let bob = keypair([3u8; 32]);
         let auth = make_auth_data(group_seed, &alice, SUBACC_FLAG_READ);

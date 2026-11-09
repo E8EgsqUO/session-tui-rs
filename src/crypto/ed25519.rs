@@ -174,11 +174,9 @@ mod tests {
             "cd83ca3d13ad8a954d5011aa7861abe3a29ac25b70c4ed5234aff74d34ef5786"
         );
 
-        let expected_sk1 =
-            "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7\
+        let expected_sk1 = "4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7\
              8862834829a87e0afadfed763fa8785e893dbde7f2c001ff1071aa55005c347f";
-        let expected_sk2 =
-            "5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876\
+        let expected_sk2 = "5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876\
              cd83ca3d13ad8a954d5011aa7861abe3a29ac25b70c4ed5234aff74d34ef5786";
         assert_eq!(hex::encode(sk1), expected_sk1);
         assert_eq!(hex::encode(sk2), expected_sk2);
@@ -223,8 +221,7 @@ mod tests {
 
         // Sign with 32-byte seed
         let sig = sign(&SEED1, b"hello").unwrap();
-        let expected_sig =
-            "e03b6e87a53d83f202f2501e9b52193dbe4a64c6503f88244948dee532718501\
+        let expected_sig = "e03b6e87a53d83f202f2501e9b52193dbe4a64c6503f88244948dee532718501\
              1574589aa7b59bc9757f9b9c31b7be9c9212b92ac7c81e029ee21c338ee12405";
         assert_eq!(hex::encode(sig), expected_sig);
 
@@ -253,10 +250,8 @@ mod tests {
 
     #[test]
     fn test_pro_privkey() {
-        let seed1 =
-            hex!("e5481635020d6f7b327e94e6d63e33a431fccabc4d2775845c43a8486a9f2884");
-        let seed2 =
-            hex!("743d646706b6b04b97b752036dd6cf5f2adc4b339fcfdfb4b496f0764bb93a84");
+        let seed1 = hex!("e5481635020d6f7b327e94e6d63e33a431fccabc4d2775845c43a8486a9f2884");
+        let seed2 = hex!("743d646706b6b04b97b752036dd6cf5f2adc4b339fcfdfb4b496f0764bb93a84");
 
         let sk1 = ed25519_pro_privkey_for_ed25519_seed(&seed1).unwrap();
         let sk2 = ed25519_pro_privkey_for_ed25519_seed(&seed2).unwrap();
@@ -264,11 +259,9 @@ mod tests {
         assert_eq!(sk1.len(), 64);
         assert_ne!(sk1, sk2);
 
-        let expected_sk1 =
-            "a4ec87e2346b25ee6394211cb682640a09dd8d297016fe241fe5b06fefef416c\
+        let expected_sk1 = "a4ec87e2346b25ee6394211cb682640a09dd8d297016fe241fe5b06fefef416c\
              b6d20c075eddd2edb69d4d7da9b7e580f187ce0537585da2b5e454b77980d0c8";
-        let expected_sk2 =
-            "7da256ba427cf5419cefea81f8ebb3395c261e4dfc2c91ee4d3ce9def67aa21c\
+        let expected_sk2 = "7da256ba427cf5419cefea81f8ebb3395c261e4dfc2c91ee4d3ce9def67aa21c\
              539d0a3be9658ebb6ba3ce97b25d4f6b716f7ef6d6ae6343bd0733519f5a51e8";
 
         assert_eq!(hex::encode(sk1), expected_sk1);

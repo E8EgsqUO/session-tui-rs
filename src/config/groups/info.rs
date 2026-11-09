@@ -14,8 +14,8 @@
 //!   p - group profile pic URL
 //!   q - group profile pic decryption key (32 bytes)
 
-use crate::config::config_base::field_helpers::*;
 use crate::config::config_base::ConfigType;
+use crate::config::config_base::field_helpers::*;
 use crate::config::config_message::ConfigData;
 use crate::config::namespaces::Namespace;
 use crate::config::profile_pic::ProfilePic;
@@ -97,20 +97,12 @@ impl GroupInfo {
 
     /// Sets the delete-before timestamp.
     pub fn set_delete_before(&mut self, timestamp: i64) {
-        self.delete_before = if timestamp > 0 {
-            Some(timestamp)
-        } else {
-            None
-        };
+        self.delete_before = if timestamp > 0 { Some(timestamp) } else { None };
     }
 
     /// Sets the delete-attachments-before timestamp.
     pub fn set_delete_attach_before(&mut self, timestamp: i64) {
-        self.delete_attach_before = if timestamp > 0 {
-            Some(timestamp)
-        } else {
-            None
-        };
+        self.delete_attach_before = if timestamp > 0 { Some(timestamp) } else { None };
     }
 }
 
@@ -132,15 +124,14 @@ impl ConfigType for GroupInfo {
             self.profile_pic.url = url;
         }
         if let Some(key) = get_bytes(data, b"q")
-            && key.len() == 32 {
-                self.profile_pic.key = key;
-            }
+            && key.len() == 32
+        {
+            self.profile_pic.key = key;
+        }
 
         self.created = get_int(data, b"c").filter(|&v| v > 0);
 
-        self.expiry_timer = get_int(data, b"E")
-            .filter(|&v| v > 0)
-            .map(|v| v as u32);
+        self.expiry_timer = get_int(data, b"E").filter(|&v| v > 0).map(|v| v as u32);
 
         self.delete_before = get_int(data, b"d").filter(|&v| v > 0);
         self.delete_attach_before = get_int(data, b"D").filter(|&v| v > 0);

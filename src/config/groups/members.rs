@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::config_base::field_helpers::*;
 use crate::config::config_base::ConfigType;
+use crate::config::config_base::field_helpers::*;
 use crate::config::config_message::{ConfigData, ConfigValue};
 use crate::config::namespaces::Namespace;
 use crate::config::profile_pic::ProfilePic;
@@ -181,9 +181,10 @@ impl Member {
             self.profile_pic.url = url;
         }
         if let Some(key) = get_bytes(dict, b"q")
-            && key.len() == 32 {
-                self.profile_pic.key = key;
-            }
+            && key.len() == 32
+        {
+            self.profile_pic.key = key;
+        }
 
         self.profile_updated = get_int_or_zero(dict, b"t");
         self.admin = get_int_or_zero(dict, b"A") != 0;
@@ -254,8 +255,7 @@ impl GroupMembers {
 
     /// Sets (inserts or updates) a member.
     pub fn set(&mut self, member: Member) {
-        self.members
-            .insert(member.session_id.clone(), member);
+        self.members.insert(member.session_id.clone(), member);
     }
 
     /// Removes a member. Returns true if found.
@@ -388,14 +388,16 @@ mod tests {
     fn test_roundtrip() {
         let mut members = GroupMembers::default();
 
-        let mut m1 = Member::new("050000000000000000000000000000000000000000000000000000000000000000");
+        let mut m1 =
+            Member::new("050000000000000000000000000000000000000000000000000000000000000000");
         m1.name = "Alice".to_string();
         m1.admin = true;
         m1.set_invite_accepted();
         m1.set_promotion_accepted();
         members.set(m1);
 
-        let mut m2 = Member::new("050000000000000000000000000000000000000000000000000000000000000001");
+        let mut m2 =
+            Member::new("050000000000000000000000000000000000000000000000000000000000000001");
         m2.name = "Bob".to_string();
         m2.set_invite_sent();
         m2.supplement = true;
@@ -409,12 +411,16 @@ mod tests {
 
         assert_eq!(loaded.size(), 2);
 
-        let alice = loaded.get("050000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let alice = loaded
+            .get("050000000000000000000000000000000000000000000000000000000000000000")
+            .unwrap();
         assert_eq!(alice.name, "Alice");
         assert!(alice.admin);
         assert!(!alice.invite_pending());
 
-        let bob = loaded.get("050000000000000000000000000000000000000000000000000000000000000001").unwrap();
+        let bob = loaded
+            .get("050000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap();
         assert_eq!(bob.name, "Bob");
         assert!(!bob.admin);
         assert_eq!(bob.invite_status, STATUS_SENT);

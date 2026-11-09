@@ -4,8 +4,8 @@
 //! derived from the plaintext via BLAKE2b keyed hashing, so that identical
 //! messages encrypt to identical ciphertext (enabling server-side dedup).
 
-use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, KeyInit};
 
 /// Poly1305 authentication tag size (16 bytes) + XChaCha20 nonce size (24 bytes).
 pub const ENCRYPT_DATA_OVERHEAD: usize = 40;
@@ -116,9 +116,7 @@ pub fn config_decrypt(
     let message_len = ciphertext.len() - ENCRYPT_DATA_OVERHEAD;
 
     // Extract nonce from the last 24 bytes
-    let nonce_bytes: [u8; 24] = ciphertext[ciphertext.len() - 24..]
-        .try_into()
-        .unwrap();
+    let nonce_bytes: [u8; 24] = ciphertext[ciphertext.len() - 24..].try_into().unwrap();
     let nonce = chacha20poly1305::XNonce::from(nonce_bytes);
 
     // The ciphertext+tag portion (excluding the appended nonce)

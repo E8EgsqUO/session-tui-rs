@@ -7,8 +7,7 @@
 ///
 /// Panics if ZSTD compression fails (which should not happen with valid inputs).
 pub fn compress(data: &[u8], level: i32, prefix: &[u8]) -> Vec<u8> {
-    let compressed = zstd::bulk::compress(data, level)
-        .expect("ZSTD compression failed");
+    let compressed = zstd::bulk::compress(data, level).expect("ZSTD compression failed");
 
     if prefix.is_empty() {
         compressed
@@ -32,9 +31,10 @@ pub fn decompress(data: &[u8], max_size: usize) -> Option<Vec<u8>> {
     if max_size > 0 {
         // Try to get the decompressed size from the frame header
         if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(data)
-            && size as usize > max_size {
-                return None;
-            }
+            && size as usize > max_size
+        {
+            return None;
+        }
     }
 
     // Use streaming decompression to handle unknown sizes and enforce limits

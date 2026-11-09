@@ -68,9 +68,7 @@ pub fn get_swarm(
     let swarm_id = pubkey_to_swarm_space(swarm_pubkey);
 
     // Find the first swarm with id >= swarm_id (right boundary)
-    let right_idx = all_swarms
-        .iter()
-        .position(|(id, _)| *id >= swarm_id);
+    let right_idx = all_swarms.iter().position(|(id, _)| *id >= swarm_id);
 
     let right_idx = right_idx.unwrap_or(0); // wrap around if beyond end
 
@@ -188,8 +186,8 @@ pub async fn fetch_swarm<T: Transport>(
 /// * `{"snodes": [...]}` — direct shape used by snodes
 /// * `{"result": {"snodes": [...]}}` — wrapped shape from some paths
 pub(crate) fn parse_swarm_response(body: &[u8]) -> Result<Vec<ServiceNode>, SwarmFetchError> {
-    let v: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| SwarmFetchError::Parse(format!("json: {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| SwarmFetchError::Parse(format!("json: {e}")))?;
 
     let arr = v
         .get("snodes")
@@ -239,8 +237,8 @@ pub async fn fetch_swarm_via_onion<T: Transport>(
     let destination = NetworkDestination::ServiceNode(dest_snode);
 
     let params = rpc::build_get_swarm_params(pubkey_hex);
-    let body_bytes = serde_json::to_vec(&params)
-        .map_err(|e| SwarmFetchError::Parse(format!("encode: {e}")))?;
+    let body_bytes =
+        serde_json::to_vec(&params).map_err(|e| SwarmFetchError::Parse(format!("encode: {e}")))?;
 
     let resp = router
         .send(
@@ -479,7 +477,9 @@ mod tests {
             target_paths_per_category: 1,
             path_strike_threshold: 1, // retire on strike
         });
-        paths.build_up_to_target(PathCategory::Standard, &pool).unwrap();
+        paths
+            .build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
 
         let router = OnionRequestRouter::new(OnionRequestRouterConfig::default());
         let t = MockTransport::new();

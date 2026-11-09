@@ -92,8 +92,7 @@ impl Builder {
         builder.enc_type = enc_type;
         builder.endpoint = endpoint.to_string();
         builder.destination_x25519_pubkey = Some(pubkey_for_destination(destination)?);
-        builder.is_v4_request =
-            matches!(destination, NetworkDestination::Server(_));
+        builder.is_v4_request = matches!(destination, NetworkDestination::Server(_));
 
         builder.set_destination(destination)?;
         for node in nodes {
@@ -134,8 +133,7 @@ impl Builder {
             NetworkDestination::ServiceNode(sn) => {
                 self.is_v4_request = false;
                 self.ed25519_pubkey = Some(sn.ed25519_pubkey);
-                self.destination_x25519_pubkey =
-                    Some(compute_x25519_pubkey(&sn.ed25519_pubkey)?);
+                self.destination_x25519_pubkey = Some(compute_x25519_pubkey(&sn.ed25519_pubkey)?);
             }
             NetworkDestination::Server(sd) => {
                 self.is_v4_request = true;
@@ -163,10 +161,7 @@ impl Builder {
     }
 
     /// Adds a hop by computing X25519 from the Ed25519 key.
-    pub fn add_hop_from_ed25519(
-        &mut self,
-        ed25519_pk: &Ed25519Pubkey,
-    ) -> Result<(), BuilderError> {
+    pub fn add_hop_from_ed25519(&mut self, ed25519_pk: &Ed25519Pubkey) -> Result<(), BuilderError> {
         let x25519_pk = compute_x25519_pubkey(ed25519_pk)?;
         self.hops.push((*ed25519_pk, x25519_pk));
         Ok(())
@@ -200,10 +195,7 @@ impl Builder {
         if let Some(ref hdrs) = self.headers {
             for (key, value) in hdrs {
                 if key != "User-Agent" {
-                    headers_json.insert(
-                        key.clone(),
-                        serde_json::Value::String(value.clone()),
-                    );
+                    headers_json.insert(key.clone(), serde_json::Value::String(value.clone()));
                 }
             }
         }
@@ -380,7 +372,6 @@ impl Default for Builder {
         Self::new()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

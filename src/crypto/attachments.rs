@@ -91,15 +91,14 @@ impl SecretStream {
         key: &[u8; ENCRYPT_KEY_SIZE],
         nonce_bytes: &[u8; ENCRYPT_HEADER],
     ) -> Self {
-        use chacha20::hchacha;
         use chacha20::R20;
+        use chacha20::hchacha;
 
         header_out.copy_from_slice(nonce_bytes);
 
         // Derive subkey via HChaCha20(key, header[0..16])
         let hchacha_input: [u8; 16] = header_out[..16].try_into().unwrap();
-        let subkey =
-            hchacha::<R20>(&(*key).into(), &hchacha_input.into());
+        let subkey = hchacha::<R20>(&(*key).into(), &hchacha_input.into());
 
         let mut k = [0u8; 32];
         k.copy_from_slice(subkey.as_slice());
@@ -114,12 +113,11 @@ impl SecretStream {
 
     /// Initialise for **pull** (decryption) from the header bytes.
     fn init_pull(header: &[u8; ENCRYPT_HEADER], key: &[u8; ENCRYPT_KEY_SIZE]) -> Self {
-        use chacha20::hchacha;
         use chacha20::R20;
+        use chacha20::hchacha;
 
         let hchacha_input: [u8; 16] = header[..16].try_into().unwrap();
-        let subkey =
-            hchacha::<R20>(&(*key).into(), &hchacha_input.into());
+        let subkey = hchacha::<R20>(&(*key).into(), &hchacha_input.into());
 
         let mut k = [0u8; 32];
         k.copy_from_slice(subkey.as_slice());
@@ -133,8 +131,8 @@ impl SecretStream {
 
     /// Encrypt a chunk (push) using libsodium secretstream wire semantics.
     fn push(&mut self, plaintext: &[u8], tag: u8) -> Vec<u8> {
-        use chacha20::cipher::{KeyIvInit, StreamCipher};
         use chacha20::ChaCha20;
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
 
         let mlen = plaintext.len();
         let mut out = vec![0u8; 1 + mlen + 16];
@@ -165,8 +163,8 @@ impl SecretStream {
 
     /// Decrypt a chunk (pull) using libsodium secretstream wire semantics.
     fn pull(&mut self, ciphertext: &[u8]) -> Result<(Vec<u8>, u8), ()> {
-        use chacha20::cipher::{KeyIvInit, StreamCipher};
         use chacha20::ChaCha20;
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
 
         if ciphertext.len() < ENCRYPT_CHUNK_OVERHEAD {
             return Err(());
@@ -251,8 +249,8 @@ impl SecretStream {
 
     /// Rekey the stream (called after TAG_FINAL or TAG_REKEY).
     fn rekey(&mut self) {
-        use chacha20::cipher::{KeyIvInit, StreamCipher};
         use chacha20::ChaCha20;
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
 
         // Rekey by XORing the current key and inonce with 40 bytes of stream.
         let mut material = [0u8; 40];
@@ -291,8 +289,7 @@ pub fn encrypted_padding(data_size: usize) -> usize {
     // Number of mac+tag values embedded every 32 KiB in the data stream:
     let stream_chunks = data_size.div_ceil(ENCRYPT_CHUNK_SIZE);
 
-    let enc_size =
-        data_size + PREFIX_SIZE + MIN_PADDING + stream_chunks * ENCRYPT_CHUNK_OVERHEAD;
+    let enc_size = data_size + PREFIX_SIZE + MIN_PADDING + stream_chunks * ENCRYPT_CHUNK_OVERHEAD;
 
     let pad_factor = bit_floor(enc_size.max(131072)) >> 5;
 
@@ -327,8 +324,7 @@ pub fn encrypted_padding(data_size: usize) -> usize {
 pub fn encrypted_size(plaintext_size: usize) -> usize {
     let padding = encrypted_padding(plaintext_size);
     let padded_size = plaintext_size + padding;
-    let tags_size = padded_size.div_ceil(ENCRYPT_CHUNK_SIZE)
-        * ENCRYPT_CHUNK_OVERHEAD;
+    let tags_size = padded_size.div_ceil(ENCRYPT_CHUNK_SIZE) * ENCRYPT_CHUNK_OVERHEAD;
 
     1 /* 'S' identifier */ + ENCRYPT_HEADER + plaintext_size + padding + tags_size
 }
@@ -347,8 +343,7 @@ pub fn decrypted_max_size(enc_size: usize) -> Option<usize> {
     let sz = enc_size - 1 /* 'S' */ - 1 /* minimum padding */ - ENCRYPT_HEADER;
 
     // Figure out how many 17-byte overheads are present:
-    let overhead = sz.div_ceil(ENCRYPTED_CHUNK_TOTAL)
-        * ENCRYPT_CHUNK_OVERHEAD;
+    let overhead = sz.div_ceil(ENCRYPTED_CHUNK_TOTAL) * ENCRYPT_CHUNK_OVERHEAD;
 
     let result = sz.checked_sub(overhead)?;
     // Overflow check (matching C++ `sz > encrypted_size`)
@@ -419,8 +414,7 @@ pub fn encrypt(
 
     let nonce_key = derive_nonce_key(seed, data, domain);
     let nonce: [u8; ENCRYPT_HEADER] = nonce_key[..ENCRYPT_HEADER].try_into().unwrap();
-    let enc_key: [u8; ENCRYPT_KEY_SIZE] =
-        nonce_key[ENCRYPT_HEADER..].try_into().unwrap();
+    let enc_key: [u8; ENCRYPT_KEY_SIZE] = nonce_key[ENCRYPT_HEADER..].try_into().unwrap();
 
     let padding = encrypted_padding(data.len());
     debug_assert!(padding >= 1);
@@ -503,10 +497,7 @@ pub fn encrypt(
 /// Decrypt an attachment produced by [`encrypt`].
 ///
 /// Returns the decrypted, de-padded data.
-pub fn decrypt(
-    ciphertext: &[u8],
-    key: &[u8; ENCRYPT_KEY_SIZE],
-) -> CryptoResult<Vec<u8>> {
+pub fn decrypt(ciphertext: &[u8], key: &[u8; ENCRYPT_KEY_SIZE]) -> CryptoResult<Vec<u8>> {
     let max_size = decrypted_max_size(ciphertext.len()).ok_or_else(|| {
         CryptoError::DecryptionFailed(
             "Attachment decryption failed: encrypted data too short".into(),
@@ -525,8 +516,7 @@ pub fn decrypt(
     }
 
     // Extract header
-    let header: [u8; ENCRYPT_HEADER] =
-        ciphertext[1..1 + ENCRYPT_HEADER].try_into().unwrap();
+    let header: [u8; ENCRYPT_HEADER] = ciphertext[1..1 + ENCRYPT_HEADER].try_into().unwrap();
     let mut stream = SecretStream::init_pull(&header, key);
 
     let enc_data = &ciphertext[1 + ENCRYPT_HEADER..];
@@ -558,9 +548,7 @@ pub fn decrypt(
 
         if !depadded {
             // Look for the 0x01 padding terminator
-            let pad_end = plaintext
-                .iter()
-                .position(|&b| b != 0x00);
+            let pad_end = plaintext.iter().position(|&b| b != 0x00);
 
             if let Some(idx) = pad_end {
                 if plaintext[idx] != 0x01 {
@@ -665,15 +653,14 @@ mod tests {
         let seed = hex!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
 
         let data_sizes = [
-            0, 1, 2, 10, 100, 1000, 2000, 4000, 4053, 4054, 8149, 8150,
-            33333, 261982, 261983, 523990, 523991,
+            0, 1, 2, 10, 100, 1000, 2000, 4000, 4053, 4054, 8149, 8150, 33333, 261982, 261983,
+            523990, 523991,
         ];
 
         for &data_size in &data_sizes {
             let data = make_data(data_size);
 
-            let (enc, key) =
-                encrypt(&seed, &data, Domain::Attachment, false).unwrap();
+            let (enc, key) = encrypt(&seed, &data, Domain::Attachment, false).unwrap();
 
             let expected_size_val = encrypted_size(data_size);
             assert_eq!(
@@ -686,11 +673,7 @@ mod tests {
             );
 
             let decr = decrypt(&enc, &key).unwrap();
-            assert_eq!(
-                decr, data,
-                "data_size={}: roundtrip mismatch",
-                data_size
-            );
+            assert_eq!(decr, data, "data_size={}: roundtrip mismatch", data_size);
         }
     }
 
@@ -701,10 +684,8 @@ mod tests {
         for data_size in [0, 1, 100, 1000, 33333] {
             let data = make_data(data_size);
 
-            let (enc1, key1) =
-                encrypt(&seed, &data, Domain::Attachment, false).unwrap();
-            let (enc2, key2) =
-                encrypt(&seed, &data, Domain::Attachment, false).unwrap();
+            let (enc1, key1) = encrypt(&seed, &data, Domain::Attachment, false).unwrap();
+            let (enc2, key2) = encrypt(&seed, &data, Domain::Attachment, false).unwrap();
 
             assert_eq!(key1, key2, "data_size={}: keys differ", data_size);
             assert_eq!(enc1, enc2, "data_size={}: ciphertexts differ", data_size);
@@ -719,10 +700,8 @@ mod tests {
         for data_size in [0, 20, 100, 1000, 33333] {
             let data = make_data(data_size);
 
-            let (enc1, key1) =
-                encrypt(&seed1, &data, Domain::Attachment, false).unwrap();
-            let (enc2, key2) =
-                encrypt(&seed2, &data, Domain::Attachment, false).unwrap();
+            let (enc1, key1) = encrypt(&seed1, &data, Domain::Attachment, false).unwrap();
+            let (enc2, key2) = encrypt(&seed2, &data, Domain::Attachment, false).unwrap();
 
             assert_ne!(key1, key2);
             assert_ne!(enc1, enc2);
@@ -740,10 +719,8 @@ mod tests {
         for data_size in [0, 20, 100, 1000, 33333] {
             let data = make_data(data_size);
 
-            let (enc1, key1) =
-                encrypt(&seed, &data, Domain::Attachment, false).unwrap();
-            let (enc2, key2) =
-                encrypt(&seed, &data, Domain::ProfilePic, false).unwrap();
+            let (enc1, key1) = encrypt(&seed, &data, Domain::Attachment, false).unwrap();
+            let (enc2, key2) = encrypt(&seed, &data, Domain::ProfilePic, false).unwrap();
 
             assert_ne!(key1, key2);
             assert_ne!(enc1, enc2);
@@ -761,10 +738,8 @@ mod tests {
         let mut data2 = data.clone();
         data2[43210] = 0x42;
 
-        let (enc1, key1) =
-            encrypt(&seed, &data, Domain::Attachment, false).unwrap();
-        let (enc2, key2) =
-            encrypt(&seed, &data2, Domain::Attachment, false).unwrap();
+        let (enc1, key1) = encrypt(&seed, &data, Domain::Attachment, false).unwrap();
+        let (enc2, key2) = encrypt(&seed, &data2, Domain::Attachment, false).unwrap();
 
         assert_ne!(key1, key2);
         assert_eq!(enc1.len(), enc2.len());
@@ -813,8 +788,7 @@ mod tests {
 
         for data_size in [6543210] {
             let data = make_data(data_size);
-            let (enc, key) =
-                encrypt(&seed, &data, Domain::Attachment, true).unwrap();
+            let (enc, key) = encrypt(&seed, &data, Domain::Attachment, true).unwrap();
 
             let expected = encrypted_size(data_size);
             assert_eq!(enc.len(), expected);

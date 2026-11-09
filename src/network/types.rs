@@ -328,7 +328,9 @@ pub struct FileMetadata {
 /// Path metadata for onion routing.
 #[derive(Debug, Clone)]
 pub enum PathMetadata {
-    OnionPath { category: PathCategory },
+    OnionPath {
+        category: PathCategory,
+    },
     SessionRouterTunnel {
         destination_pubkey: String,
         destination_snode_address: String,
@@ -402,9 +404,8 @@ pub fn find_uniform_batch_error(body: &str) -> Option<i16> {
 pub type NodeFailureReporter = Box<dyn Fn(&Ed25519Pubkey, bool) + Send + Sync>;
 
 /// Network response callback type.
-pub type NetworkResponseCallback = Box<
-    dyn FnOnce(bool, bool, i16, Vec<(String, String)>, Option<String>) + Send + 'static,
->;
+pub type NetworkResponseCallback =
+    Box<dyn FnOnce(bool, bool, i16, Vec<(String, String)>, Option<String>) + Send + 'static>;
 
 // ---------------------------------------------------------------------------
 // Helpers

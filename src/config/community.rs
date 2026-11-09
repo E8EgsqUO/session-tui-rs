@@ -16,8 +16,7 @@ pub const ROOM_MAX_LENGTH: usize = 64;
 const QS_PUBKEY: &str = "?public_key=";
 
 /// Maximum length of a full community URL (including null terminator space).
-pub const FULL_URL_MAX_LENGTH: usize =
-    BASE_URL_MAX_LENGTH + 3 /* "/r/" */ + ROOM_MAX_LENGTH + QS_PUBKEY.len() + 64 /* pubkey hex */ + 1; /* null terminator */
+pub const FULL_URL_MAX_LENGTH: usize = BASE_URL_MAX_LENGTH + 3 /* "/r/" */ + ROOM_MAX_LENGTH + QS_PUBKEY.len() + 64 /* pubkey hex */ + 1; /* null terminator */
 
 /// Errors that can occur during community URL parsing.
 #[derive(Debug, thiserror::Error)]
@@ -119,13 +118,12 @@ fn parse_url(url: &str) -> Result<ParsedUrl, CommunityError> {
             .map_err(|_| CommunityError::InvalidPort)?;
         let rest = &port_str[end..];
         // Suppress default ports
-        let port = if (port_val == 80 && proto == "http://")
-            || (port_val == 443 && proto == "https://")
-        {
-            None
-        } else {
-            Some(port_val)
-        };
+        let port =
+            if (port_val == 80 && proto == "http://") || (port_val == 443 && proto == "https://") {
+                None
+            } else {
+                Some(port_val)
+            };
         (port, rest)
     } else {
         (None, rest)
@@ -271,9 +269,7 @@ pub fn parse_full_url(full_url: &str) -> Result<(String, String, [u8; 32]), Comm
 /// Parses a full or partial community URL into `(base_url, room, Option<pubkey>)`.
 ///
 /// The public key is optional; if missing, the third element is `None`.
-pub fn parse_partial_url(
-    url: &str,
-) -> Result<(String, String, Option<[u8; 32]>), CommunityError> {
+pub fn parse_partial_url(url: &str) -> Result<(String, String, Option<[u8; 32]>), CommunityError> {
     let mut url = url.to_string();
     let mut maybe_pubkey: Option<[u8; 32]> = None;
 
@@ -305,9 +301,7 @@ pub fn parse_partial_url(
 ///
 /// The URL format is: `{base_url}/{room}?public_key={hex_pubkey}`
 pub fn make_full_url(base_url: &str, room: &str, pubkey: &[u8; 32]) -> String {
-    let mut url = String::with_capacity(
-        base_url.len() + 1 + room.len() + QS_PUBKEY.len() + 64,
-    );
+    let mut url = String::with_capacity(base_url.len() + 1 + room.len() + QS_PUBKEY.len() + 64);
     url.push_str(base_url);
     url.push('/');
     url.push_str(room);
@@ -334,11 +328,7 @@ impl Community {
     ///
     /// The base URL will be canonicalized. The room token is validated and stored
     /// in both canonical (lower-case) and original-case forms.
-    pub fn new(
-        base_url: &str,
-        room: &str,
-        pubkey: &[u8; 32],
-    ) -> Result<Self, CommunityError> {
+    pub fn new(base_url: &str, room: &str, pubkey: &[u8; 32]) -> Result<Self, CommunityError> {
         let canonical_base = canonical_url(base_url)?;
         let canonical_rm = canonical_room(room)?;
         Ok(Community {
@@ -508,8 +498,7 @@ mod tests {
 
     #[test]
     fn test_parse_partial_url_no_pubkey() {
-        let (base, room, pk) =
-            parse_partial_url("https://example.com/r/TestRoom").unwrap();
+        let (base, room, pk) = parse_partial_url("https://example.com/r/TestRoom").unwrap();
         assert_eq!(base, "https://example.com");
         assert_eq!(room, "TestRoom");
         assert!(pk.is_none());
@@ -517,10 +506,9 @@ mod tests {
 
     #[test]
     fn test_make_full_url() {
-        let pubkey = hex::decode(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        )
-        .unwrap();
+        let pubkey =
+            hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                .unwrap();
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&pubkey);
         let url = make_full_url("https://example.com", "TestRoom", &pk);
@@ -532,10 +520,9 @@ mod tests {
 
     #[test]
     fn test_community_struct() {
-        let pubkey = hex::decode(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        )
-        .unwrap();
+        let pubkey =
+            hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                .unwrap();
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&pubkey);
         let comm = Community::new("https://example.com", "TestRoom", &pk).unwrap();

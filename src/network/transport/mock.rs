@@ -46,10 +46,7 @@ impl MockTransport {
             response: TransportResponse {
                 status_code: 200,
                 body: body.into(),
-                headers: vec![(
-                    "Content-Type".to_string(),
-                    "application/json".to_string(),
-                )],
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             },
         });
     }

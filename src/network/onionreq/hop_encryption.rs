@@ -10,10 +10,7 @@
 //!    Shared key = HMAC-SHA256(salt="LOKI", DH(local_sk, remote_pk))
 //!    IV (16 bytes) is prepended, followed by ciphertext, followed by 16-byte tag.
 
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce as AesNonce,
-    aead::Aead,
-};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce as AesNonce, aead::Aead};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngExt;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -143,9 +140,7 @@ impl HopEncryption {
         let mut nonce_bytes = [0u8; XCHACHA20_NONCE_SIZE];
         rand::rng().fill(&mut nonce_bytes[..]);
 
-        let cipher = XChaCha20Poly1305::new(
-            chacha20poly1305::Key::from_slice(&key),
-        );
+        let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
         let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
 
         let encrypted = cipher
@@ -178,9 +173,7 @@ impl HopEncryption {
             !self.server,
         )?;
 
-        let cipher = XChaCha20Poly1305::new(
-            chacha20poly1305::Key::from_slice(&key),
-        );
+        let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
         let nonce = chacha20poly1305::XNonce::from_slice(nonce_bytes);
 
         cipher
@@ -308,9 +301,8 @@ fn derive_aesgcm_key(
     let shared_secret = dh(secret, public)?;
 
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(b"LOKI")
-            .map_err(|e| HopEncryptionError::EncryptionFailed(e.to_string()))?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(b"LOKI")
+        .map_err(|e| HopEncryptionError::EncryptionFailed(e.to_string()))?;
     Mac::update(&mut mac, &shared_secret);
     let result = mac.finalize();
 
@@ -408,8 +400,14 @@ mod tests {
 
     #[test]
     fn test_response_long_enough() {
-        assert!(!HopEncryption::response_long_enough(EncryptType::XChaCha20, 0));
-        assert!(HopEncryption::response_long_enough(EncryptType::XChaCha20, 16));
+        assert!(!HopEncryption::response_long_enough(
+            EncryptType::XChaCha20,
+            0
+        ));
+        assert!(HopEncryption::response_long_enough(
+            EncryptType::XChaCha20,
+            16
+        ));
         assert!(!HopEncryption::response_long_enough(EncryptType::AesGcm, 0));
         assert!(HopEncryption::response_long_enough(EncryptType::AesGcm, 32));
     }

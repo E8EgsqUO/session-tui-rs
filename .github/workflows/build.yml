@@ -7,6 +7,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
@@ -15,7 +17,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    name: Format, Clippy and tests (Rust 1.93)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build requirements
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: quality-1.93-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      # Existing style warnings remain visible. Correctness lints and compiler
+      # errors block the build; no blanket lint suppression is introduced.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness
+      - name: Tests (library and TUI)
+        run: cargo test --locked --all-targets
+
+  dependency-audit:
+    name: Dependency security audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      # No advisory IDs are ignored. Informational warnings are tracked in
+      # docs/ENGINEERING_AUDIT.md; vulnerabilities fail this job by default.
+      - name: Audit locked dependencies
+        run: cargo audit
+
   linux-x86_64:
+    if: github.event_name != 'schedule'
     name: Linux x86_64
     runs-on: ubuntu-24.04
     steps:
@@ -44,6 +90,7 @@ jobs:
           if-no-files-found: error
 
   macos-arm64:
+    if: github.event_name != 'schedule'
     name: macOS ARM64
     runs-on: macos-15
     steps:
@@ -72,6 +119,7 @@ jobs:
           if-no-files-found: error
 
   windows-x86_64:
+    if: github.event_name != 'schedule'
     name: Windows x86_64 (GNU)
     runs-on: ubuntu-24.04
     steps:
@@ -106,7 +154,7 @@ jobs:
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-x86_64, macos-arm64, windows-x86_64]
+    needs: [quality, dependency-audit, linux-x86_64, macos-arm64, windows-x86_64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

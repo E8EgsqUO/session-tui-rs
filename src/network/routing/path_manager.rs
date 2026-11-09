@@ -309,12 +309,10 @@ mod tests {
     fn test_pool_too_small_errors() {
         let mut mgr = PathManager::new(PathManagerConfig::default());
         let pool = pool_with(2);
-        assert!(
-            matches!(
-                mgr.build_one(PathCategory::Standard, &pool),
-                Err(PathManagerError::PoolTooSmall { .. })
-            )
-        );
+        assert!(matches!(
+            mgr.build_one(PathCategory::Standard, &pool),
+            Err(PathManagerError::PoolTooSmall { .. })
+        ));
     }
 
     #[test]
@@ -324,19 +322,25 @@ mod tests {
             path_strike_threshold: 3,
         });
         let pool = pool_with(20);
-        let n = mgr.build_up_to_target(PathCategory::Standard, &pool).unwrap();
+        let n = mgr
+            .build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
         assert_eq!(n, 2);
         assert_eq!(mgr.path_count(PathCategory::Standard), 2);
 
         let paths = mgr.paths(PathCategory::Standard);
-        assert_ne!(paths[0].guard().ed25519_pubkey, paths[1].guard().ed25519_pubkey);
+        assert_ne!(
+            paths[0].guard().ed25519_pubkey,
+            paths[1].guard().ed25519_pubkey
+        );
     }
 
     #[test]
     fn test_standard_and_file_are_independent() {
         let mut mgr = PathManager::new(PathManagerConfig::default());
         let pool = pool_with(20);
-        mgr.build_up_to_target(PathCategory::Standard, &pool).unwrap();
+        mgr.build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
         mgr.build_up_to_target(PathCategory::File, &pool).unwrap();
         assert!(mgr.path_count(PathCategory::Standard) > 0);
         assert!(mgr.path_count(PathCategory::File) > 0);
@@ -349,11 +353,10 @@ mod tests {
             path_strike_threshold: 3,
         });
         let pool = pool_with(20);
-        mgr.build_up_to_target(PathCategory::Standard, &pool).unwrap();
+        mgr.build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
 
-        let guard = mgr.paths(PathCategory::Standard)[0]
-            .guard()
-            .ed25519_pubkey;
+        let guard = mgr.paths(PathCategory::Standard)[0].guard().ed25519_pubkey;
 
         mgr.record_failure(PathCategory::Standard, &guard);
         assert_eq!(mgr.path_count(PathCategory::Standard), 1);
@@ -370,10 +373,9 @@ mod tests {
             path_strike_threshold: 3,
         });
         let pool = pool_with(20);
-        mgr.build_up_to_target(PathCategory::Standard, &pool).unwrap();
-        let old_guard = mgr.paths(PathCategory::Standard)[0]
-            .guard()
-            .ed25519_pubkey;
+        mgr.build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
+        let old_guard = mgr.paths(PathCategory::Standard)[0].guard().ed25519_pubkey;
 
         let new_path = mgr
             .rebuild_path(PathCategory::Standard, &old_guard, &pool)
@@ -386,7 +388,8 @@ mod tests {
     fn test_clear_removes_all() {
         let mut mgr = PathManager::new(PathManagerConfig::default());
         let pool = pool_with(20);
-        mgr.build_up_to_target(PathCategory::Standard, &pool).unwrap();
+        mgr.build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
         assert!(mgr.path_count(PathCategory::Standard) > 0);
         mgr.clear(PathCategory::Standard);
         assert_eq!(mgr.path_count(PathCategory::Standard), 0);

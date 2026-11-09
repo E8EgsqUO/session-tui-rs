@@ -92,11 +92,7 @@ impl ResponseParser {
 
     /// Decrypts raw ciphertext from an onion response.
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, ResponseParserError> {
-        let dec = HopEncryption::new(
-            self.x25519_keypair.1.clone(),
-            self.x25519_keypair.0,
-            false,
-        );
+        let dec = HopEncryption::new(self.x25519_keypair.1.clone(), self.x25519_keypair.0, false);
 
         // Try primary encryption type first
         match dec.decrypt(self.enc_type, ciphertext, &self.destination_x25519_pubkey) {
@@ -110,9 +106,7 @@ impl ResponseParser {
                         &self.destination_x25519_pubkey,
                     )
                     .map_err(|_| {
-                        ResponseParserError::DecryptionFailed(
-                            DECRYPTION_FAILED_ERROR.into(),
-                        )
+                        ResponseParserError::DecryptionFailed(DECRYPTION_FAILED_ERROR.into())
                     })
                 } else {
                     Err(ResponseParserError::DecryptionFailed(
@@ -167,10 +161,9 @@ impl ResponseParser {
         };
 
         use base64::Engine;
-        let iv_and_ciphertext =
-            base64::engine::general_purpose::STANDARD
-                .decode(&base64_data)
-                .map_err(|e| ResponseParserError::Base64Error(e.to_string()))?;
+        let iv_and_ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(&base64_data)
+            .map_err(|e| ResponseParserError::Base64Error(e.to_string()))?;
 
         let decrypted = self.decrypt(&iv_and_ciphertext)?;
 
@@ -183,9 +176,7 @@ impl ResponseParser {
             .and_then(|v| v.as_i64())
             .or_else(|| result_json.get("status").and_then(|v| v.as_i64()))
             .ok_or_else(|| {
-                ResponseParserError::InvalidFormat(
-                    "Missing required status_code field".into(),
-                )
+                ResponseParserError::InvalidFormat("Missing required status_code field".into())
             })? as i16;
 
         // Extract headers
@@ -223,8 +214,8 @@ impl ResponseParser {
 
         // Parse bencoded list: l<string1><string2>e
         // First string is response info JSON, second (optional) is body
-        let parsed = parse_bencode_list(&decrypted)
-            .map_err(|e| ResponseParserError::InvalidFormat(e))?;
+        let parsed =
+            parse_bencode_list(&decrypted).map_err(|e| ResponseParserError::InvalidFormat(e))?;
 
         if parsed.is_empty() {
             return Err(ResponseParserError::InvalidFormat(
@@ -232,9 +223,8 @@ impl ResponseParser {
             ));
         }
 
-        let response_info: serde_json::Value =
-            serde_json::from_slice(&parsed[0])
-                .map_err(|e| ResponseParserError::JsonError(e.to_string()))?;
+        let response_info: serde_json::Value = serde_json::from_slice(&parsed[0])
+            .map_err(|e| ResponseParserError::JsonError(e.to_string()))?;
 
         let status_code = response_info
             .get("code")
@@ -354,7 +344,12 @@ mod tests {
         let wrapped = serde_json::json!({"result": b64}).to_string();
 
         // Client decrypts
-        let parser = ResponseParser::new(dest_pk, (client_pk, client_sk), EncryptType::XChaCha20, false);
+        let parser = ResponseParser::new(
+            dest_pk,
+            (client_pk, client_sk),
+            EncryptType::XChaCha20,
+            false,
+        );
         let resp = parser.decrypted_response(&wrapped).unwrap();
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.body.as_deref(), Some("ok"));

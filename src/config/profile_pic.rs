@@ -102,8 +102,7 @@ mod tests {
     #[test]
     fn test_clear() {
         let key = vec![0xABu8; 32];
-        let mut pic =
-            ProfilePic::with_url_and_key("https://example.com/pic.jpg", key).unwrap();
+        let mut pic = ProfilePic::with_url_and_key("https://example.com/pic.jpg", key).unwrap();
         assert!(!pic.is_empty());
         pic.clear();
         assert!(pic.is_empty());

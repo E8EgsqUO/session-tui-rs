@@ -18,11 +18,12 @@ pub fn hash(size: usize, msg: &[u8], key: Option<&[u8]>) -> CryptoResult<Vec<u8>
     }
 
     if let Some(k) = key
-        && k.len() > 64 {
-            return Err(CryptoError::InvalidInput(
-                "key must be less than 65 bytes".into(),
-            ));
-        }
+        && k.len() > 64
+    {
+        return Err(CryptoError::InvalidInput(
+            "key must be less than 65 bytes".into(),
+        ));
+    }
 
     let mut params = blake2b_simd::Params::new();
     params.hash_length(size);
@@ -73,8 +74,7 @@ mod tests {
     fn test_hash_unkeyed_64() {
         let h5 = hash(64, b"TestMessage", None).unwrap();
         assert_eq!(h5.len(), 64);
-        let expected =
-            "9d9085ac026fe3542abbeb2ea2ec05f5c37aecd7695f6cc41e9ccf39014196a3\
+        let expected = "9d9085ac026fe3542abbeb2ea2ec05f5c37aecd7695f6cc41e9ccf39014196a3\
              9c02db69c4416d5c45acc2e9469b7f274992b2858f3bb2746becb48c8b56ce4b";
         assert_eq!(hex::encode(&h5), expected);
     }
@@ -83,8 +83,7 @@ mod tests {
     fn test_hash_keyed_64() {
         let h6 = hash(64, b"TestMessage", Some(b"TestKey")).unwrap();
         assert_eq!(h6.len(), 64);
-        let expected =
-            "6a2faad89cf9010a4270cba07cc96cfb36688106e080b15fef66bb03c68e8778\
+        let expected = "6a2faad89cf9010a4270cba07cc96cfb36688106e080b15fef66bb03c68e8778\
              74c9059edf53d03c1330b2655efdad6e4aa259118b6ea88698ea038efb9d52ce";
         assert_eq!(hex::encode(&h6), expected);
     }
@@ -109,7 +108,8 @@ mod tests {
 
     #[test]
     fn test_hash_key_too_long() {
-        let long_key = b"KeyThatIsTooLongKeyThatIsTooLongKeyThatIsTooLongKeyThatIsTooLongKeyThatIsTooLong";
+        let long_key =
+            b"KeyThatIsTooLongKeyThatIsTooLongKeyThatIsTooLongKeyThatIsTooLongKeyThatIsTooLong";
         assert!(long_key.len() > 64);
         assert!(hash(32, b"TestMessage", Some(long_key)).is_err());
     }

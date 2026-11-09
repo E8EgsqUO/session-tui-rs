@@ -20,8 +20,7 @@ pub fn default_config() -> FileServerConfig {
         scheme: "http".to_string(),
         host: "filev2.getsession.org".to_string(),
         port: 80,
-        pubkey_hex: "da21e1d886c6fbaea313f75298bd64aab03a97ce985b46bb2dad9f2089c8ee59"
-            .to_string(),
+        pubkey_hex: "da21e1d886c6fbaea313f75298bd64aab03a97ce985b46bb2dad9f2089c8ee59".to_string(),
         max_file_size: 10_000_000,
         use_stream_encryption: false,
     }
@@ -68,8 +67,8 @@ pub struct DownloadInfo {
 ///   - `https://example.com/file/abc123#p=da21e...&d`
 pub fn parse_download_url(url: &str) -> Option<DownloadInfo> {
     // Try matching /file/{id} pattern
-    let (base, file_id) = match_file_endpoint(url, "/file/")
-        .or_else(|| match_file_endpoint(url, "/files/"))?;
+    let (base, file_id) =
+        match_file_endpoint(url, "/file/").or_else(|| match_file_endpoint(url, "/files/"))?;
 
     if file_id.is_empty() {
         return None;
@@ -103,10 +102,7 @@ pub fn parse_download_url(url: &str) -> Option<DownloadInfo> {
             } else if fragment.starts_with(&format!("{}=", FRAGMENT_PUBKEY)) {
                 let pk_value = &fragment[2..];
                 // Must be 64 hex chars and not the default pubkey
-                if pk_value.len() == 64
-                    && hex::decode(pk_value).is_ok()
-                    && pk_value != default_pk
-                {
+                if pk_value.len() == 64 && hex::decode(pk_value).is_ok() && pk_value != default_pk {
                     info.custom_pubkey_hex = Some(pk_value.to_string());
                 }
             }
@@ -151,12 +147,8 @@ pub struct FileMetadata {
 }
 
 /// Parses an upload response JSON into file metadata.
-pub fn parse_upload_response(
-    body: &str,
-    upload_size: usize,
-) -> Result<FileMetadata, String> {
-    let json: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| e.to_string())?;
+pub fn parse_upload_response(body: &str, upload_size: usize) -> Result<FileMetadata, String> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
 
     let id = json
         .get("id")
@@ -164,22 +156,15 @@ pub fn parse_upload_response(
         .ok_or("Upload response missing required 'id' field")?
         .to_string();
 
-    let mut size = json
-        .get("size")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let mut size = json.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
 
     if size == 0 {
         size = upload_size as i64;
     }
 
-    let uploaded = json
-        .get("uploaded")
-        .and_then(|v| v.as_i64());
+    let uploaded = json.get("uploaded").and_then(|v| v.as_i64());
 
-    let expiry = json
-        .get("expires")
-        .and_then(|v| v.as_i64());
+    let expiry = json.get("expires").and_then(|v| v.as_i64());
 
     Ok(FileMetadata {
         id,
@@ -290,8 +275,8 @@ mod tests {
     #[test]
     fn test_generate_download_url_with_custom_pubkey() {
         let mut config = default_config();
-        config.pubkey_hex = "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd"
-            .to_string();
+        config.pubkey_hex =
+            "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd".to_string();
         let url = generate_download_url("abc123", &config);
         assert!(url.contains("#p=aabbccdd"));
     }
@@ -299,8 +284,8 @@ mod tests {
     #[test]
     fn test_generate_download_url_with_both() {
         let mut config = default_config();
-        config.pubkey_hex = "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd"
-            .to_string();
+        config.pubkey_hex =
+            "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd".to_string();
         config.use_stream_encryption = true;
         let url = generate_download_url("abc123", &config);
         assert!(url.contains("#p=aabbccdd"));

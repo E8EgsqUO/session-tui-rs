@@ -21,7 +21,7 @@ use crate::network::onionreq::response_parser::{
     DecryptedResponse, ResponseParser, ResponseParserError,
 };
 use crate::network::routing::path_manager::{
-    PathCategory, PathManager, PathManagerError, PATH_HOPS,
+    PATH_HOPS, PathCategory, PathManager, PathManagerError,
 };
 use crate::network::snode_pool::SnodePool;
 use crate::network::transport::{Transport, TransportError, TransportRequest};
@@ -136,12 +136,7 @@ impl OnionRequestRouter {
         };
 
         // 2. Build the onion blob.
-        let mut builder = Builder::make(
-            destination,
-            endpoint,
-            &path.hops,
-            EncryptType::XChaCha20,
-        )?;
+        let mut builder = Builder::make(destination, endpoint, &path.hops, EncryptType::XChaCha20)?;
         let blob = builder.generate_onion_blob(Some(body_json))?;
 
         // 3. Send to the guard snode's /onion_req/v2 endpoint.
@@ -207,16 +202,14 @@ pub const REQUIRED_PATH_HOPS: usize = PATH_HOPS;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::ed25519 as ed;
+    use crate::network::key_types::Ed25519Pubkey;
     use crate::network::routing::path_manager::{PathManager, PathManagerConfig};
     use crate::network::service_node::ServiceNode;
     use crate::network::snode_pool::{SnodePool, SnodePoolConfig};
-    use crate::network::transport::{
-        MockRoute, MockTransport, TransportResponse,
-    };
-    use crate::network::types::NetworkDestination;
     use crate::network::swarm::INVALID_SWARM_ID;
-    use crate::network::key_types::Ed25519Pubkey;
-    use crate::crypto::ed25519 as ed;
+    use crate::network::transport::{MockRoute, MockTransport, TransportResponse};
+    use crate::network::types::NetworkDestination;
 
     /// Build a `ServiceNode` from a seed that is actually a valid ed25519
     /// point (the Builder needs to compute an X25519 key from it).
@@ -254,7 +247,8 @@ mod tests {
             target_paths_per_category: 1,
             path_strike_threshold: 1, // retire immediately on strike
         });
-        mgr.build_up_to_target(PathCategory::Standard, &pool).unwrap();
+        mgr.build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
 
         let t = MockTransport::new();
         t.route(MockRoute {
@@ -292,7 +286,8 @@ mod tests {
             target_paths_per_category: 1,
             path_strike_threshold: 1,
         });
-        mgr.build_up_to_target(PathCategory::Standard, &pool).unwrap();
+        mgr.build_up_to_target(PathCategory::Standard, &pool)
+            .unwrap();
 
         // Empty routes → every request fails with TransportError::Other.
         let t = MockTransport::new();

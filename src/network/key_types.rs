@@ -274,10 +274,7 @@ pub type X25519Keypair = (X25519Pubkey, X25519Seckey);
 /// Converts an Ed25519 public key to an X25519 public key.
 pub fn compute_x25519_pubkey(ed25519_pk: &Ed25519Pubkey) -> KeyResult<X25519Pubkey> {
     let x_pk = to_curve25519_pubkey(ed25519_pk.as_bytes()).map_err(|e| {
-        KeyError::ConversionFailed(format!(
-            "Failed to convert Ed25519 pubkey to X25519: {}",
-            e
-        ))
+        KeyError::ConversionFailed(format!("Failed to convert Ed25519 pubkey to X25519: {}", e))
     })?;
     Ok(X25519Pubkey(x_pk))
 }
@@ -408,8 +405,7 @@ mod tests {
 
     #[test]
     fn test_ed25519_pubkey_from_bytes() {
-        let bytes =
-            hex!("4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7");
+        let bytes = hex!("4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7");
         let pk = Ed25519Pubkey::from_bytes(&bytes).unwrap();
         assert_eq!(
             pk.hex(),

@@ -24,8 +24,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::config_base::field_helpers::*;
 use crate::config::config_base::ConfigType;
+use crate::config::config_base::field_helpers::*;
 use crate::config::config_message::{ConfigData, ConfigValue};
 use crate::config::namespaces::Namespace;
 
@@ -207,8 +207,7 @@ impl ConvoInfoVolatile {
 
     /// Sets blinded one-to-one info.
     pub fn set_blinded(&mut self, convo: ConvoBlindedOneToOne) {
-        self.blinded
-            .insert(convo.blinded_session_id.clone(), convo);
+        self.blinded.insert(convo.blinded_session_id.clone(), convo);
     }
 
     /// Erases blinded one-to-one info.
@@ -397,10 +396,7 @@ impl ConfigType for ConvoInfoVolatile {
                     if let ConfigValue::Dict(rd) = rooms {
                         let mut room_dict = ConfigData::new();
                         store_convo_base(&mut room_dict, &convo.base);
-                        rd.insert(
-                            convo.room.as_bytes().to_vec(),
-                            ConfigValue::Dict(room_dict),
-                        );
+                        rd.insert(convo.room.as_bytes().to_vec(), ConfigValue::Dict(room_dict));
                     }
                 }
             }
@@ -414,12 +410,14 @@ impl ConfigType for ConvoInfoVolatile {
             let mut dict = ConfigData::new();
             for (id, convo) in &self.groups {
                 // Strip "03" prefix for key
-                if id.len() == 66 && id.starts_with("03")
-                    && let Ok(key_bytes) = hex::decode(&id[2..]) {
-                        let mut convo_dict = ConfigData::new();
-                        store_convo_base(&mut convo_dict, &convo.base);
-                        dict.insert(key_bytes, ConfigValue::Dict(convo_dict));
-                    }
+                if id.len() == 66
+                    && id.starts_with("03")
+                    && let Ok(key_bytes) = hex::decode(&id[2..])
+                {
+                    let mut convo_dict = ConfigData::new();
+                    store_convo_base(&mut convo_dict, &convo.base);
+                    dict.insert(key_bytes, ConfigValue::Dict(convo_dict));
+                }
             }
             data.insert(b"g".to_vec(), ConfigValue::Dict(dict));
         }
@@ -480,7 +478,10 @@ mod tests {
             },
         });
         assert_eq!(civ.size(), 1);
-        assert_eq!(civ.get_1to1("05abcdef").unwrap().base.last_read, 1700000000000);
+        assert_eq!(
+            civ.get_1to1("05abcdef").unwrap().base.last_read,
+            1700000000000
+        );
 
         civ.erase_1to1("05abcdef");
         assert_eq!(civ.size(), 0);
@@ -525,9 +526,8 @@ mod tests {
 
     #[test]
     fn test_config_base() {
-        let seed = hex_literal::hex!(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000"
-        );
+        let seed =
+            hex_literal::hex!("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let base: ConfigBase<ConvoInfoVolatile> = ConfigBase::new(&seed, None).unwrap();
         assert_eq!(base.get().size(), 0);
     }

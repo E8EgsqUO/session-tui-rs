@@ -24,8 +24,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::config_base::field_helpers::*;
 use crate::config::config_base::ConfigType;
+use crate::config::config_base::field_helpers::*;
 use crate::config::config_message::{ConfigData, ConfigValue, ScalarValue};
 use crate::config::namespaces::Namespace;
 use crate::config::notify::NotifyMode;
@@ -350,8 +350,7 @@ impl UserGroups {
 
     /// Sets a legacy group.
     pub fn set_legacy_group(&mut self, group: LegacyGroupInfo) {
-        self.legacy_groups
-            .insert(group.session_id.clone(), group);
+        self.legacy_groups.insert(group.session_id.clone(), group);
     }
 
     /// Erases a legacy group. Returns true if found.
@@ -377,9 +376,11 @@ impl UserGroups {
     /// Sets a community.
     pub fn set_community(&mut self, comm: CommunityInfo) {
         let room_lower = comm.room.to_ascii_lowercase();
-        if let Some(existing) = self.communities.iter_mut().find(|c| {
-            c.base_url == comm.base_url && c.room.to_ascii_lowercase() == room_lower
-        }) {
+        if let Some(existing) = self
+            .communities
+            .iter_mut()
+            .find(|c| c.base_url == comm.base_url && c.room.to_ascii_lowercase() == room_lower)
+        {
             *existing = comm;
         } else {
             self.communities.push(comm);
@@ -390,9 +391,8 @@ impl UserGroups {
     pub fn erase_community(&mut self, base_url: &str, room: &str) -> bool {
         let room_lower = room.to_ascii_lowercase();
         let before = self.communities.len();
-        self.communities.retain(|c| {
-            !(c.base_url == base_url && c.room.to_ascii_lowercase() == room_lower)
-        });
+        self.communities
+            .retain(|c| !(c.base_url == base_url && c.room.to_ascii_lowercase() == room_lower));
         self.communities.len() < before
     }
 
@@ -548,10 +548,7 @@ impl ConfigType for UserGroups {
                         comm.base.store_common(&mut room_dict);
                         // Always store the room display name
                         set_str_always(&mut room_dict, b"n", &comm.base.name);
-                        rd.insert(
-                            comm.room.as_bytes().to_vec(),
-                            ConfigValue::Dict(room_dict),
-                        );
+                        rd.insert(comm.room.as_bytes().to_vec(), ConfigValue::Dict(room_dict));
                     }
                 }
             }
@@ -575,13 +572,16 @@ mod tests {
     fn test_new_group_crud() {
         let mut ug = UserGroups::default();
 
-        let mut g = GroupInfo::new("0300000000000000000000000000000000000000000000000000000000000000aa");
+        let mut g =
+            GroupInfo::new("0300000000000000000000000000000000000000000000000000000000000000aa");
         g.base.name = "Test Group".into();
         g.secretkey = vec![0xAA; 32];
         ug.set_group(g);
 
         assert_eq!(ug.size(), 1);
-        let found = ug.get_group("0300000000000000000000000000000000000000000000000000000000000000aa").unwrap();
+        let found = ug
+            .get_group("0300000000000000000000000000000000000000000000000000000000000000aa")
+            .unwrap();
         assert_eq!(found.base.name, "Test Group");
     }
 
@@ -613,7 +613,8 @@ mod tests {
     fn test_roundtrip() {
         let mut ug = UserGroups::default();
 
-        let mut g = GroupInfo::new("0300000000000000000000000000000000000000000000000000000000000000bb");
+        let mut g =
+            GroupInfo::new("0300000000000000000000000000000000000000000000000000000000000000bb");
         g.base.name = "My Group".into();
         g.base.priority = 5;
         ug.set_group(g);
@@ -624,16 +625,17 @@ mod tests {
         let mut loaded = UserGroups::default();
         loaded.load_from_data(&data);
 
-        let found = loaded.get_group("0300000000000000000000000000000000000000000000000000000000000000bb").unwrap();
+        let found = loaded
+            .get_group("0300000000000000000000000000000000000000000000000000000000000000bb")
+            .unwrap();
         assert_eq!(found.base.name, "My Group");
         assert_eq!(found.base.priority, 5);
     }
 
     #[test]
     fn test_config_base() {
-        let seed = hex_literal::hex!(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000"
-        );
+        let seed =
+            hex_literal::hex!("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let base: ConfigBase<UserGroups> = ConfigBase::new(&seed, None).unwrap();
         assert_eq!(base.get().size(), 0);
     }

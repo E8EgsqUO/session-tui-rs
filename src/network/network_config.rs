@@ -66,8 +66,7 @@ impl RetryDelay {
             return self.base_delay;
         }
 
-        let delay_ms =
-            self.base_delay.as_millis() as f64 * 2.0f64.powi(failure_count - 1);
+        let delay_ms = self.base_delay.as_millis() as f64 * 2.0f64.powi(failure_count - 1);
         let final_delay = Duration::from_millis(delay_ms as u64);
 
         std::cmp::min(final_delay, self.max_delay)

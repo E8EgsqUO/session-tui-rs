@@ -219,12 +219,13 @@ fn decode_dict(data: &[u8], pos: usize, depth: usize) -> Result<(BtValue, usize)
 
         // Verify keys are in sorted order
         if let Some(ref prev) = last_key
-            && key <= *prev {
-                return Err(BencodeError::InvalidData(
-                    current,
-                    "dict keys not in sorted order or duplicate key".into(),
-                ));
-            }
+            && key <= *prev
+        {
+            return Err(BencodeError::InvalidData(
+                current,
+                "dict keys not in sorted order or duplicate key".into(),
+            ));
+        }
         last_key = Some(key.clone());
 
         let (val, after_val) = decode_value(data, after_key, depth + 1)?;
@@ -341,10 +342,7 @@ mod tests {
 
     #[test]
     fn test_encode_string() {
-        assert_eq!(
-            encode(&BtValue::String(b"spam".to_vec())),
-            b"4:spam"
-        );
+        assert_eq!(encode(&BtValue::String(b"spam".to_vec())), b"4:spam");
         assert_eq!(encode(&BtValue::String(vec![])), b"0:");
     }
 
@@ -483,8 +481,16 @@ mod tests {
 
     #[test]
     fn test_merge_sorted_lists() {
-        let a = vec![BtValue::Integer(1), BtValue::Integer(3), BtValue::Integer(5)];
-        let b = vec![BtValue::Integer(2), BtValue::Integer(3), BtValue::Integer(4)];
+        let a = vec![
+            BtValue::Integer(1),
+            BtValue::Integer(3),
+            BtValue::Integer(5),
+        ];
+        let b = vec![
+            BtValue::Integer(2),
+            BtValue::Integer(3),
+            BtValue::Integer(4),
+        ];
 
         let merged = merge_sorted_lists(&a, &b);
         assert_eq!(

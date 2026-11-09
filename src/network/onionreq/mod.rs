@@ -4,10 +4,10 @@
 //! service node network. Supports both XChaCha20-Poly1305 and AES-256-GCM
 //! encryption modes.
 
-/// Per-hop encryption/decryption using XChaCha20-Poly1305 or AES-256-GCM.
-pub mod hop_encryption;
 /// Onion request payload builder with layered encryption.
 pub mod builder;
+/// Per-hop encryption/decryption using XChaCha20-Poly1305 or AES-256-GCM.
+pub mod hop_encryption;
 /// Server-side onion request parser for decrypting incoming requests.
 pub mod parser;
 /// Client-side response parser for decrypting onion-routed responses.

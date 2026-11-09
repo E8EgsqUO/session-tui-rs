@@ -6,7 +6,9 @@
 //! Port of `session::onionreq::OnionReqParser` from the C++ code.
 
 use crate::network::key_types::{X25519Keypair, X25519Pubkey, X25519Seckey};
-use crate::network::onionreq::hop_encryption::{EncryptType, HopEncryption, HopEncryptionError, parse_enc_type};
+use crate::network::onionreq::hop_encryption::{
+    EncryptType, HopEncryption, HopEncryptionError, parse_enc_type,
+};
 
 /// Maximum size of an onion request accepted by default (10 MiB).
 pub const DEFAULT_MAX_SIZE: usize = 10_485_760;

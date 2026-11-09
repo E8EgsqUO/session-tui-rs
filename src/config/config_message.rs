@@ -150,28 +150,25 @@ impl ConfigMessage {
         };
 
         if let Some(first_key) = top_dict.keys().next()
-            && first_key.as_slice() < b"#".as_slice() {
-                return Err(ConfigError::ParseError(
-                    "config has keys before '#' indicating incompatible version".into(),
-                ));
-            }
+            && first_key.as_slice() < b"#".as_slice()
+        {
+            return Err(ConfigError::ParseError(
+                "config has keys before '#' indicating incompatible version".into(),
+            ));
+        }
 
         let seqno = match top_dict.get(b"#".as_ref()) {
             Some(BtValue::Integer(n)) => *n,
             _ => {
                 return Err(ConfigError::ParseError(
                     "first key must be \"#\" with integer value".into(),
-                ))
+                ));
             }
         };
 
         let data = match top_dict.get(b"&".as_ref()) {
             Some(BtValue::Dict(d)) => parse_config_data(d, true)?,
-            _ => {
-                return Err(ConfigError::ParseError(
-                    "\"&\" data dict not found".into(),
-                ))
-            }
+            _ => return Err(ConfigError::ParseError("\"&\" data dict not found".into())),
         };
 
         let mut lagged_diffs = LaggedDiffs::new();
@@ -472,16 +469,15 @@ impl ConfigMessage {
             encoded.extend_from_slice(b"1:~64:");
             encoded.extend_from_slice(sig);
             encoded.push(b'e');
-        } else if enable_signing
-            && let Some(signer_fn) = &self.signer {
-                let data_to_sign = &encoded[..encoded.len() - 1];
-                let sig = signer_fn(data_to_sign);
-                assert!(sig.len() == 64, "signing function must return 64 bytes");
-                encoded.pop();
-                encoded.extend_from_slice(b"1:~64:");
-                encoded.extend_from_slice(&sig);
-                encoded.push(b'e');
-            }
+        } else if enable_signing && let Some(signer_fn) = &self.signer {
+            let data_to_sign = &encoded[..encoded.len() - 1];
+            let sig = signer_fn(data_to_sign);
+            assert!(sig.len() == 64, "signing function must return 64 bytes");
+            encoded.pop();
+            encoded.extend_from_slice(b"1:~64:");
+            encoded.extend_from_slice(&sig);
+            encoded.push(b'e');
+        }
 
         encoded
     }
@@ -869,15 +865,16 @@ fn parse_config_set(list: &[BtValue]) -> Result<Vec<ScalarValue>, ConfigError> {
             _ => {
                 return Err(ConfigError::ParseError(
                     "set contains non-scalar value".into(),
-                ))
+                ));
             }
         };
         if let Some(last) = result.last()
-            && scalar <= *last {
-                return Err(ConfigError::ParseError(
-                    "set elements are not properly sorted or contain duplicates".into(),
-                ));
-            }
+            && scalar <= *last
+        {
+            return Err(ConfigError::ParseError(
+                "set elements are not properly sorted or contain duplicates".into(),
+            ));
+        }
         result.push(scalar);
     }
     Ok(result)
@@ -919,9 +916,7 @@ fn load_diff(dict: &BTreeMap<Vec<u8>, BtValue>) -> Result<DiffData, ConfigError>
                 result.insert(key.clone(), diff_to_bt(&sub_diff));
             }
             BtValue::Integer(_) => {
-                return Err(ConfigError::ParseError(
-                    "unexpected integer in diff".into(),
-                ));
+                return Err(ConfigError::ParseError("unexpected integer in diff".into()));
             }
         }
     }
@@ -940,7 +935,7 @@ fn parse_lagged_diffs(
             _ => {
                 return Err(ConfigError::ParseError(
                     "lagged diff entry must be a list".into(),
-                ))
+                ));
             }
         };
         if tuple.len() != 3 {
@@ -953,7 +948,7 @@ fn parse_lagged_diffs(
             _ => {
                 return Err(ConfigError::ParseError(
                     "lagged diff seqno must be integer".into(),
-                ))
+                ));
             }
         };
         if seqno >= curr_seqno {
@@ -973,22 +968,23 @@ fn parse_lagged_diffs(
             _ => {
                 return Err(ConfigError::ParseError(
                     "lagged diff hash must be 32 bytes".into(),
-                ))
+                ));
             }
         };
         let seqno_hash: SeqnoHash = (seqno, hash_bytes);
         if let Some(last) = lagged_diffs.keys().last()
-            && seqno_hash <= *last {
-                return Err(ConfigError::ParseError(
-                    "lagged diffs are not properly sorted or contain duplicates".into(),
-                ));
-            }
+            && seqno_hash <= *last
+        {
+            return Err(ConfigError::ParseError(
+                "lagged diffs are not properly sorted or contain duplicates".into(),
+            ));
+        }
         let diff = match &tuple[2] {
             BtValue::Dict(d) => load_diff(d)?,
             _ => {
                 return Err(ConfigError::ParseError(
                     "lagged diff data must be a dict".into(),
-                ))
+                ));
             }
         };
         lagged_diffs.insert(seqno_hash, diff);
@@ -1094,41 +1090,40 @@ fn apply_diff(data: &mut ConfigData, diff: &DiffData, source: &ConfigData) {
                     apply_diff(sub_data, &sub_diff, source_dict);
                 }
             }
-        } else if set_diff
-            && let BtValue::List(sl) = v {
-                let entry = data
-                    .entry(k.clone())
-                    .or_insert_with(|| ConfigValue::Set(Vec::new()));
-                if !matches!(entry, ConfigValue::Set(_)) {
-                    *entry = ConfigValue::Set(Vec::new());
-                }
-                if let ConfigValue::Set(subset) = entry {
-                    if let Some(BtValue::List(added)) = sl.first() {
-                        for item in added {
-                            let scalar = match item {
-                                BtValue::Integer(n) => ScalarValue::Integer(*n),
-                                BtValue::String(s) => ScalarValue::String(s.clone()),
-                                _ => continue,
-                            };
-                            if let Err(pos) = subset.binary_search(&scalar) {
-                                subset.insert(pos, scalar);
-                            }
+        } else if set_diff && let BtValue::List(sl) = v {
+            let entry = data
+                .entry(k.clone())
+                .or_insert_with(|| ConfigValue::Set(Vec::new()));
+            if !matches!(entry, ConfigValue::Set(_)) {
+                *entry = ConfigValue::Set(Vec::new());
+            }
+            if let ConfigValue::Set(subset) = entry {
+                if let Some(BtValue::List(added)) = sl.first() {
+                    for item in added {
+                        let scalar = match item {
+                            BtValue::Integer(n) => ScalarValue::Integer(*n),
+                            BtValue::String(s) => ScalarValue::String(s.clone()),
+                            _ => continue,
+                        };
+                        if let Err(pos) = subset.binary_search(&scalar) {
+                            subset.insert(pos, scalar);
                         }
                     }
-                    if let Some(BtValue::List(removed)) = sl.get(1) {
-                        for item in removed {
-                            let scalar = match item {
-                                BtValue::Integer(n) => ScalarValue::Integer(*n),
-                                BtValue::String(s) => ScalarValue::String(s.clone()),
-                                _ => continue,
-                            };
-                            if let Ok(pos) = subset.binary_search(&scalar) {
-                                subset.remove(pos);
-                            }
+                }
+                if let Some(BtValue::List(removed)) = sl.get(1) {
+                    for item in removed {
+                        let scalar = match item {
+                            BtValue::Integer(n) => ScalarValue::Integer(*n),
+                            BtValue::String(s) => ScalarValue::String(s.clone()),
+                            _ => continue,
+                        };
+                        if let Ok(pos) = subset.binary_search(&scalar) {
+                            subset.remove(pos);
                         }
                     }
                 }
             }
+        }
     }
 }
 
@@ -1376,8 +1371,7 @@ mod tests {
             b"c".to_vec(),
             cv_dict(vec![(b"a", ConfigValue::Integer(1))]),
         );
-        m.data_mut()
-            .insert(b"d".to_vec(), cv_set(vec![sv_int(42)]));
+        m.data_mut().insert(b"d".to_vec(), cv_set(vec![sv_int(42)]));
         m.data_mut()
             .insert(b"e".to_vec(), ConfigValue::Set(Vec::new()));
         m.prune();
@@ -1429,32 +1423,43 @@ mod tests {
 
         let expected = concat!(
             "d",
-            "1:#", "i10e",
-            "1:&", "d",
-            "3:bar", "d",
-            "0:", "li42e1:a1:be",
-            "4:asdf", "i123e",
-            "3:xyz", "3:abc",
+            "1:#",
+            "i10e",
+            "1:&",
+            "d",
+            "3:bar",
+            "d",
+            "0:",
+            "li42e1:a1:be",
+            "4:asdf",
+            "i123e",
+            "3:xyz",
+            "3:abc",
             "e",
-            "3:foo", "i123e",
+            "3:foo",
+            "i123e",
             "e",
-            "1:<", "le",
-            "1:=", "d",
-            "3:bar", "d",
-            "0:", "lli42e1:a1:belee",
-            "4:asdf", "0:",
-            "3:xyz", "0:",
+            "1:<",
+            "le",
+            "1:=",
+            "d",
+            "3:bar",
+            "d",
+            "0:",
+            "lli42e1:a1:belee",
+            "4:asdf",
+            "0:",
+            "3:xyz",
+            "0:",
             "e",
-            "3:foo", "0:",
+            "3:foo",
+            "0:",
             "e",
             "e"
         );
 
         let serialized = m.serialize();
-        assert_eq!(
-            std::string::String::from_utf8_lossy(&serialized),
-            expected,
-        );
+        assert_eq!(std::string::String::from_utf8_lossy(&serialized), expected,);
 
         let hash0_hex = "d65738bba88b0f3455cef20fe09a7b4b10f25f9db82be24a6ce1bd06da197526";
         assert_eq!(to_hex_str(&m.hash()), hash0_hex);
@@ -1559,9 +1564,18 @@ mod tests {
         let mut m4 = m3.increment();
         let mut m5 = m4.increment();
 
-        assert_eq!(to_hex_str(&m3.hash()), "b83871ea06587f9254cdf2b2af8daff19bd7fb550fb90d5f8f9f546464c08bc5");
-        assert_eq!(to_hex_str(&m4.hash()), "c30e2cfa7ec93c64a1ab6420c9bccfb63da8e4c2940ed6509ffb64f3f0131860");
-        assert_eq!(to_hex_str(&m5.hash()), "3234eb7da8cf4b79b9eec2a144247279d10f6f118184f82429a42c5996bea60c");
+        assert_eq!(
+            to_hex_str(&m3.hash()),
+            "b83871ea06587f9254cdf2b2af8daff19bd7fb550fb90d5f8f9f546464c08bc5"
+        );
+        assert_eq!(
+            to_hex_str(&m4.hash()),
+            "c30e2cfa7ec93c64a1ab6420c9bccfb63da8e4c2940ed6509ffb64f3f0131860"
+        );
+        assert_eq!(
+            to_hex_str(&m5.hash()),
+            "3234eb7da8cf4b79b9eec2a144247279d10f6f118184f82429a42c5996bea60c"
+        );
     }
 
     fn data118() -> ConfigData {
@@ -1577,23 +1591,20 @@ mod tests {
         );
         d.insert(
             b"dictC".to_vec(),
-            cv_dict(vec![(
-                b"x",
-                cv_dict(vec![(b"y", ConfigValue::Integer(1))]),
-            )]),
+            cv_dict(vec![(b"x", cv_dict(vec![(b"y", ConfigValue::Integer(1))]))]),
         );
         d.insert(
             b"good".to_vec(),
             cv_set(vec![sv_int(99), sv_int(456), sv_str(b"bar")]),
         );
-        d.insert(
-            b"great".to_vec(),
-            cv_set(vec![sv_int(-42), sv_str(b"omg")]),
-        );
+        d.insert(b"great".to_vec(), cv_set(vec![sv_int(-42), sv_str(b"omg")]));
         d.insert(b"int0".to_vec(), ConfigValue::Integer(-9999));
         d.insert(b"int1".to_vec(), ConfigValue::Integer(100));
         d.insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
-        d.insert(b"string2".to_vec(), ConfigValue::String(b"goodbye".to_vec()));
+        d.insert(
+            b"string2".to_vec(),
+            ConfigValue::String(b"goodbye".to_vec()),
+        );
         d
     }
 
@@ -1604,29 +1615,47 @@ mod tests {
 
         let mut m = m118.increment();
         assert_eq!(m.seqno(), 119);
-        assert_eq!(to_hex_str(&m.hash()), "43094f68c1faa37eff79e1c2f3973ffd5f9d6423b00ccda306fc6e7dac5f0c44");
+        assert_eq!(
+            to_hex_str(&m.hash()),
+            "43094f68c1faa37eff79e1c2f3973ffd5f9d6423b00ccda306fc6e7dac5f0c44"
+        );
 
         m = m.increment();
         assert_eq!(m.seqno(), 120);
-        assert_eq!(to_hex_str(&m.hash()), "e3a237f91014d31e4d30569c4a8bfcd72157804f99b8732c611c48bf126432b5");
+        assert_eq!(
+            to_hex_str(&m.hash()),
+            "e3a237f91014d31e4d30569c4a8bfcd72157804f99b8732c611c48bf126432b5"
+        );
 
         m = m.increment();
         assert_eq!(m.seqno(), 121);
-        assert_eq!(to_hex_str(&m.hash()), "1a7f602055124deaf21175ef3f32983dee7c9de570e5d9c9a0bbc2db71dcb97f");
+        assert_eq!(
+            to_hex_str(&m.hash()),
+            "1a7f602055124deaf21175ef3f32983dee7c9de570e5d9c9a0bbc2db71dcb97f"
+        );
 
         m = m.increment();
         assert_eq!(m.seqno(), 122);
-        assert_eq!(to_hex_str(&m.hash()), "46560604fe352101bb869435260d7100ccfe007be5f741c7e96303f02f394e8a");
+        assert_eq!(
+            to_hex_str(&m.hash()),
+            "46560604fe352101bb869435260d7100ccfe007be5f741c7e96303f02f394e8a"
+        );
 
         m = m.increment();
         assert_eq!(m.seqno(), 123);
 
-        m.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(1));
-        m.data_mut().insert(b"int2".to_vec(), ConfigValue::Integer(2));
+        m.data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(1));
+        m.data_mut()
+            .insert(b"int2".to_vec(), ConfigValue::Integer(2));
         m.data_mut().remove(b"int0".as_ref());
-        m.data_mut().insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
+        m.data_mut()
+            .insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
 
-        assert_eq!(to_hex_str(&m.hash()), "d9398c597b058ac7e28e3febb76ed68eb8c5b6c369610562ab5f2b596775d73c");
+        assert_eq!(
+            to_hex_str(&m.hash()),
+            "d9398c597b058ac7e28e3febb76ed68eb8c5b6c369610562ab5f2b596775d73c"
+        );
     }
 
     #[test]
@@ -1639,17 +1668,23 @@ mod tests {
         m = m.increment();
         m = m.increment();
         m = m.increment();
-        m.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(1));
-        m.data_mut().insert(b"int2".to_vec(), ConfigValue::Integer(2));
+        m.data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(1));
+        m.data_mut()
+            .insert(b"int2".to_vec(), ConfigValue::Integer(2));
         m.data_mut().remove(b"int0".as_ref());
-        m.data_mut().insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
+        m.data_mut()
+            .insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
 
         let m123_serialized = m.serialize();
 
         // Deserialize as immutable
         let parsed = ConfigMessage::from_bytes(&m123_serialized, None, None, 5, false).unwrap();
         assert_eq!(parsed.seqno(), 123);
-        assert_eq!(to_hex_str(&parsed.hash()), "d9398c597b058ac7e28e3febb76ed68eb8c5b6c369610562ab5f2b596775d73c");
+        assert_eq!(
+            to_hex_str(&parsed.hash()),
+            "d9398c597b058ac7e28e3febb76ed68eb8c5b6c369610562ab5f2b596775d73c"
+        );
 
         let diff = parsed.diff();
         assert_eq!(diff.len(), 3);
@@ -1682,7 +1717,8 @@ mod tests {
         let mut dict_a = ConfigData::new();
         dict_a.insert(b"hello".to_vec(), ConfigValue::Integer(123));
         dict_a.insert(b"goodbye".to_vec(), cv_set(vec![sv_int(123), sv_int(456)]));
-        m.data_mut().insert(b"dictA".to_vec(), ConfigValue::Dict(dict_a));
+        m.data_mut()
+            .insert(b"dictA".to_vec(), ConfigValue::Dict(dict_a));
 
         if let Some(ConfigValue::Dict(dictb)) = m.data_mut().get_mut(b"dictB".as_ref()) {
             dictb.insert(b"changed".to_vec(), ConfigValue::Integer(1));
@@ -1708,10 +1744,13 @@ mod tests {
             }
         }
 
-        m.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(42));
+        m.data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(42));
         m.data_mut().remove(b"string1".as_ref());
-        m.data_mut().insert(b"string2".to_vec(), ConfigValue::String(b"hello".to_vec()));
-        m.data_mut().insert(b"string3".to_vec(), ConfigValue::String(b"omg".to_vec()));
+        m.data_mut()
+            .insert(b"string2".to_vec(), ConfigValue::String(b"hello".to_vec()));
+        m.data_mut()
+            .insert(b"string3".to_vec(), ConfigValue::String(b"omg".to_vec()));
         m.data_mut().remove(b"great".as_ref());
     }
 
@@ -1725,10 +1764,13 @@ mod tests {
         m = m.increment();
         m = m.increment();
         m = m.increment();
-        m.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(1));
-        m.data_mut().insert(b"int2".to_vec(), ConfigValue::Integer(2));
+        m.data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(1));
+        m.data_mut()
+            .insert(b"int2".to_vec(), ConfigValue::Integer(2));
         m.data_mut().remove(b"int0".as_ref());
-        m.data_mut().insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
+        m.data_mut()
+            .insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
 
         let m123_serialized = m.serialize();
 
@@ -1737,7 +1779,10 @@ mod tests {
 
         apply_updates_124(&mut m124);
 
-        assert_eq!(to_hex_str(&m124.hash()), "8b73f316178765b9b3b37168e865c84bb5a78610cbb59b84d0fa4d3b4b3c102b");
+        assert_eq!(
+            to_hex_str(&m124.hash()),
+            "8b73f316178765b9b3b37168e865c84bb5a78610cbb59b84d0fa4d3b4b3c102b"
+        );
     }
 
     #[test]
@@ -1749,16 +1794,22 @@ mod tests {
         m = m.increment();
         m = m.increment();
         m = m.increment();
-        m.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(1));
-        m.data_mut().insert(b"int2".to_vec(), ConfigValue::Integer(2));
+        m.data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(1));
+        m.data_mut()
+            .insert(b"int2".to_vec(), ConfigValue::Integer(2));
         m.data_mut().remove(b"int0".as_ref());
-        m.data_mut().insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
+        m.data_mut()
+            .insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
 
         let m123_serialized = m.serialize();
 
         let mut m124 = MutableConfigMessage::from_bytes(&m123_serialized, None, None, 5).unwrap();
         apply_updates_124(&mut m124);
-        assert_eq!(to_hex_str(&m124.hash()), "8b73f316178765b9b3b37168e865c84bb5a78610cbb59b84d0fa4d3b4b3c102b");
+        assert_eq!(
+            to_hex_str(&m124.hash()),
+            "8b73f316178765b9b3b37168e865c84bb5a78610cbb59b84d0fa4d3b4b3c102b"
+        );
 
         let mut m125_a = m124.increment();
         if let Some(ConfigValue::Dict(dictb)) = m125_a.data_mut().get_mut(b"dictB".as_ref()) {
@@ -1766,10 +1817,18 @@ mod tests {
         }
 
         let mut m125_b = m124.increment();
-        m125_b.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(5));
+        m125_b
+            .data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(5));
 
-        assert_eq!(to_hex_str(&m125_a.hash()), "80f229c3667de6d0fa6f96b53118e097fbda82db3ca1aea221a3db91ea9c45fb");
-        assert_eq!(to_hex_str(&m125_b.hash()), "ab12f0efe9a9ed00db6b17b44ae0ff36b9f49094077fb114f415522f2a0e98de");
+        assert_eq!(
+            to_hex_str(&m125_a.hash()),
+            "80f229c3667de6d0fa6f96b53118e097fbda82db3ca1aea221a3db91ea9c45fb"
+        );
+        assert_eq!(
+            to_hex_str(&m125_b.hash()),
+            "ab12f0efe9a9ed00db6b17b44ae0ff36b9f49094077fb114f415522f2a0e98de"
+        );
         assert!(m125_a.hash() < m125_b.hash());
 
         let ser_a = m125_a.serialize();
@@ -1794,7 +1853,15 @@ mod tests {
             dict_b.insert(b"nested".to_vec(), ConfigValue::Dict(nested));
             d.insert(b"dictB".to_vec(), ConfigValue::Dict(dict_b));
 
-            d.insert(b"good".to_vec(), cv_set(vec![sv_int(99), sv_int(123), sv_str(b"Foo"), sv_str(b"bar")]));
+            d.insert(
+                b"good".to_vec(),
+                cv_set(vec![
+                    sv_int(99),
+                    sv_int(123),
+                    sv_str(b"Foo"),
+                    sv_str(b"bar"),
+                ]),
+            );
             d.insert(b"int1".to_vec(), ConfigValue::Integer(5));
             d.insert(b"int2".to_vec(), ConfigValue::Integer(2));
             d.insert(b"string2".to_vec(), ConfigValue::String(b"hello".to_vec()));
@@ -1805,19 +1872,26 @@ mod tests {
         assert_eq!(*merged.data(), expected_data);
 
         // Opposite order should give same result
-        let merged_alt = ConfigMessage::from_multiple(&[&ser_b, &ser_a], None, None, 5, None).unwrap();
+        let merged_alt =
+            ConfigMessage::from_multiple(&[&ser_b, &ser_a], None, None, 5, None).unwrap();
         assert_eq!(merged.serialize(), merged_alt.serialize());
 
         // Already-included message shouldn't matter
         let ser_124 = m124.serialize();
-        let merged_alt2 = ConfigMessage::from_multiple(&[&ser_124, &ser_b, &ser_a], None, None, 5, None).unwrap();
+        let merged_alt2 =
+            ConfigMessage::from_multiple(&[&ser_124, &ser_b, &ser_a], None, None, 5, None).unwrap();
         assert_eq!(merged.serialize(), merged_alt2.serialize());
 
         // Too-old message should get dropped
         let mut m120b = MutableConfigMessage::new(118, 5).increment().increment();
-        m120b.data_mut().insert(b"too old".to_vec(), ConfigValue::String(b"won't see".to_vec()));
+        m120b.data_mut().insert(
+            b"too old".to_vec(),
+            ConfigValue::String(b"won't see".to_vec()),
+        );
         let ser_120b = m120b.serialize();
-        let merged_alt4 = ConfigMessage::from_multiple(&[&ser_b, &ser_120b, &ser_a], None, None, 5, None).unwrap();
+        let merged_alt4 =
+            ConfigMessage::from_multiple(&[&ser_b, &ser_120b, &ser_a], None, None, 5, None)
+                .unwrap();
         assert_eq!(merged.serialize(), merged_alt4.serialize());
     }
 
@@ -1830,13 +1904,17 @@ mod tests {
         m = m.increment();
         m = m.increment();
         m = m.increment();
-        m.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(1));
-        m.data_mut().insert(b"int2".to_vec(), ConfigValue::Integer(2));
+        m.data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(1));
+        m.data_mut()
+            .insert(b"int2".to_vec(), ConfigValue::Integer(2));
         m.data_mut().remove(b"int0".as_ref());
-        m.data_mut().insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
+        m.data_mut()
+            .insert(b"string1".to_vec(), ConfigValue::String(b"hello".to_vec()));
 
         let m123_serialized = m.serialize();
-        let m123_parsed = ConfigMessage::from_bytes(&m123_serialized, None, None, 5, false).unwrap();
+        let m123_parsed =
+            ConfigMessage::from_bytes(&m123_serialized, None, None, 5, false).unwrap();
 
         let mut m124a = m123_parsed.increment();
         if let Some(ConfigValue::Dict(dictb)) = m124a.data_mut().get_mut(b"dictB".as_ref()) {
@@ -1846,7 +1924,10 @@ mod tests {
 
         let mut m124b = m123_parsed.increment();
         apply_updates_124(&mut m124b);
-        assert_eq!(to_hex_str(&m124b.hash()), "8b73f316178765b9b3b37168e865c84bb5a78610cbb59b84d0fa4d3b4b3c102b");
+        assert_eq!(
+            to_hex_str(&m124b.hash()),
+            "8b73f316178765b9b3b37168e865c84bb5a78610cbb59b84d0fa4d3b4b3c102b"
+        );
 
         let mut m125a = m124b.increment();
         if let Some(ConfigValue::Dict(dictb)) = m125a.data_mut().get_mut(b"dictB".as_ref()) {
@@ -1854,21 +1935,31 @@ mod tests {
         }
 
         let mut m125b = m124b.increment();
-        m125b.data_mut().insert(b"int1".to_vec(), ConfigValue::Integer(5));
+        m125b
+            .data_mut()
+            .insert(b"int1".to_vec(), ConfigValue::Integer(5));
 
         let ser_125a = m125a.serialize();
         let ser_125b = m125b.serialize();
-        let m126a = ConfigMessage::from_multiple(&[&ser_125a, &ser_125b], None, None, 5, None).unwrap();
+        let m126a =
+            ConfigMessage::from_multiple(&[&ser_125a, &ser_125b], None, None, 5, None).unwrap();
 
         let mut m120b = MutableConfigMessage::new(118, 5).increment().increment();
-        m120b.data_mut().insert(b"too old".to_vec(), ConfigValue::String(b"won't see".to_vec()));
+        m120b.data_mut().insert(
+            b"too old".to_vec(),
+            ConfigValue::String(b"won't see".to_vec()),
+        );
         let ser_120b = m120b.serialize();
 
         let ser_124a = m124a.serialize();
         let m126b = ConfigMessage::from_multiple(
             &[&ser_125b, &ser_124a, &ser_125a, &m123_serialized, &ser_120b],
-            None, None, 5, None,
-        ).unwrap();
+            None,
+            None,
+            5,
+            None,
+        )
+        .unwrap();
 
         assert!(m124a.hash() < m124b.hash());
         assert!(m125a.hash() < m125b.hash());
@@ -1876,9 +1967,9 @@ mod tests {
 
         let ser_126a = m126a.serialize();
         let ser_126b = m126b.serialize();
-        let mut m127 = MutableConfigMessage::from_multiple(
-            &[&ser_126a, &ser_126b], None, None, 5, None,
-        ).unwrap();
+        let mut m127 =
+            MutableConfigMessage::from_multiple(&[&ser_126a, &ser_126b], None, None, 5, None)
+                .unwrap();
 
         if let Some(ConfigValue::Dict(dict_a)) = m127.data_mut().get_mut(b"dictA".as_ref()) {
             if let Some(ConfigValue::Set(goodbye)) = dict_a.get_mut(b"goodbye".as_ref()) {
@@ -1893,7 +1984,10 @@ mod tests {
         let expected_data = {
             let mut d = ConfigData::new();
             let mut dict_a = ConfigData::new();
-            dict_a.insert(b"goodbye".to_vec(), cv_set(vec![sv_int(123), sv_int(456), sv_int(789)]));
+            dict_a.insert(
+                b"goodbye".to_vec(),
+                cv_set(vec![sv_int(123), sv_int(456), sv_int(789)]),
+            );
             dict_a.insert(b"hello".to_vec(), ConfigValue::Integer(123));
             d.insert(b"dictA".to_vec(), ConfigValue::Dict(dict_a));
 
@@ -1906,7 +2000,15 @@ mod tests {
             dict_b.insert(b"nested".to_vec(), ConfigValue::Dict(nested));
             d.insert(b"dictB".to_vec(), ConfigValue::Dict(dict_b));
 
-            d.insert(b"good".to_vec(), cv_set(vec![sv_int(99), sv_int(123), sv_str(b"Foo"), sv_str(b"bar")]));
+            d.insert(
+                b"good".to_vec(),
+                cv_set(vec![
+                    sv_int(99),
+                    sv_int(123),
+                    sv_str(b"Foo"),
+                    sv_str(b"bar"),
+                ]),
+            );
             d.insert(b"int1".to_vec(), ConfigValue::Integer(5));
             d.insert(b"int2".to_vec(), ConfigValue::Integer(2));
             d.insert(b"string2".to_vec(), ConfigValue::String(b"hello".to_vec()));
@@ -1918,9 +2020,9 @@ mod tests {
 
         // Verify stability with different input order
         let m127_ser = m127.serialize();
-        let m_alt1 = ConfigMessage::from_multiple(
-            &[&m127_ser, &ser_125a, &ser_126b], None, None, 5, None,
-        ).unwrap();
+        let m_alt1 =
+            ConfigMessage::from_multiple(&[&m127_ser, &ser_125a, &ser_126b], None, None, 5, None)
+                .unwrap();
         assert_eq!(m_alt1.seqno(), 127);
         assert_eq!(m_alt1.hash(), m127.hash());
     }
@@ -1928,31 +2030,38 @@ mod tests {
     #[test]
     fn test_config_signature() {
         let mut m = MutableConfigMessage::new(10, DEFAULT_DIFF_LAGS);
-        m.data_mut().insert(b"foo".to_vec(), ConfigValue::Integer(123));
+        m.data_mut()
+            .insert(b"foo".to_vec(), ConfigValue::Integer(123));
 
         let mut bar_dict = ConfigData::new();
         bar_dict.insert(b"asdf".to_vec(), ConfigValue::Integer(123));
         bar_dict.insert(b"xyz".to_vec(), ConfigValue::String(b"abc".to_vec()));
-        bar_dict.insert(b"".to_vec(), cv_set(vec![sv_int(42), sv_str(b"a"), sv_str(b"b")]));
-        m.data_mut().insert(b"bar".to_vec(), ConfigValue::Dict(bar_dict));
+        bar_dict.insert(
+            b"".to_vec(),
+            cv_set(vec![sv_int(42), sv_str(b"a"), sv_str(b"b")]),
+        );
+        m.data_mut()
+            .insert(b"bar".to_vec(), ConfigValue::Dict(bar_dict));
 
         let secret_key = hex::decode(
             "79f530dbf3d81aecc04072933c1b3e3edc0b7d91f2dcc2f7756f2611886cca5f\
              4384261cdd338f5820ca9cbbe3fc72ac8944ee60d3b795b797fbbf5597b09f17",
-        ).unwrap();
-        let pubkey = hex::decode(
-            "4384261cdd338f5820ca9cbbe3fc72ac8944ee60d3b795b797fbbf5597b09f17"
-        ).unwrap();
+        )
+        .unwrap();
+        let pubkey =
+            hex::decode("4384261cdd338f5820ca9cbbe3fc72ac8944ee60d3b795b797fbbf5597b09f17")
+                .unwrap();
 
         let sk_clone = secret_key.clone();
         m.set_signer(Some(Arc::new(move |data: &[u8]| {
-            crate::crypto::ed25519::sign(&sk_clone, data).unwrap().to_vec()
+            crate::crypto::ed25519::sign(&sk_clone, data)
+                .unwrap()
+                .to_vec()
         })));
 
         let serialized = m.serialize();
 
-        let expected_sig_hex =
-            "77267f4de7701ae348eba0ef73175281512ba3f1051cfed22dc3e31b9c699330\
+        let expected_sig_hex = "77267f4de7701ae348eba0ef73175281512ba3f1051cfed22dc3e31b9c699330\
              2938863e09bc8b33638161071bd8dc397d5c1d3f674120d08fbb9c64dde2e907";
         let expected_sig = hex::decode(expected_sig_hex).unwrap();
 
@@ -1969,10 +2078,19 @@ mod tests {
         });
         let sk_clone2 = secret_key.clone();
         let signer: SignCallable = Arc::new(move |data: &[u8]| {
-            crate::crypto::ed25519::sign(&sk_clone2, data).unwrap().to_vec()
+            crate::crypto::ed25519::sign(&sk_clone2, data)
+                .unwrap()
+                .to_vec()
         });
 
-        let msg = ConfigMessage::from_bytes(&serialized, Some(verifier.clone()), Some(signer.clone()), 5, false).unwrap();
+        let msg = ConfigMessage::from_bytes(
+            &serialized,
+            Some(verifier.clone()),
+            Some(signer.clone()),
+            5,
+            false,
+        )
+        .unwrap();
         assert!(msg.verified_signature().is_some());
         assert_eq!(msg.hash(), m.hash());
         assert_eq!(msg.serialize(), serialized);
@@ -1984,10 +2102,14 @@ mod tests {
         assert_eq!(broken[broken_byte_pos], 0x07);
         broken[broken_byte_pos] = 0x17;
 
-        assert!(ConfigMessage::from_bytes(&broken, Some(verifier.clone()), None, 5, false).is_err());
+        assert!(
+            ConfigMessage::from_bytes(&broken, Some(verifier.clone()), None, 5, false).is_err()
+        );
 
         // Unsigned message should fail with verifier
         let unsigned = m.serialize_unsigned();
-        assert!(ConfigMessage::from_bytes(&unsigned, Some(verifier.clone()), None, 5, false).is_err());
+        assert!(
+            ConfigMessage::from_bytes(&unsigned, Some(verifier.clone()), None, 5, false).is_err()
+        );
     }
 }

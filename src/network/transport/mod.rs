@@ -9,8 +9,6 @@
 //! - [`MockTransport`] — test-only mock transport returning canned responses.
 //! - `quic` — QUIC transport skeleton (full implementation is future work).
 
-/// Transport trait and request/response types.
-pub mod transport;
 /// HTTPS transport implementation using `reqwest`.
 pub mod http;
 /// Mock transport for unit tests.
@@ -19,6 +17,8 @@ pub mod mock;
 pub mod quic;
 /// Bundled Session seed-node CA certificates (pinned — implementation detail).
 pub(crate) mod seed_certs;
+/// Transport trait and request/response types.
+pub mod transport;
 
 pub use http::HttpTransport;
 pub use mock::{MockRoute, MockTransport};

@@ -270,11 +270,20 @@ mod tests {
         };
         let json = serde_json::to_string(&preview).unwrap();
         assert!(json.starts_with("\"2:"), "{json}");
-        assert_eq!(serde_json::from_str::<ImagePreview>(&json).unwrap(), preview);
+        assert_eq!(
+            serde_json::from_str::<ImagePreview>(&json).unwrap(),
+            preview
+        );
         let legacy = r#"{"rows":[[[[1,2,3],[4,5,6]],[[7,8,9],[10,11,12]]]]}"#;
-        assert_eq!(serde_json::from_str::<ImagePreview>(legacy).unwrap().rows, preview.rows[..1]);
+        assert_eq!(
+            serde_json::from_str::<ImagePreview>(legacy).unwrap().rows,
+            preview.rows[..1]
+        );
         let empty = serde_json::to_string(&ImagePreview::default()).unwrap();
-        assert_eq!(serde_json::from_str::<ImagePreview>(&empty).unwrap(), ImagePreview::default());
+        assert_eq!(
+            serde_json::from_str::<ImagePreview>(&empty).unwrap(),
+            ImagePreview::default()
+        );
     }
 
     #[test]

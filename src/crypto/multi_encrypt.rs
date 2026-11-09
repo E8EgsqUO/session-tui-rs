@@ -8,8 +8,8 @@
 //! secret and BLAKE2b. A single nonce is shared across all encryptions
 //! (safe because keys differ).
 
-use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, KeyInit};
 use rand::RngExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -70,9 +70,9 @@ pub fn encrypt_multi_key(
 fn encrypt_multi_impl(msg: &[u8], key: &[u8; 32], nonce: &[u8; 24]) -> CryptoResult<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let xnonce = chacha20poly1305::XNonce::from(*nonce);
-    cipher
-        .encrypt(&xnonce, msg)
-        .map_err(|e| CryptoError::EncryptionFailed(format!("XChaCha20-Poly1305 encrypt failed: {e}")))
+    cipher.encrypt(&xnonce, msg).map_err(|e| {
+        CryptoError::EncryptionFailed(format!("XChaCha20-Poly1305 encrypt failed: {e}"))
+    })
 }
 
 /// Attempts to decrypt a ciphertext with XChaCha20-Poly1305.
@@ -306,7 +306,12 @@ pub fn decrypt_for_multiple_simple_ed25519(
     domain: &str,
 ) -> Option<Vec<u8>> {
     let sender_x25519_pub = to_curve25519_pubkey(sender_ed25519_pubkey).ok()?;
-    decrypt_for_multiple_simple_from_ed25519(encoded, ed25519_secret_key, &sender_x25519_pub, domain)
+    decrypt_for_multiple_simple_from_ed25519(
+        encoded,
+        ed25519_secret_key,
+        &sender_x25519_pub,
+        domain,
+    )
 }
 
 #[cfg(test)]
@@ -388,9 +393,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(encrypted.len(), 3);
-        assert_eq!(hex::encode(&encrypted[0]), "e64937e5ea201b84f4e88a976dad900d91caaf6a17");
-        assert_eq!(hex::encode(&encrypted[1]), "b7a15bcd9f7b09445defcae2f1dc5085dd75cb085b");
-        assert_eq!(hex::encode(&encrypted[2]), "01c4fc2156327735f3fb5063b11ea95f6ebcc5b6cc");
+        assert_eq!(
+            hex::encode(&encrypted[0]),
+            "e64937e5ea201b84f4e88a976dad900d91caaf6a17"
+        );
+        assert_eq!(
+            hex::encode(&encrypted[1]),
+            "b7a15bcd9f7b09445defcae2f1dc5085dd75cb085b"
+        );
+        assert_eq!(
+            hex::encode(&encrypted[2]),
+            "01c4fc2156327735f3fb5063b11ea95f6ebcc5b6cc"
+        );
     }
 
     #[test]
@@ -412,15 +426,36 @@ mod tests {
         let cts: Vec<&[u8]> = encrypted.iter().map(|v| v.as_slice()).collect();
 
         // Recipient 1 can decrypt
-        let m1 = decrypt_for_multiple(&cts, &nonce, &keys[1].0, &keys[1].1, &keys[0].1, "test suite");
+        let m1 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[1].0,
+            &keys[1].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert_eq!(m1.as_deref(), Some(b"hello".as_ref()));
 
         // Recipient 2 can decrypt
-        let m2 = decrypt_for_multiple(&cts, &nonce, &keys[2].0, &keys[2].1, &keys[0].1, "test suite");
+        let m2 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[2].0,
+            &keys[2].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert_eq!(m2.as_deref(), Some(b"hello".as_ref()));
 
         // Recipient 3 can decrypt
-        let m3 = decrypt_for_multiple(&cts, &nonce, &keys[3].0, &keys[3].1, &keys[0].1, "test suite");
+        let m3 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[3].0,
+            &keys[3].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert_eq!(m3.as_deref(), Some(b"hello".as_ref()));
 
         // Wrong domain fails
@@ -435,7 +470,14 @@ mod tests {
         assert!(m3b.is_none());
 
         // Non-recipient (key 4) fails
-        let m4 = decrypt_for_multiple(&cts, &nonce, &keys[4].0, &keys[4].1, &keys[0].1, "test suite");
+        let m4 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[4].0,
+            &keys[4].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert!(m4.is_none());
     }
 
@@ -456,9 +498,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(encrypted.len(), 3);
-        assert_eq!(hex::encode(&encrypted[0]), "e64937e5ea201b84f4e88a976dad900d91caaf6a17");
-        assert_eq!(hex::encode(&encrypted[1]), "bcb642c49c6da03f70cdaab2ed6666721318afd631");
-        assert_eq!(hex::encode(&encrypted[2]), "1ecee2215d226817edfdb097f05037eb799309103a");
+        assert_eq!(
+            hex::encode(&encrypted[0]),
+            "e64937e5ea201b84f4e88a976dad900d91caaf6a17"
+        );
+        assert_eq!(
+            hex::encode(&encrypted[1]),
+            "bcb642c49c6da03f70cdaab2ed6666721318afd631"
+        );
+        assert_eq!(
+            hex::encode(&encrypted[2]),
+            "1ecee2215d226817edfdb097f05037eb799309103a"
+        );
     }
 
     #[test]
@@ -479,13 +530,34 @@ mod tests {
 
         let cts: Vec<&[u8]> = encrypted.iter().map(|v| v.as_slice()).collect();
 
-        let m1 = decrypt_for_multiple(&cts, &nonce, &keys[1].0, &keys[1].1, &keys[0].1, "test suite");
+        let m1 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[1].0,
+            &keys[1].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert_eq!(m1.as_deref(), Some(b"hello".as_ref()));
 
-        let m2 = decrypt_for_multiple(&cts, &nonce, &keys[2].0, &keys[2].1, &keys[0].1, "test suite");
+        let m2 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[2].0,
+            &keys[2].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert_eq!(m2.as_deref(), Some(b"cruel".as_ref()));
 
-        let m3 = decrypt_for_multiple(&cts, &nonce, &keys[3].0, &keys[3].1, &keys[0].1, "test suite");
+        let m3 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[3].0,
+            &keys[3].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert_eq!(m3.as_deref(), Some(b"world".as_ref()));
 
         let m3b = decrypt_for_multiple(
@@ -498,7 +570,14 @@ mod tests {
         );
         assert!(m3b.is_none());
 
-        let m4 = decrypt_for_multiple(&cts, &nonce, &keys[4].0, &keys[4].1, &keys[0].1, "test suite");
+        let m4 = decrypt_for_multiple(
+            &cts,
+            &nonce,
+            &keys[4].0,
+            &keys[4].1,
+            &keys[0].1,
+            "test suite",
+        );
         assert!(m4.is_none());
     }
 
@@ -781,21 +860,13 @@ mod tests {
 
         // Decrypt using ed25519 recipient
         let (_, ed_sk1) = ed25519_key_pair_from_seed(&s[1]).unwrap();
-        let m1_ed = decrypt_for_multiple_simple_from_ed25519(
-            &encrypted,
-            &ed_sk1,
-            &keys[0].1,
-            "test suite",
-        );
+        let m1_ed =
+            decrypt_for_multiple_simple_from_ed25519(&encrypted, &ed_sk1, &keys[0].1, "test suite");
         assert_eq!(m1_ed.as_deref(), Some(b"hello".as_ref()));
 
         // Decrypt using ed25519 for both sender and recipient
-        let m1_full_ed = decrypt_for_multiple_simple_ed25519(
-            &encrypted,
-            &ed_sk1,
-            &ed_pk0,
-            "test suite",
-        );
+        let m1_full_ed =
+            decrypt_for_multiple_simple_ed25519(&encrypted, &ed_sk1, &ed_pk0, "test suite");
         assert_eq!(m1_full_ed.as_deref(), Some(b"hello".as_ref()));
     }
 

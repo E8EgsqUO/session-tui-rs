@@ -23,8 +23,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::config_base::field_helpers::*;
 use crate::config::config_base::ConfigType;
+use crate::config::config_base::field_helpers::*;
 use crate::config::config_message::{ConfigData, ConfigValue, ScalarValue};
 use crate::config::expiring::ExpiryType;
 use crate::config::namespaces::Namespace;
@@ -119,9 +119,10 @@ impl ContactInfo {
             self.profile_pic.url = url;
         }
         if let Some(key) = get_bytes(dict, b"q")
-            && key.len() == 32 {
-                self.profile_pic.key = key;
-            }
+            && key.len() == 32
+        {
+            self.profile_pic.key = key;
+        }
 
         self.approved = get_int_or_zero(dict, b"a") != 0;
         self.approved_me = get_int_or_zero(dict, b"A") != 0;
@@ -143,9 +144,11 @@ impl ContactInfo {
                 let mut bits = 0u64;
                 for item in items {
                     if let ScalarValue::Integer(v) = item
-                        && *v >= 0 && *v < 64 {
-                            bits |= 1 << *v;
-                        }
+                        && *v >= 0
+                        && *v < 64
+                    {
+                        bits |= 1 << *v;
+                    }
                 }
                 bits
             }
@@ -175,10 +178,7 @@ impl ContactInfo {
         set_nonzero_int(&mut dict, b"+", self.priority as i64);
 
         if self.expiry_type != ExpiryType::None {
-            dict.insert(
-                b"e".to_vec(),
-                ConfigValue::Integer(self.expiry_type as i64),
-            );
+            dict.insert(b"e".to_vec(), ConfigValue::Integer(self.expiry_type as i64));
             set_positive_int(&mut dict, b"E", self.expiry_timer as i64);
         }
 
@@ -222,8 +222,7 @@ impl Contacts {
 
     /// Sets (inserts or updates) a contact.
     pub fn set(&mut self, contact: ContactInfo) {
-        self.contacts
-            .insert(contact.session_id.clone(), contact);
+        self.contacts.insert(contact.session_id.clone(), contact);
     }
 
     /// Removes a contact by session ID. Returns true if it existed.
@@ -305,7 +304,8 @@ mod tests {
 
     #[test]
     fn test_contact_info_new() {
-        let contact = ContactInfo::new("0500000000000000000000000000000000000000000000000000000000000000ff");
+        let contact =
+            ContactInfo::new("0500000000000000000000000000000000000000000000000000000000000000ff");
         assert!(!contact.approved);
         assert!(!contact.blocked);
         assert_eq!(contact.priority, 0);
@@ -346,7 +346,8 @@ mod tests {
     fn test_contacts_roundtrip() {
         let mut contacts = Contacts::default();
 
-        let mut c = ContactInfo::new("050000000000000000000000000000000000000000000000000000000000000000");
+        let mut c =
+            ContactInfo::new("050000000000000000000000000000000000000000000000000000000000000000");
         c.name = "TestUser".to_string();
         c.approved = true;
         c.blocked = false;
@@ -361,7 +362,9 @@ mod tests {
         let mut loaded = Contacts::default();
         loaded.load_from_data(&data);
 
-        let loaded_contact = loaded.get("050000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let loaded_contact = loaded
+            .get("050000000000000000000000000000000000000000000000000000000000000000")
+            .unwrap();
         assert_eq!(loaded_contact.name, "TestUser");
         assert!(loaded_contact.approved);
         assert_eq!(loaded_contact.priority, 3);
@@ -371,9 +374,8 @@ mod tests {
 
     #[test]
     fn test_contacts_config_base() {
-        let seed = hex_literal::hex!(
-            "0123456789abcdef0123456789abcdef00000000000000000000000000000000"
-        );
+        let seed =
+            hex_literal::hex!("0123456789abcdef0123456789abcdef00000000000000000000000000000000");
         let base: ConfigBase<Contacts> = ConfigBase::new(&seed, None).unwrap();
         assert!(base.get().is_empty());
     }

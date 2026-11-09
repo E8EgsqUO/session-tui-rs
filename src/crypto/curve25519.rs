@@ -27,9 +27,7 @@ pub fn curve25519_key_pair() -> ([u8; 32], [u8; 32]) {
 pub fn to_curve25519_pubkey(ed25519_pubkey: &[u8; 32]) -> CryptoResult<[u8; 32]> {
     let compressed = CompressedEdwardsY(*ed25519_pubkey);
     let point = compressed.decompress().ok_or_else(|| {
-        CryptoError::KeyConversionFailed(
-            "failed to decompress Ed25519 public key".to_string(),
-        )
+        CryptoError::KeyConversionFailed("failed to decompress Ed25519 public key".to_string())
     })?;
     Ok(point.to_montgomery().to_bytes())
 }
@@ -71,10 +69,8 @@ mod tests {
     fn test_to_curve25519_pubkey() {
         // These are the same hex values used in the C++ test. The C++ test names
         // them ed_pk1/ed_pk2 and feeds them to `to_curve25519_pubkey`.
-        let ed_pk1 =
-            hex!("4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7");
-        let ed_pk2 =
-            hex!("5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876");
+        let ed_pk1 = hex!("4cb76fdc6d32278e3f83dbf608360ecc6b65727934b85d2fb86862ff98c46ab7");
+        let ed_pk2 = hex!("5ea34e72bb044654a6a23675690ef5ffaaf1656b02f93fb76655f9cbdbe89876");
 
         let x_pk1 = to_curve25519_pubkey(&ed_pk1).unwrap();
         let x_pk2 = to_curve25519_pubkey(&ed_pk2).unwrap();

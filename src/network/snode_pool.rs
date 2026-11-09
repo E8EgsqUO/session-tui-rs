@@ -115,11 +115,7 @@ impl SnodePool {
     }
 
     /// Gets random unused nodes from the pool, excluding the given list.
-    pub fn get_unused_nodes(
-        &self,
-        count: usize,
-        exclude: &[ServiceNode],
-    ) -> Vec<ServiceNode> {
+    pub fn get_unused_nodes(&self, count: usize, exclude: &[ServiceNode]) -> Vec<ServiceNode> {
         use rand::seq::SliceRandom;
 
         let available: Vec<&ServiceNode> = self
@@ -132,11 +128,7 @@ impl SnodePool {
         let mut shuffled: Vec<&ServiceNode> = available;
         shuffled.shuffle(&mut rng);
 
-        shuffled
-            .into_iter()
-            .take(count)
-            .cloned()
-            .collect()
+        shuffled.into_iter().take(count).cloned().collect()
     }
 
     /// Gets the swarm for a given pubkey.
@@ -157,8 +149,7 @@ impl SnodePool {
     /// Records a failure for a node. If `permanent`, removes it from the cache.
     pub fn record_node_failure(&mut self, pubkey: &Ed25519Pubkey, permanent: bool) {
         if permanent {
-            self.snode_cache
-                .retain(|n| n.ed25519_pubkey != *pubkey);
+            self.snode_cache.retain(|n| n.ed25519_pubkey != *pubkey);
             self.snode_strikes.remove(pubkey);
             self.regenerate_swarms();
             return;
@@ -168,8 +159,7 @@ impl SnodePool {
         *count += 1;
 
         if *count >= self.config.cache_node_strike_threshold {
-            self.snode_cache
-                .retain(|n| n.ed25519_pubkey != *pubkey);
+            self.snode_cache.retain(|n| n.ed25519_pubkey != *pubkey);
             self.snode_strikes.remove(pubkey);
             self.regenerate_swarms();
         }
@@ -435,9 +425,7 @@ fn parse_service_node_states(body: &[u8]) -> Result<Vec<ServiceNode>, SnodePoolN
         .get("result")
         .and_then(|r| r.get("service_node_states"))
         .and_then(|s| s.as_array())
-        .ok_or_else(|| {
-            SnodePoolNetworkError::Parse("missing result.service_node_states".into())
-        })?;
+        .ok_or_else(|| SnodePoolNetworkError::Parse("missing result.service_node_states".into()))?;
 
     let mut nodes = Vec::with_capacity(states.len());
     for entry in states {
@@ -680,7 +668,11 @@ mod tests {
         use crate::network::transport::MockTransport;
 
         let mut pool = SnodePool::new(SnodePoolConfig::default());
-        pool.add_nodes(vec![make_node(10, 100), make_node(20, 100), make_node(30, 100)]);
+        pool.add_nodes(vec![
+            make_node(10, 100),
+            make_node(20, 100),
+            make_node(30, 100),
+        ]);
 
         // Every snode responds with a DIFFERENT single node, so no entry is
         // seen by ≥2 responders.
@@ -688,7 +680,10 @@ mod tests {
         // The routes below are matched in-order; we hard-code three distinct
         // bodies keyed by the snode IP substring.
         for (id, ip) in [("11", "1.2.3.10"), ("22", "1.2.3.20"), ("33", "1.2.3.30")] {
-            let pk = format!("{}00000000000000000000000000000000000000000000000000000000000000", id);
+            let pk = format!(
+                "{}00000000000000000000000000000000000000000000000000000000000000",
+                id
+            );
             t.route_ok_json(
                 ip,
                 seed_response_body(

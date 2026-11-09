@@ -19,7 +19,10 @@ pub fn insert(text: &mut String, cursor: &mut usize, insert: &str) {
 }
 
 fn prev_boundary(text: &str, cursor: usize) -> Option<usize> {
-    text[..cursor].char_indices().next_back().map(|(index, _)| index)
+    text[..cursor]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
 }
 
 fn next_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -68,7 +71,9 @@ fn line_start(text: &str, cursor: usize) -> usize {
 }
 
 fn line_end(text: &str, cursor: usize) -> usize {
-    text[cursor..].find('\n').map_or(text.len(), |index| cursor + index)
+    text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |index| cursor + index)
 }
 
 pub fn home(text: &str, cursor: &mut usize) {

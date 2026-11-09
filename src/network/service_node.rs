@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::network::key_types::{Ed25519Pubkey, KeyError, X25519Pubkey, compute_x25519_pubkey};
-use crate::network::swarm::{SwarmId, INVALID_SWARM_ID};
+use crate::network::swarm::{INVALID_SWARM_ID, SwarmId};
 
 /// A service node on the Session network.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,7 +42,10 @@ impl ServiceNode {
 
     /// Returns the IP as a dotted-quad string.
     pub fn host(&self) -> String {
-        format!("{}.{}.{}.{}", self.ip[0], self.ip[1], self.ip[2], self.ip[3])
+        format!(
+            "{}.{}.{}.{}",
+            self.ip[0], self.ip[1], self.ip[2], self.ip[3]
+        )
     }
 
     /// Returns `host:https_port` string.
@@ -206,7 +209,9 @@ impl ServiceNode {
 
     /// Parses binary snode cache data. Each snode is 51 bytes:
     /// pubkey(32) | swarm_id(8) | ip(4) | https_port(2) | omq_port(2) | version(3)
-    pub fn process_snode_cache_bin(data: &[u8]) -> Result<(Vec<ServiceNode>, usize), ServiceNodeError> {
+    pub fn process_snode_cache_bin(
+        data: &[u8],
+    ) -> Result<(Vec<ServiceNode>, usize), ServiceNodeError> {
         const SNODE_SIZE: usize = 51;
 
         if data.len() % SNODE_SIZE != 0 {
@@ -245,13 +250,11 @@ impl ServiceNode {
                 }
 
                 // HTTPS port (2 bytes big-endian)
-                let https_port =
-                    u16::from_be_bytes([chunk[offset], chunk[offset + 1]]);
+                let https_port = u16::from_be_bytes([chunk[offset], chunk[offset + 1]]);
                 offset += 2;
 
                 // OMQ port (2 bytes big-endian)
-                let omq_port =
-                    u16::from_be_bytes([chunk[offset], chunk[offset + 1]]);
+                let omq_port = u16::from_be_bytes([chunk[offset], chunk[offset + 1]]);
                 offset += 2;
 
                 if omq_port == 0 {

@@ -253,9 +253,10 @@ impl GroupKeys {
                         let mut hashes = Vec::new();
                         for item in &items[1..] {
                             if let BtValue::String(h) = item
-                                && let Ok(s) = String::from_utf8(h.clone()) {
-                                    hashes.push(s);
-                                }
+                                && let Ok(s) = String::from_utf8(h.clone())
+                            {
+                                hashes.push(s);
+                            }
                         }
                         self.active_msgs.insert(*generation, hashes);
                     }
@@ -303,11 +304,12 @@ impl GroupKeys {
                 self.pending_generation = *generation;
             }
             if let Some(BtValue::String(k)) = pd.get(b"k".as_ref())
-                && k.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(k);
-                    self.pending_key = Some(arr);
-                }
+                && k.len() == 32
+            {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(k);
+                self.pending_key = Some(arr);
+            }
         }
 
         Ok(())
