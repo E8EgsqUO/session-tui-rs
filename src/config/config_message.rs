@@ -497,6 +497,17 @@ pub struct MutableConfigMessage {
 }
 
 impl MutableConfigMessage {
+    /// Wraps a (possibly merged) config as-is, keeping its seqno. Used by
+    /// `ConfigBase::merge`: adopting a remote config must not bump its
+    /// seqno, or the next remote update looks older than our copy.
+    pub fn from_config(msg: ConfigMessage) -> Self {
+        let orig = msg.data.clone();
+        MutableConfigMessage {
+            inner: msg,
+            orig_data: orig,
+        }
+    }
+
     /// Creates a new empty mutable config message.
     pub fn new_empty() -> Self {
         let msg = ConfigMessage::new();

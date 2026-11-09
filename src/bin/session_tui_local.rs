@@ -380,6 +380,12 @@ pub(super) fn forget_chat(app: &mut App, store: &LocalStore, peer: &str) {
     store.forget_chat_state(peer);
 }
 
+/// A chat's messages were deleted: drop its bookmarks.
+pub(super) fn forget_bookmarks(app: &mut App, store: &LocalStore, peer: &str) {
+    app.bookmarks.retain(|(chat, _)| chat != peer);
+    let _ = store.exec("DELETE FROM bookmarks WHERE peer = ?1", params![peer]);
+}
+
 /// Load drafts, pins and bookmarks into the app.
 pub(super) fn load(app: &mut App, store: &LocalStore) {
     app.drafts = Drafts::new(store.load_drafts());

@@ -55,6 +55,10 @@ pub enum AccountChange {
         name: String,
         auth_data: Vec<u8>,
     },
+    /// Remove a group from the account (deleted or left on this device).
+    LeaveGroup {
+        id: String,
+    },
 }
 
 impl AccountChange {
@@ -66,6 +70,8 @@ impl AccountChange {
             (SetBlocked { id: a, .. }, SetBlocked { id: b, .. })
             | (ContactExpiry { id: a, .. }, ContactExpiry { id: b, .. })
             | (JoinGroup { id: a, .. }, JoinGroup { id: b, .. }) => a != b,
+            (JoinGroup { id: a, .. } | LeaveGroup { id: a }, LeaveGroup { id: b })
+            | (LeaveGroup { id: a }, JoinGroup { id: b, .. }) => a != b,
             (ApproveContact { id: a, .. }, ApproveContact { id: b, .. })
             | (HideContact { id: a }, HideContact { id: b })
             | (HideContact { id: a }, ApproveContact { id: b, .. })
@@ -299,6 +305,20 @@ impl AccountConfigs {
                 }
                 self.contacts.edit_data(|data| {
                     dict(data, b"c").remove(&key);
+                });
+                true
+            }
+            AccountChange::LeaveGroup { id } => {
+                let Some(key) = id_key(id) else { return false };
+                let exists = matches!(
+                    self.groups.data().get(b"g".as_slice()),
+                    Some(ConfigValue::Dict(g)) if g.contains_key(&key)
+                );
+                if !exists {
+                    return false;
+                }
+                self.groups.edit_data(|data| {
+                    dict(data, b"g").remove(&key);
                 });
                 true
             }
@@ -541,11 +561,16 @@ mod tests {
             auth_data: vec![1; 100],
         });
         let dumps = configs.dumps();
-        let restored = AccountConfigs::new(&sk, &dumps.map(Some)).unwrap();
+        let restored = AccountConfigs::new(&sk, &dumps.clone().map(Some)).unwrap();
         let groups: Vec<_> = restored.groups.get().iter_groups().cloned().collect();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].base.name, "Team");
         assert_eq!(groups[0].auth_data, vec![1; 100]);
+        let mut configs = AccountConfigs::new(&sk, &dumps.map(Some)).unwrap();
+        configs.apply(&AccountChange::LeaveGroup {
+            id: "03".to_owned() + &"cd".repeat(32),
+        });
+        assert_eq!(configs.groups.get().iter_groups().count(), 0);
     }
 
     #[test]

@@ -379,6 +379,61 @@ impl<T: ConfigType> ConfigBase<T> {
     ///
     /// `messages` is a list of (hash, encrypted_data) pairs.
     /// Returns the hashes that were successfully processed.
+    /// Why a config message would or would not merge, for the debug log.
+    /// Reveals only sizes and the first plaintext byte.
+    pub fn diagnose(&self, encrypted: &[u8]) -> String {
+        let Some(plain) = self
+            .keys
+            .iter()
+            .find_map(|key| config_decrypt(encrypted, key, T::encryption_domain()).ok())
+        else {
+            return format!(
+                "decrypt=failed len={} keys={}",
+                encrypted.len(),
+                self.keys.len()
+            );
+        };
+        let start = plain.iter().position(|&b| b != 0).unwrap_or(plain.len());
+        let body = &plain[start..];
+        let first = body.first().copied().unwrap_or(0);
+        let mut out = format!(
+            "decrypt=ok plain={} pad={} first=0x{first:02x}",
+            plain.len(),
+            start
+        );
+        if first == b'z' {
+            match crate::util::zstd_compress::decompress(&body[1..], 1_000_000) {
+                Some(d) => {
+                    out += &format!(
+                        " zstd=ok size={} zfirst=0x{:02x}",
+                        d.len(),
+                        d.first().copied().unwrap_or(0)
+                    );
+                    out += &self.diagnose_parse(&d);
+                }
+                None => out += " zstd=failed",
+            }
+        }
+        if first == b'd' {
+            out += &self.diagnose_parse(body);
+        }
+        out
+    }
+
+    fn diagnose_parse(&self, plain: &[u8]) -> String {
+        let mine = self.message.seqno();
+        match crate::config::config_message::ConfigMessage::from_bytes(
+            plain,
+            self.verifier.clone(),
+            self.signer.clone(),
+            T::config_lags(),
+            false,
+        ) {
+            Ok(m) => format!(" parse=ok seqno={} mine={mine}", m.seqno()),
+            Err(e) => format!(" parse=failed ({e}) mine={mine}"),
+        }
+    }
+
     pub fn merge(&mut self, messages: &[(&str, &[u8])]) -> Result<Vec<String>, String> {
         if self.keys.is_empty() {
             return Err("Cannot merge configs without any decryption keys".into());
@@ -452,7 +507,7 @@ impl<T: ConfigType> ConfigBase<T> {
         let signer_for_merge = self.signer.clone();
 
         // Merge using ConfigMessage
-        match MutableConfigMessage::from_multiple(
+        match crate::config::config_message::ConfigMessage::from_multiple(
             &all_configs,
             verifier_for_merge,
             signer_for_merge,
@@ -462,6 +517,7 @@ impl<T: ConfigType> ConfigBase<T> {
             }),
         ) {
             Ok(new_msg) => {
+                let new_msg = MutableConfigMessage::from_config(new_msg);
                 let merged = new_msg.merged();
                 let new_seqno = new_msg.seqno();
 

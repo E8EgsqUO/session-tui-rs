@@ -129,6 +129,17 @@ fn deleting_a_chat_forgets_its_draft_pin_and_bookmarks() {
     session_tui_local::load(&mut app, &store);
     assert!(app.pinned.contains(&a) && !app.bookmarks.is_empty());
     delete_chat(&mut app, &store, ChatAction::Delete, &a);
+    assert!(app.bookmarks.is_empty() && store.load_bookmarks().is_empty());
+    assert!(
+        app.conversations
+            .iter()
+            .any(|c| c.id == a && c.messages.is_empty())
+    );
+    assert!(
+        app.pinned.contains(&a),
+        "/delete keeps the chat and its pin"
+    );
+    delete_chat(&mut app, &store, ChatAction::Remove, &a);
     assert!(app.pinned.is_empty() && app.bookmarks.is_empty());
     assert!(store.load_drafts().is_empty());
     assert!(store.load_pins().is_empty());

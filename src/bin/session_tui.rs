@@ -1817,6 +1817,8 @@ struct SessionClient {
     identity: Identity,
     network: Network<HttpTransport>,
     groups: Mutex<HashMap<String, GroupRuntime>>,
+    /// Groups we already told that we left (a retried leave is not resent).
+    left_groups: Mutex<HashSet<String>>,
     /// Swarm member we keep polling per account/group, while it answers.
     poll_nodes: Mutex<HashMap<String, ServiceNode>>,
     /// Message cursors per (swarm key, namespace, node), as the official
@@ -1847,6 +1849,9 @@ struct AccountSyncResult {
     dumps: [Option<Vec<u8>>; 4],
     /// Pending changes that are now stored on the swarm.
     applied: Vec<session_tui_account::AccountChange>,
+    /// Contacts and groups that were in the stored config but are gone from
+    /// the merged one: deleted (or the group left) on another device.
+    removed: Vec<String>,
 }
 
 /// Account config messages live for 30 days and are re-pushed on change.
@@ -2885,6 +2890,13 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Forget a group's invite/join record so it is not rediscovered.
+    fn forget_group(&self, group_id: &str) -> Result<(), String> {
+        self.exec("DELETE FROM group_invites WHERE group_id = ?1", [group_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn delete_empty_contact(&self, peer: &str) -> Result<(), String> {
         self.exec(
             "DELETE FROM contacts WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE peer_id = ?1)",
@@ -3090,6 +3102,7 @@ impl SessionClient {
             identity,
             network: Network::new(NetworkConfig::default(), transport),
             groups: Mutex::new(HashMap::new()),
+            left_groups: Mutex::new(HashSet::new()),
             poll_nodes: Mutex::new(HashMap::new()),
             node_cursors: Mutex::new(HashMap::new()),
             pending_cursors: Mutex::new(HashMap::new()),
@@ -3382,6 +3395,7 @@ impl SessionClient {
         &self,
         local_groups: &[LocalGroup],
         user_groups: Vec<UserGroupInfo>,
+        removed: &[String],
     ) -> Result<Vec<DiscoveredGroup>, String> {
         debug_log(
             "group.user_config.parsed",
@@ -3404,7 +3418,7 @@ impl SessionClient {
             candidates.push((group.id, group.base.name, group.secretkey, group.auth_data));
         }
         for local in local_groups {
-            if !candidates.iter().any(|(id, ..)| id == &local.id) {
+            if !removed.contains(&local.id) && !candidates.iter().any(|(id, ..)| id == &local.id) {
                 candidates.push((
                     local.id.clone(),
                     local.name.clone(),
@@ -3568,15 +3582,15 @@ impl SessionClient {
     /// `SharedConfigMessage` (kind 1 profile, 2 contacts, 3 read state,
     /// 4 groups); current ones store it raw.
     fn unwrap_shared_config(&self, wire: &[u8], kind: i32) -> Result<Vec<u8>, String> {
-        let ws = WebSocketMessage::decode(wire)
-            .map_err(|error| format!("invalid config websocket frame: {error}"))?;
-        if ws.r#type != Some(web_socket_message::Type::Request as i32) {
-            return Err("config websocket frame is not a request".to_owned());
-        }
-        let envelope_bytes = ws
-            .request
-            .and_then(|request| request.body)
-            .ok_or_else(|| "config websocket request has no body".to_owned())?;
+        // Older clients sent the Envelope inside a WebSocketMessage request;
+        // current ones store the bare Envelope.
+        let envelope_bytes = match WebSocketMessage::decode(wire) {
+            Ok(ws) if ws.r#type == Some(web_socket_message::Type::Request as i32) => ws
+                .request
+                .and_then(|request| request.body)
+                .ok_or_else(|| "config websocket request has no body".to_owned())?,
+            _ => wire.to_vec(),
+        };
         let envelope = Envelope::decode(envelope_bytes.as_slice())
             .map_err(|error| format!("invalid config envelope: {error}"))?;
         let ciphertext = envelope
@@ -3625,11 +3639,46 @@ impl SessionClient {
                 return false;
             }
         };
+        // Nothing of ours waits to be pushed: the swarm copy is the truth.
+        // Start from it instead of our dump, so a local copy whose seqno ran
+        // ahead (older builds bumped it on every merge) cannot shadow the
+        // other devices' changes. Pending changes are re-applied after.
+        if !messages.is_empty()
+            && !config.needs_push()
+            && let Ok(fresh) = ConfigBase::<T>::new(&self.identity.ed_secret, None)
+        {
+            *config = fresh;
+        }
         let raw: Vec<(&str, &[u8])> = messages
             .iter()
             .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
             .collect();
-        let mut good = config.merge(&raw).map(|hashes| hashes.len()).unwrap_or(0);
+        let merged = config.merge(&raw);
+        if let Err(error) = &merged {
+            debug_log(
+                "account.merge_error",
+                &format!("namespace={namespace} error={error}"),
+            );
+        }
+        let mut good = merged.map(|hashes| hashes.len()).unwrap_or(0);
+        if good < messages.len() {
+            for (_, wire) in &messages {
+                let unwrap = match self.unwrap_shared_config(wire, kind) {
+                    Ok(data) => {
+                        format!("unwrap=ok inner={} {}", data.len(), config.diagnose(&data))
+                    }
+                    Err(error) => format!("unwrap=failed ({error})"),
+                };
+                debug_log(
+                    "account.merge_diag",
+                    &format!(
+                        "namespace={namespace} {} {unwrap} head={}",
+                        config.diagnose(wire),
+                        hex::encode(&wire[..wire.len().min(6)])
+                    ),
+                );
+            }
+        }
         if good < messages.len() {
             let unwrapped: Vec<(String, Vec<u8>)> = messages
                 .iter()
@@ -3740,6 +3789,28 @@ impl SessionClient {
         use session_tui_account::AccountChange;
         let mut configs =
             session_tui_account::AccountConfigs::new(&self.identity.ed_secret, &dumps)?;
+        // Contacts still on the account: an entry that is gone, or no longer
+        // approved nor blocked, was deleted on another device.
+        let contact_ids = |configs: &session_tui_account::AccountConfigs| {
+            configs
+                .state()
+                .contacts
+                .into_iter()
+                .filter(|contact| contact.approved || contact.blocked)
+                .map(|contact| contact.id)
+                .collect::<HashSet<String>>()
+        };
+        let group_ids = |configs: &session_tui_account::AccountConfigs| {
+            configs
+                .groups
+                .get()
+                .iter_groups()
+                .filter(|group| group.removed_status == 0)
+                .map(|group| group.id.clone())
+                .collect::<HashSet<String>>()
+        };
+        let contacts_before = contact_ids(&configs);
+        let groups_before = group_ids(&configs);
         let safe = [
             self.merge_config_namespace(&mut configs.profile, 2, 1)
                 .await,
@@ -3756,11 +3827,15 @@ impl SessionClient {
             | AccountChange::HideContact { .. }
             | AccountChange::RemoveContact { .. } => 1,
             AccountChange::ReadUpTo { .. } => 2,
-            AccountChange::JoinGroup { .. } => 3,
+            AccountChange::JoinGroup { .. } | AccountChange::LeaveGroup { .. } => 3,
         };
         let mut attempted = Vec::new();
         for change in changes {
             if safe[slot(&change)] {
+                if let AccountChange::LeaveGroup { id } = &change {
+                    // While the group's keys are still loaded.
+                    self.send_group_leave(id).await;
+                }
                 configs.apply(&change);
                 attempted.push(change);
             }
@@ -3776,6 +3851,44 @@ impl SessionClient {
             .filter(|change| pushed[slot(change)])
             .collect();
         let state = configs.state();
+        let mut removed = Vec::new();
+        if safe[1] {
+            let now = contact_ids(&configs);
+            let flags = |configs: &session_tui_account::AccountConfigs, id: &str| {
+                configs
+                    .state()
+                    .contacts
+                    .into_iter()
+                    .find(|contact| contact.id == id)
+                    .map_or("absent".to_owned(), |c| {
+                        format!(
+                            "approved={} blocked={} hidden={}",
+                            c.approved, c.blocked, c.hidden
+                        )
+                    })
+            };
+            for id in contacts_before.symmetric_difference(&now) {
+                debug_log(
+                    "account.contact.changed",
+                    &format!(
+                        "prefix={} now={}",
+                        &id[..id.len().min(8)],
+                        flags(&configs, id)
+                    ),
+                );
+            }
+            removed.extend(contacts_before.difference(&now).cloned());
+        }
+        if safe[3] {
+            let now = group_ids(&configs);
+            removed.extend(groups_before.difference(&now).cloned());
+        }
+        if !removed.is_empty() {
+            debug_log(
+                "account.config.removed",
+                &format!("count={}", removed.len()),
+            );
+        }
         let user_groups = configs.groups.get().iter_groups().cloned().collect();
         let all_dumps = configs.dumps();
         // Keep the previous dump where we could not push: the change is
@@ -3786,6 +3899,7 @@ impl SessionClient {
             user_groups,
             dumps,
             applied,
+            removed,
         })
     }
 
@@ -3950,6 +4064,55 @@ impl SessionClient {
         self.send_content(recipient_id, content, timestamp_ms)
             .await
             .map(|_| ())
+    }
+
+    /// Tell a group we are leaving, as the official clients do: the admins'
+    /// clients take us off the member list, and every member sees
+    /// "… left the group". Best effort: we leave either way.
+    async fn send_group_leave(&self, group_id: &str) {
+        use libsession::proto::session_protos::{
+            GroupUpdateMemberLeftMessage, GroupUpdateMemberLeftNotificationMessage,
+            GroupUpdateMessage,
+        };
+        let first_time = self
+            .left_groups
+            .lock()
+            .map(|mut left| left.insert(group_id.to_owned()))
+            .unwrap_or(false);
+        let loaded = self
+            .groups
+            .lock()
+            .map(|groups| groups.contains_key(group_id))
+            .unwrap_or(false);
+        if !first_time || !loaded {
+            return;
+        }
+        let updates = [
+            GroupUpdateMessage {
+                member_left_message: Some(GroupUpdateMemberLeftMessage {}),
+                ..Default::default()
+            },
+            GroupUpdateMessage {
+                member_left_notification_message: Some(GroupUpdateMemberLeftNotificationMessage {}),
+                ..Default::default()
+            },
+        ];
+        for update in updates {
+            let data_message = DataMessage {
+                timestamp: Some(now_ms()),
+                group_update_message: Some(update),
+                ..Default::default()
+            };
+            let result = self.send_data_message(group_id, data_message, None).await;
+            debug_log(
+                "group.leave.sent",
+                &format!(
+                    "group_prefix={} ok={}",
+                    &group_id[..group_id.len().min(8)],
+                    result.is_ok()
+                ),
+            );
+        }
     }
 
     /// Tell a group we accepted its invite (shows as "joined" for others).
@@ -4737,7 +4900,14 @@ impl SessionClient {
             .as_ref()
             .map(|account| account.user_groups.clone())
             .unwrap_or_default();
-        let groups = match self.discover_groups(&local_groups, user_groups).await {
+        let removed = account
+            .as_ref()
+            .map(|account| account.removed.clone())
+            .unwrap_or_default();
+        let groups = match self
+            .discover_groups(&local_groups, user_groups, &removed)
+            .await
+        {
             Ok(groups) => groups,
             Err(error) => {
                 debug_log("group.sync.failed", &format!("error={error}"));
@@ -5801,6 +5971,12 @@ async fn run(
                 continue;
             }
             Event::Mouse(mouse) => {
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::Down(_)
+                ) {
+                    dismiss_unread_marker(app);
+                }
                 let was_dragging = app.dragging_divider;
                 handle_mouse(app, mouse);
                 if let Some(text) = app.clipboard.take() {
@@ -5829,6 +6005,7 @@ async fn run(
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        dismiss_unread_marker(app);
         if let Some(viewer) = app.image_viewer.as_ref() {
             let step: isize = match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -6518,9 +6695,10 @@ async fn run(
                             continue;
                         };
                         if action == ChatAction::Remove
-                            && (!id.starts_with("05") || id == app.local_id)
+                            && !((id.starts_with("05") && id != app.local_id)
+                                || id.starts_with("03"))
                         {
-                            app.status = "/remove IS FOR 1:1 CONTACTS · USE /delete".into();
+                            app.status = "/remove IS FOR CONTACTS AND GROUPS · USE /delete".into();
                             continue;
                         }
                         app.chat_prompt = Some((action, id));
@@ -7489,9 +7667,18 @@ fn start_sync(
 }
 
 /// Carry out a confirmed `/delete` or `/remove`; returns the status line.
-fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) -> String {
+/// A contact or group was deleted on another device: drop the chat here
+/// too, without queueing anything for the swarm (it is already gone there).
+fn remove_chat_deleted_elsewhere(app: &mut App, store: &LocalStore, id: &str) {
+    if id == app.local_id {
+        return;
+    }
+    app.approved.remove(id);
+    if id.starts_with("03") {
+        let _ = store.forget_group(id);
+    }
     let Some(index) = app.conversations.iter().position(|c| c.id == id) else {
-        return "CHAT NOT FOUND".into();
+        return;
     };
     let removed = app.conversations.remove(index);
     for message in &removed.messages {
@@ -7502,30 +7689,69 @@ fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) 
     if app.selected > index || app.selected >= app.conversations.len() {
         app.selected = app.selected.saturating_sub(1);
     }
-    let one_to_one = id.starts_with("05") && id != app.local_id;
-    match action {
-        ChatAction::Remove => {
-            app.approved.remove(id);
-            store.queue_account_change(session_tui_account::AccountChange::RemoveContact {
-                id: id.to_owned(),
-            });
-            "CONTACT REMOVED · NEW MESSAGES FROM THEM ARRIVE AS A REQUEST".into()
+    debug_log(
+        "chat.removed_elsewhere",
+        &format!("prefix={}", &id[..id.len().min(8)]),
+    );
+}
+
+/// `/delete` clears a chat's messages and keeps the chat; `/remove` takes
+/// the contact or group off the account and drops the chat entirely.
+fn delete_chat(app: &mut App, store: &LocalStore, action: ChatAction, id: &str) -> String {
+    let Some(index) = app.conversations.iter().position(|c| c.id == id) else {
+        return "CHAT NOT FOUND".into();
+    };
+    if action == ChatAction::Delete {
+        let messages = std::mem::take(&mut app.conversations[index].messages);
+        for message in &messages {
+            let _ = store.delete_message(id, message);
         }
-        ChatAction::Delete if one_to_one => {
-            store.queue_account_change(session_tui_account::AccountChange::HideContact {
-                id: id.to_owned(),
-            });
-            "CHAT DELETED".into()
-        }
-        ChatAction::Delete if id.starts_with("03") => {
-            "GROUP HISTORY DELETED · THE GROUP STAYS UNTIL YOU LEAVE IT".into()
-        }
-        ChatAction::Delete => "CHAT DELETED".into(),
+        session_tui_local::forget_bookmarks(app, store, id);
+        return format!("{} MESSAGES DELETED", messages.len());
     }
+    let removed = app.conversations.remove(index);
+    for message in &removed.messages {
+        let _ = store.delete_message(id, message);
+    }
+    let _ = store.delete_empty_contact(id);
+    session_tui_local::forget_chat(app, store, id);
+    if app.selected > index || app.selected >= app.conversations.len() {
+        app.selected = app.selected.saturating_sub(1);
+    }
+    if id.starts_with("03") {
+        let _ = store.forget_group(id);
+        store.queue_account_change(session_tui_account::AccountChange::LeaveGroup {
+            id: id.to_owned(),
+        });
+        return "LEFT THE GROUP · REMOVED ON ALL YOUR DEVICES".into();
+    }
+    app.approved.remove(id);
+    store.queue_account_change(session_tui_account::AccountChange::RemoveContact {
+        id: id.to_owned(),
+    });
+    "CONTACT REMOVED · NEW MESSAGES FROM THEM ARRIVE AS A REQUEST".into()
 }
 
 /// Keep the "Unread Messages" boundary of the open chat (see
 /// [`session_tui_separators::UnreadMarker`]). Only reads state.
+/// The user scrolled or pressed a key: once the open chat is all read,
+/// they have seen the unread line, so stop drawing it.
+fn dismiss_unread_marker(app: &mut App) {
+    let Some(conversation) = app.conversations.get(app.selected) else {
+        return;
+    };
+    let all_read = !conversation
+        .messages
+        .iter()
+        .any(|m| !m.outgoing && !m.is_read && !m.system);
+    if let Some(marker) = app.unread_marker.as_mut()
+        && marker.conversation == conversation.id
+        && all_read
+    {
+        marker.dismissed = true;
+    }
+}
+
 fn update_unread_marker(app: &mut App) {
     let Some(conversation) = app.conversations.get(app.selected) else {
         app.unread_marker = None;
@@ -7913,6 +8139,9 @@ fn finish_sync(
             let _ = store.set_pending_account_changes(&pending);
         }
         apply_account_state(app, store, &account.state);
+        for id in &account.removed {
+            remove_chat_deleted_elsewhere(app, store, id);
+        }
     }
     let groups_found = result.groups.len();
     for group in result.groups.iter() {
@@ -8559,8 +8788,14 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
             .map_or("", |c| c.title(&app.local_id));
         let (title, text) = match action {
             ChatAction::Delete => (
-                " Delete chat ",
-                format!("  Delete the chat with {name} and all its messages?    Y yes    Esc no"),
+                " Delete messages ",
+                format!("  Delete all messages in {name}? The chat stays.    Y yes    Esc no"),
+            ),
+            ChatAction::Remove if id.starts_with("03") => (
+                " Remove group ",
+                format!(
+                    "  Leave the group {name} (members are told) and delete the chat?    Y yes    Esc no"
+                ),
             ),
             ChatAction::Remove => (
                 " Remove contact ",
@@ -9242,7 +9477,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         let unread_at = app
             .unread_marker
             .as_ref()
-            .filter(|marker| marker.conversation == c.id)
+            .filter(|marker| marker.conversation == c.id && !marker.dismissed)
             .and_then(|marker| marker.first_unread.as_ref())
             .and_then(|key| c.position_of(key, &app.local_id));
         if let Some(today) = session_tui_separators::today() {

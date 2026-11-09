@@ -140,11 +140,11 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ("/decline", "Decline a message request (deletes it)"),
             (
                 "/delete",
-                "Delete this chat and its messages (the contact stays)",
+                "Delete all messages in this chat (the chat stays)",
             ),
             (
                 "/remove",
-                "Remove this contact from your account and delete the chat",
+                "Remove this contact or group from your account and delete the chat",
             ),
             (
                 "/block · /unblock",

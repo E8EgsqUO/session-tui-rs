@@ -166,12 +166,15 @@ pub fn separators(
 }
 
 /// The unread boundary of one visit to a chat. It is fixed when the chat
-/// is opened and only filled in later if unread messages arrive while it
-/// had none, so reading (or scrolling) never moves or removes the line.
+/// is opened, so being marked read never moves it. The line is hidden once
+/// the user scrolls or presses a key with everything read (they have seen
+/// it); new unread messages bring it back at the new boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnreadMarker {
     pub conversation: String,
     pub first_unread: Option<MessageKey>,
+    /// The line was seen and is no longer drawn (`/unread` still uses it).
+    pub dismissed: bool,
 }
 
 impl UnreadMarker {
@@ -182,12 +185,16 @@ impl UnreadMarker {
             Some(current) if current.conversation == conversation => {
                 if current.first_unread.is_none() {
                     current.first_unread = first_unread;
+                } else if current.dismissed && first_unread.is_some() {
+                    current.first_unread = first_unread;
+                    current.dismissed = false;
                 }
             }
             _ => {
                 *marker = Some(Self {
                     conversation: conversation.to_owned(),
                     first_unread,
+                    dismissed: false,
                 });
             }
         }

@@ -1,6 +1,6 @@
 [package]
 name = "libsession"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2024"
 # Files beside session_tui.rs are modules, not independent executables.
 autobins = false
