@@ -6233,20 +6233,10 @@ async fn run(
                     app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
                 }
             }
-            KeyCode::Tab
-                if app.focus == FocusArea::Composer
-                    && app.input_mode == InputMode::Message
-                    && !app.input.starts_with('/')
-                    && let Some(peer) =
-                        app.conversations.get(app.selected).map(|c| c.id.clone())
-                    && let names = app
-                        .mention_names(&peer)
-                        .into_iter()
-                        .map(|(name, _)| name)
-                        .collect::<Vec<_>>()
-                    && let Some((input, cursor, matches)) =
-                        session_tui_mentions::complete(&app.input, app.cursor, &names) =>
-            {
+            KeyCode::Tab if mention_completion(app).is_some() => {
+                let Some((input, cursor, matches)) = mention_completion(app) else {
+                    unreachable!()
+                };
                 app.input = input;
                 app.cursor = cursor;
                 app.status = if matches.len() > 1 {
@@ -11451,3 +11441,20 @@ mod session_tui_quality_tests;
 #[cfg(test)]
 #[path = "session_tui_feature_tests.rs"]
 mod session_tui_feature_tests;
+
+/// Tab completion of an `@name` mention in the composer, if one applies.
+fn mention_completion(app: &App) -> Option<(String, usize, Vec<String>)> {
+    if app.focus != FocusArea::Composer
+        || app.input_mode != InputMode::Message
+        || app.input.starts_with('/')
+    {
+        return None;
+    }
+    let peer = app.conversations.get(app.selected)?.id.clone();
+    let names = app
+        .mention_names(&peer)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    session_tui_mentions::complete(&app.input, app.cursor, &names)
+}
