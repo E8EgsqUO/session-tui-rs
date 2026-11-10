@@ -63,7 +63,9 @@ jobs:
   linux-x86_64:
     if: github.event_name != 'schedule'
     name: Linux x86_64
-    runs-on: ubuntu-24.04
+    # Built on the oldest hosted image so the binary runs on older distros:
+    # the bundled C code (SQLCipher) links against whatever glibc is here.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install protobuf compiler
@@ -81,6 +83,11 @@ jobs:
           restore-keys: linux-x86_64-cargo-
       - name: Build
         run: cargo build --locked --release --bin session-tui
+      - name: Check glibc requirement (2.35 or older)
+        run: |
+          newest=$(objdump -T target/release/session-tui | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "newest glibc symbol version: $newest"
+          [ "$(printf '%s\n' GLIBC_2.35 "$newest" | sort -V | tail -1)" = GLIBC_2.35 ]
       - name: Name binary
         run: cp target/release/session-tui session-tui-linux-x86_64
       - uses: actions/upload-artifact@v4

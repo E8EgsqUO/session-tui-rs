@@ -6,6 +6,7 @@ mod session_tui_group;
 mod session_tui_input;
 mod session_tui_local;
 mod session_tui_media;
+mod session_tui_mentions;
 mod session_tui_netdiag;
 mod session_tui_search;
 mod session_tui_separators;
@@ -563,6 +564,8 @@ struct App {
     message_hitboxes: Vec<(u16, u16, usize, Option<usize>)>,
     /// Display names of group members and other senders, by Session ID.
     display_names: HashMap<String, String>,
+    /// Member lists of the groups, from the last sync.
+    group_members: HashMap<String, Vec<GroupMember>>,
     /// Message the next text/attachment replies to.
     reply_to: Option<QuoteRef>,
     /// Composer cursor (byte offset into `input`).
@@ -659,6 +662,7 @@ impl App {
             message_viewport: None,
             message_hitboxes: Vec::new(),
             display_names: HashMap::new(),
+            group_members: HashMap::new(),
             reply_to: None,
             cursor: 0,
             bell: true,
@@ -738,6 +742,17 @@ impl App {
             && !self.approved.contains(&conversation.id)
             && !conversation.messages.is_empty()
             && !conversation.messages.iter().any(|m| m.outgoing)
+    }
+
+    /// `(name, id)` of the members of group `peer` that can be mentioned.
+    fn mention_names(&self, peer: &str) -> Vec<(String, String)> {
+        self.group_members
+            .get(peer)
+            .into_iter()
+            .flatten()
+            .filter(|member| member.id != self.local_id)
+            .map(|member| (self.sender_label(&member.id), member.id.clone()))
+            .collect()
     }
 
     fn sender_label(&self, sender: &str) -> String {
@@ -1608,10 +1623,13 @@ fn parse_content(
                 action,
                 ids: change.member_session_ids,
             })
-        } else if update.member_left_message.is_some()
-            || update.member_left_notification_message.is_some()
-        {
+        } else if update.member_left_notification_message.is_some() {
+            // A leaving member sends two messages: `member_left_message` is
+            // the request for the admins' clients and is not shown; this one
+            // is the visible notice.
             Some(ChatEvent::Notice("left the group".into()))
+        } else if update.member_left_message.is_some() {
+            None
         } else if let Some(response) = update.invite_response {
             response
                 .is_approved
@@ -1761,6 +1779,18 @@ struct DiscoveredGroup {
     id: String,
     name: String,
     can_write: bool,
+    /// From the group's member list; empty if it could not be read.
+    members: Vec<GroupMember>,
+}
+
+#[derive(Clone, Debug)]
+struct GroupMember {
+    id: String,
+    /// The name the group stores for them (may be empty).
+    name: String,
+    admin: bool,
+    /// Invited, has not accepted yet.
+    pending: bool,
 }
 
 #[derive(Clone)]
@@ -3443,6 +3473,7 @@ impl SessionClient {
                     config_name.clone()
                 },
                 can_write: false,
+                members: Vec::new(),
             };
             let auth = if admin_seed.len() == 32 {
                 let (derived_pk, secret_key) =
@@ -3553,6 +3584,33 @@ impl SessionClient {
                 .filter(|name| !name.is_empty())
             {
                 discovered.name = name;
+            }
+            // The member list, for /members and @mentions (best effort).
+            if let Ok(member_messages) = self.retrieve_namespace_raw(&id, 14, &swarm_auth).await
+                && let Ok(mut members) = ConfigBase::<
+                    libsession::config::groups::members::GroupMembers,
+                >::new_group(
+                    &public_key, admin_secret, None
+                )
+            {
+                for key in keys.iter().rev() {
+                    members.add_key(key.key, true);
+                }
+                let merge: Vec<(&str, &[u8])> = member_messages
+                    .iter()
+                    .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
+                    .collect();
+                let _ = members.merge(&merge);
+                discovered.members = members
+                    .get()
+                    .iter()
+                    .map(|member| GroupMember {
+                        id: member.session_id.clone(),
+                        name: member.name.clone(),
+                        admin: member.admin,
+                        pending: member.invite_pending(),
+                    })
+                    .collect();
             }
             debug_log(
                 "group.config.runtime_ready",
@@ -4116,7 +4174,7 @@ impl SessionClient {
     }
 
     /// Tell a group we accepted its invite (shows as "joined" for others).
-    async fn send_invite_response(&self, group_id: &str) -> Result<(), String> {
+    async fn send_invite_response(&self, group_id: &str, profile_name: &str) -> Result<(), String> {
         use libsession::proto::session_protos::{
             GroupUpdateInviteResponseMessage, GroupUpdateMessage,
         };
@@ -4127,6 +4185,9 @@ impl SessionClient {
                 invite_response: Some(GroupUpdateInviteResponseMessage { is_approved: true }),
                 ..Default::default()
             }),
+            // As the official clients: the admins' clients take our name
+            // from it when they mark the invite accepted.
+            profile: profile_for(profile_name, timestamp_ms),
             ..Default::default()
         };
         self.send_data_message(group_id, data_message, None)
@@ -4944,7 +5005,16 @@ impl SessionClient {
                 .lock()
                 .map(|groups| groups.contains_key(&local.id))
                 .unwrap_or(false);
-            if ready && self.send_invite_response(&local.id).await.is_ok() {
+            let profile_name = account
+                .as_ref()
+                .and_then(|account| account.state.profile_name.clone())
+                .unwrap_or_default();
+            if ready
+                && self
+                    .send_invite_response(&local.id, &profile_name)
+                    .await
+                    .is_ok()
+            {
                 invite_responses.push(local.id.clone());
             }
         }
@@ -5876,6 +5946,10 @@ async fn run(
             }
         }
         session_tui_netdiag::poll(app, client, store).await;
+        // Copies requested by a key or command (mouse ones are sent at once).
+        if let Some(text) = app.clipboard.take() {
+            copy_to_clipboard(terminal.backend_mut(), &text);
+        }
         if let Some((input, cursor)) = app.restore_input.take() {
             app.input = input;
             app.cursor = cursor;
@@ -6158,6 +6232,28 @@ async fn run(
                 } else {
                     app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
                 }
+            }
+            KeyCode::Tab
+                if app.focus == FocusArea::Composer
+                    && app.input_mode == InputMode::Message
+                    && !app.input.starts_with('/')
+                    && let Some(peer) =
+                        app.conversations.get(app.selected).map(|c| c.id.clone())
+                    && let names = app
+                        .mention_names(&peer)
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
+                    && let Some((input, cursor, matches)) =
+                        session_tui_mentions::complete(&app.input, app.cursor, &names) =>
+            {
+                app.input = input;
+                app.cursor = cursor;
+                app.status = if matches.len() > 1 {
+                    format!("@{}", matches.join("  @"))
+                } else {
+                    "MENTION COMPLETED".into()
+                };
             }
             KeyCode::Tab
                 if app.focus == FocusArea::Composer
@@ -6744,6 +6840,17 @@ async fn run(
                         app.cursor = 0;
                         session_tui_browse::open_media(app);
                     }
+                    "/id" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        app.clipboard = Some(app.local_id.clone());
+                        app.status = format!("YOUR SESSION ID COPIED · {}", app.local_id);
+                    }
+                    "/members" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        open_members(app);
+                    }
                     "/links" if rest.is_empty() => {
                         app.input.clear();
                         app.cursor = 0;
@@ -7005,6 +7112,12 @@ async fn run(
                             app.focus = FocusArea::Composer;
                             continue;
                         }
+                        let mentionable = app
+                            .conversations
+                            .get(app.selected)
+                            .map(|c| app.mention_names(&c.id))
+                            .unwrap_or_default();
+                        let body = session_tui_mentions::expand(&body, &mentionable);
                         let Some(conversation) = app.conversations.get_mut(app.selected) else {
                             app.status = "ADD A CONTACT FIRST WITH CTRL+N".into();
                             continue;
@@ -7667,6 +7780,55 @@ fn start_sync(
 }
 
 /// Carry out a confirmed `/delete` or `/remove`; returns the status line.
+/// `/members`: the open group's member list. Enter mentions the member.
+fn open_members(app: &mut App) {
+    let Some(c) = app.conversations.get(app.selected) else {
+        app.status = "NO CHAT OPEN".into();
+        return;
+    };
+    if !c.id.starts_with("03") {
+        app.status = "/members IS FOR GROUPS".into();
+        return;
+    }
+    let Some(members) = app.group_members.get(&c.id) else {
+        app.status = "MEMBER LIST NOT LOADED YET · TRY AFTER THE NEXT SYNC (/rsync)".into();
+        return;
+    };
+    let mut members = members.clone();
+    members.sort_by_key(|m| (!m.admin, m.pending, app.sender_label(&m.id).to_lowercase()));
+    let items = members
+        .iter()
+        .map(|member| {
+            let name = app.sender_label(&member.id);
+            let mut head = name.clone();
+            if member.admin {
+                head += " · admin";
+            }
+            if member.pending {
+                head += " · invited, not joined yet";
+            }
+            session_tui_browse::Item {
+                conversation: c.id.clone(),
+                key: session_tui_separators::MessageKey {
+                    timestamp_ms: 0,
+                    outgoing: false,
+                    author: member.id.clone(),
+                },
+                head,
+                detail: short_id(&member.id),
+                url: (member.id != app.local_id).then_some(name),
+                attachment: None,
+            }
+        })
+        .collect();
+    let title = format!("Members · {}", c.title(&app.local_id));
+    app.browse = Some(session_tui_browse::BrowseView::new(
+        session_tui_browse::Kind::Members,
+        title,
+        items,
+    ));
+}
+
 /// A contact or group was deleted on another device: drop the chat here
 /// too, without queueing anything for the swarm (it is already gone there).
 fn remove_chat_deleted_elsewhere(app: &mut App, store: &LocalStore, id: &str) {
@@ -8148,6 +8310,16 @@ fn finish_sync(
         let index = app.ensure_contact(&group.id);
         app.conversations[index].name = group.name.clone();
         app.conversations[index].read_only = !group.can_write;
+        if !group.members.is_empty() {
+            for member in &group.members {
+                if !member.name.is_empty() && !app.display_names.contains_key(&member.id) {
+                    app.display_names
+                        .insert(member.id.clone(), member.name.clone());
+                }
+            }
+            app.group_members
+                .insert(group.id.clone(), group.members.clone());
+        }
         let _ = store.save_contact_name(&group.id, &group.name);
     }
     for group in &result.invite_responses {
@@ -8744,8 +8916,9 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
         return None;
     }
     if let Some(mut view) = app.browse.take() {
+        let members = view.kind == session_tui_browse::Kind::Members;
         session_tui_browse::draw(frame, area, &mut view, |item| {
-            session_tui_browse::locate(app, &item.conversation, &item.key).is_some()
+            members || session_tui_browse::locate(app, &item.conversation, &item.key).is_some()
         });
         app.browse = Some(view);
     }
@@ -9123,7 +9296,7 @@ fn message_layout_key(app: &App, message: &Message, width: usize) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     width.hash(&mut hasher);
     message.system.hash(&mut hasher);
-    message.body.hash(&mut hasher);
+    session_tui_mentions::display(&message.body, |id| app.sender_label(id)).hash(&mut hasher);
     message.timestamp_ms.hash(&mut hasher);
     if let Some(quote) = &message.quote {
         app.sender_label(&quote.author).hash(&mut hasher);
@@ -9317,7 +9490,8 @@ fn message_lines(
         }
         attachment_ranges.push((attachment_start, lines.len(), attachment_index));
     }
-    for text_line in message.body.lines() {
+    let body = session_tui_mentions::display(&message.body, |id| app.sender_label(id));
+    for text_line in body.lines() {
         push_wrapped(&mut lines, "    ", text_line, Style::default().fg(TEXT));
     }
     for (url, title) in &message.links {
@@ -10969,6 +11143,7 @@ mod history_key_tests {
             id: group.clone(),
             name: "New group".into(),
             can_write: true,
+            members: Vec::new(),
         }];
         finish_sync(
             &mut app,

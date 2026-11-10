@@ -90,6 +90,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Attachments of this chat · Enter open · V view · S save",
             ),
             ("/links", "Links in this chat · Enter open · C copy"),
+            (
+                "/members",
+                "Members of this group · Enter mentions · type @ and Tab to complete a name",
+            ),
         ],
     ),
     (
@@ -151,6 +155,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Block / unblock this 1:1 contact on all your devices",
             ),
             ("/rsync", "Fetch messages now (also automatic)"),
+            ("/id", "Copy your Session ID (or double-click the top bar)"),
             (
                 "/net",
                 "Network diagnostics (paths, nodes, outbox; R refresh)",

@@ -454,6 +454,8 @@ pub enum Kind {
     Bookmarks,
     Media,
     Links,
+    /// `/members`: `url` holds the name to mention (None for ourselves).
+    Members,
 }
 
 #[derive(Clone, Debug)]
@@ -515,6 +517,7 @@ impl BrowseView {
             Kind::Bookmarks => " ↑/↓ select · Enter open · Esc back ",
             Kind::Media => " ↑/↓ select · Enter open · V view · S save · Esc back ",
             Kind::Links => " ↑/↓ select · Enter open message · C copy URL · Esc back ",
+            Kind::Members => " ↑/↓ select · Enter mention · C copy Session ID · Esc back ",
         }
     }
 
@@ -523,6 +526,7 @@ impl BrowseView {
             Kind::Bookmarks => "No bookmarks. Select a message and use /bookmark.",
             Kind::Media => "No attachments in this chat.",
             Kind::Links => "No links in this chat.",
+            Kind::Members => "No members listed.",
         }
     }
 }
@@ -542,6 +546,20 @@ pub(super) fn handle_key(app: &mut App, code: crossterm::event::KeyCode) {
         KeyCode::PageDown => view.step(page),
         KeyCode::Home => view.step(isize::MIN),
         KeyCode::End => view.step(isize::MAX),
+        KeyCode::Enter if view.kind == Kind::Members => {
+            if let Some(name) = view.current().and_then(|item| item.url.clone()) {
+                let mention = format!("@{name} ");
+                super::session_tui_input::insert(&mut app.input, &mut app.cursor, &mention);
+                app.focus = super::FocusArea::Composer;
+                app.browse = None;
+            }
+        }
+        KeyCode::Char('c' | 'C') if view.kind == Kind::Members => {
+            if let Some(id) = view.current().map(|item| item.key.author.clone()) {
+                app.clipboard = Some(id);
+                app.status = "SESSION ID COPIED".into();
+            }
+        }
         KeyCode::Enter => {
             let Some(item) = view.current().cloned() else {
                 return;
