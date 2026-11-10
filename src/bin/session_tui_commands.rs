@@ -53,8 +53,16 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Messages (focus the message list)",
         &[
-            ("r", "Reply to the selected message (Esc cancels)"),
-            ("e  then 1-6", "Reaction bar: 😂 🥰 😢 😡 😮 😈"),
+            (
+                "/r1 … /r5 [TEXT]",
+                "Reply to a message on screen: 1 is the lowest, 2 the one above",
+            ),
+            (
+                "/e1 … /e5 [EMOJI]",
+                "React to it the same way: 👍, or an emoji, :shortcode: or 1-6",
+            ),
+            ("/reply", "Reply to the selected message (Esc cancels)"),
+            ("/react", "Reaction bar, then 1-6: 😂 🥰 😢 😡 😮 😈"),
             ("+", "React 👍"),
             (
                 "/react EMOJI",
@@ -187,9 +195,7 @@ pub fn commands() -> Vec<&'static str> {
         .flat_map(|(_, entries)| entries.iter())
         .flat_map(|(keys, _)| keys.split_whitespace())
         .filter(|word| {
-            word.starts_with('/')
-                && word.len() > 1
-                && !word[1..].starts_with(|c: char| c.is_ascii_digit())
+            word.starts_with('/') && word.len() > 1 && !word.contains(|c: char| c.is_ascii_digit())
         })
         .collect();
     out.sort_unstable();

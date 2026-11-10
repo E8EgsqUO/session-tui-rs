@@ -6256,17 +6256,6 @@ async fn run(
             KeyCode::Delete if editing => {
                 session_tui_input::delete(&mut app.input, &mut app.cursor);
             }
-            KeyCode::Char('e')
-                if app.focus == FocusArea::Messages
-                    && app.input.is_empty()
-                    && key.modifiers.is_empty() =>
-            {
-                if app.selected_message().is_some_and(|m| !m.system) {
-                    app.reaction_picker = true;
-                } else {
-                    app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
-                }
-            }
             KeyCode::Tab if mention_completion(app).is_some() => {
                 let Some((input, cursor, matches)) = mention_completion(app) else {
                     unreachable!()
@@ -6324,26 +6313,6 @@ async fn run(
             KeyCode::Esc if app.reply_to.is_some() => {
                 app.reply_to = None;
                 app.status = "REPLY CANCELLED".into();
-            }
-            KeyCode::Char('r')
-                if app.focus == FocusArea::Messages
-                    && app.input.is_empty()
-                    && key.modifiers.is_empty() =>
-            {
-                let local_id = client.identity.session_id.clone();
-                if let Some(conversation) = app.conversations.get(app.selected)
-                    && let Some(message) = conversation.messages.get(conversation.selected_message)
-                    && !message.system
-                    && message.send_state == SendState::Sent
-                {
-                    app.reply_to = Some(QuoteRef {
-                        id: message.timestamp_ms,
-                        author: message.author(&conversation.id, &local_id).to_owned(),
-                        text: message.preview_text(),
-                    });
-                    app.focus = FocusArea::Composer;
-                    app.status = "REPLYING · ESC TO CANCEL".into();
-                }
             }
             KeyCode::Char('+') if app.focus == FocusArea::Messages && app.input.is_empty() => {
                 react_to_selected(app, client, store, "👍", &mut background_tasks);
@@ -6477,7 +6446,40 @@ async fn run(
                     }
                     continue;
                 }
+                // `/r1`–`/r5` and `/e1`–`/e5`: reply or react to a message
+                // counted up from the bottom of what the transcript shows.
+                if let Some((kind, number)) = quick_message_command(command) {
+                    app.input.clear();
+                    app.cursor = 0;
+                    let Some(index) = visible_message_from_bottom(app, number) else {
+                        app.status = format!("NO MESSAGE {number} ON SCREEN");
+                        continue;
+                    };
+                    app.conversations[app.selected].selected_message = index;
+                    if kind == 'r' {
+                        if start_reply(app) {
+                            // `/r2 text` leaves the text ready to send.
+                            app.input = rest.to_owned();
+                            app.cursor = app.input.len();
+                        }
+                    } else {
+                        let emoji = match rest {
+                            "" => "👍".to_owned(),
+                            "1" | "2" | "3" | "4" | "5" | "6" => {
+                                QUICK_REACTIONS[rest.parse::<usize>().unwrap_or(1) - 1].to_owned()
+                            }
+                            other => expand_shortcodes(other),
+                        };
+                        react_to_selected(app, client, store, &emoji, &mut background_tasks);
+                    }
+                    continue;
+                }
                 match command {
+                    "/reply" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        start_reply(app);
+                    }
                     "/attach" => {
                         app.input.clear();
                         let (paths, caption) = match rest.split_once(" -- ") {
@@ -7008,7 +7010,12 @@ async fn run(
                     "/react" => {
                         app.input.clear();
                         if rest.is_empty() {
-                            app.status = "USAGE · /react EMOJI (again to remove)".into();
+                            // The reaction bar: 1-6 picks one.
+                            if app.selected_message().is_some_and(|m| !m.system) {
+                                app.reaction_picker = true;
+                            } else {
+                                app.status = "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+                            }
                         } else {
                             let emoji = expand_shortcodes(rest);
                             react_to_selected(app, client, store, &emoji, &mut background_tasks);
@@ -7516,6 +7523,54 @@ fn apply_reaction(message: &mut Message, emoji: &str, author: &str, remove: bool
 
 /// Toggle our `emoji` reaction on the selected message (Session behaviour:
 /// reacting again with the same emoji removes it).
+/// `/r1`…`/r5` → ('r', n); `/e1`…`/e5` → ('e', n).
+fn quick_message_command(command: &str) -> Option<(char, usize)> {
+    let mut chars = command.strip_prefix('/')?.chars();
+    let kind = chars.next().filter(|kind| matches!(kind, 'r' | 'e'))?;
+    let number = chars.next()?.to_digit(10)? as usize;
+    (chars.next().is_none() && (1..=5).contains(&number)).then_some((kind, number))
+}
+
+/// The message `number` up from the bottom of the transcript as last drawn
+/// (1 = the lowest one on screen), not counting notice lines.
+fn visible_message_from_bottom(app: &App, number: usize) -> Option<usize> {
+    if app.transcript_conversation != app.selected {
+        return None;
+    }
+    let conversation = app.conversations.get(app.selected)?;
+    app.message_hitboxes
+        .iter()
+        .filter(|(_, _, _, attachment)| attachment.is_none())
+        .map(|(_, _, index, _)| *index)
+        .filter(|index| conversation.messages.get(*index).is_some_and(|m| !m.system))
+        .rev()
+        .nth(number.checked_sub(1)?)
+}
+
+/// Start replying to the selected message. Returns false (with a status
+/// line) if it can't be replied to.
+fn start_reply(app: &mut App) -> bool {
+    let Some(conversation) = app.conversations.get(app.selected) else {
+        return false;
+    };
+    let Some(message) = conversation
+        .messages
+        .get(conversation.selected_message)
+        .filter(|m| !m.system && m.send_state == SendState::Sent)
+    else {
+        app.status = "THIS MESSAGE CAN'T BE REPLIED TO".into();
+        return false;
+    };
+    app.reply_to = Some(QuoteRef {
+        id: message.timestamp_ms,
+        author: message.author(&conversation.id, &app.local_id).to_owned(),
+        text: message.preview_text(),
+    });
+    app.focus = FocusArea::Composer;
+    app.status = "REPLYING · ESC TO CANCEL".into();
+    true
+}
+
 fn react_to_selected(
     app: &mut App,
     client: &Arc<SessionClient>,
@@ -11531,4 +11586,20 @@ fn mention_completion(app: &App) -> Option<(String, usize, Vec<String>)> {
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
     session_tui_mentions::complete(&app.input, app.cursor, &names)
+}
+
+#[cfg(test)]
+mod quick_message_tests {
+    use super::quick_message_command;
+
+    #[test]
+    fn only_r_and_e_with_one_digit_from_1_to_5() {
+        assert_eq!(quick_message_command("/r1"), Some(('r', 1)));
+        assert_eq!(quick_message_command("/e5"), Some(('e', 5)));
+        for other in [
+            "/r0", "/r6", "/r12", "/r", "/e", "/x1", "/react", "/rsync", "/1", "r1",
+        ] {
+            assert_eq!(quick_message_command(other), None, "{other}");
+        }
+    }
 }
