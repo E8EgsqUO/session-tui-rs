@@ -3922,6 +3922,12 @@ impl SessionClient {
                     // While the group's keys are still loaded.
                     self.send_group_leave(id).await;
                 }
+                if let AccountChange::JoinGroup { id, .. } = &change
+                    && let Ok(mut left) = self.left_groups.lock()
+                {
+                    // Joined again: a later leave has to be announced again.
+                    left.remove(id);
+                }
                 configs.apply(&change);
                 attempted.push(change);
             }
