@@ -6809,6 +6809,17 @@ async fn run(
                             continue;
                         };
                         if action == ChatAction::Remove
+                            && app.group_members.get(&id).is_some_and(|members| {
+                                members.iter().any(|m| m.admin && m.id == app.local_id)
+                            })
+                        {
+                            // Leaving would drop the admin key on all our
+                            // devices and orphan the group for its members.
+                            app.status =
+                                "YOU ARE AN ADMIN · DELETE THE GROUP FROM THE PHONE APP".into();
+                            continue;
+                        }
+                        if action == ChatAction::Remove
                             && !((id.starts_with("05") && id != app.local_id)
                                 || id.starts_with("03"))
                         {
@@ -8323,8 +8334,21 @@ fn finish_sync(
             remove_chat_deleted_elsewhere(app, store, id);
         }
     }
+    // Groups being left: a sync that started before `/remove` still lists
+    // them, and must not bring the chat back.
+    let leaving: HashSet<String> = store
+        .pending_account_changes()
+        .into_iter()
+        .filter_map(|change| match change {
+            session_tui_account::AccountChange::LeaveGroup { id } => Some(id),
+            _ => None,
+        })
+        .collect();
     let groups_found = result.groups.len();
     for group in result.groups.iter() {
+        if leaving.contains(&group.id) {
+            continue;
+        }
         let index = app.ensure_contact(&group.id);
         app.conversations[index].name = group.name.clone();
         app.conversations[index].read_only = !group.can_write;
@@ -8433,6 +8457,9 @@ fn finish_sync(
             continue;
         }
         let is_group = message.contact_id.starts_with("03");
+        if leaving.contains(&message.contact_id) {
+            continue;
+        }
         if !message.outgoing && app.blocked.contains(&message.sender_id) && !is_group {
             // Session drops 1:1 messages from blocked contacts.
             continue;
