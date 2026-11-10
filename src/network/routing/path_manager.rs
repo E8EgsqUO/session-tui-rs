@@ -182,6 +182,16 @@ impl PathManager {
         category: PathCategory,
         pool: &SnodePool,
     ) -> Result<OnionPath, PathManagerError> {
+        self.build_one_avoiding(category, pool, &[])
+    }
+
+    /// Like [`Self::build_one`], but never uses any node in `avoid`.
+    fn build_one_avoiding(
+        &mut self,
+        category: PathCategory,
+        pool: &SnodePool,
+        avoid: &[ServiceNode],
+    ) -> Result<OnionPath, PathManagerError> {
         let used_guards: HashSet<Ed25519Pubkey> = self
             .paths_for(category)
             .iter()
@@ -194,6 +204,7 @@ impl PathManager {
             .paths_for(category)
             .iter()
             .flat_map(|p| p.hops.iter().cloned())
+            .chain(avoid.iter().cloned())
             .collect();
 
         let candidates = pool.get_unused_nodes(PATH_HOPS + used_guards.len(), &exclude);
@@ -245,9 +256,16 @@ impl PathManager {
         guard: &Ed25519Pubkey,
         pool: &SnodePool,
     ) -> Result<OnionPath, PathManagerError> {
+        // Keep the failed guard out of the replacement path.
+        let failed: Vec<ServiceNode> = self
+            .paths_for(category)
+            .iter()
+            .filter(|p| &p.guard().ed25519_pubkey == guard)
+            .map(|p| p.guard().clone())
+            .collect();
         self.paths_for_mut(category)
             .retain(|p| &p.guard().ed25519_pubkey != guard);
-        self.build_one(category, pool)
+        self.build_one_avoiding(category, pool, &failed)
     }
 
     fn paths_for(&self, category: PathCategory) -> &Vec<OnionPath> {
