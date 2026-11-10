@@ -79,8 +79,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: linux-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cargo-
+          key: linux-x86_64-u2204-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-u2204-cargo-
       - name: Build
         run: cargo build --locked --release --bin session-tui
       - name: Check glibc requirement (2.35 or older)
