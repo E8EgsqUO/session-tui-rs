@@ -584,6 +584,12 @@ struct App {
     delete_prompt: Option<bool>,
     /// Asking whether to unsend the selected (own) message.
     unsend_prompt: bool,
+    /// For `/undo`: the composer text before the last run of deletions.
+    input_undo: Option<String>,
+    /// The composer as of the previous key press: (text, chat, was Enter).
+    input_seen: (String, usize, bool),
+    /// Deleting is under way (the text to restore is already saved).
+    input_shrinking: bool,
     /// `/delete` or `/remove` waiting for confirmation, for this chat ID.
     chat_prompt: Option<(ChatAction, String)>,
     /// Emoji shortcode list is open.
@@ -674,6 +680,9 @@ impl App {
             reaction_picker: false,
             delete_prompt: None,
             unsend_prompt: false,
+            input_undo: None,
+            input_seen: (String::new(), 0, false),
+            input_shrinking: false,
             chat_prompt: None,
             show_emoji: false,
             help_scroll: 0,
@@ -6117,6 +6126,7 @@ async fn run(
             continue;
         }
         dismiss_unread_marker(app);
+        note_input_for_undo(app, key.code == KeyCode::Enter);
         if let Some(viewer) = app.image_viewer.as_ref() {
             let step: isize = match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -6496,20 +6506,18 @@ async fn run(
                 }
                 match command {
                     "/undo" if rest.is_empty() => {
-                        app.input.clear();
-                        app.cursor = 0;
-                        // The newest message we sent, on screen or not.
-                        let newest = app.conversations.get(app.selected).and_then(|c| {
-                            c.messages.iter().rposition(|m| {
-                                m.outgoing && !m.system && m.send_state == SendState::Sent
-                            })
-                        });
-                        match newest {
-                            Some(index) => {
-                                app.conversations[app.selected].selected_message = index;
-                                app.unsend_prompt = true;
+                        // Bring back composer text that was deleted.
+                        match app.input_undo.take() {
+                            Some(text) => {
+                                app.input = text;
+                                app.cursor = app.input.len();
+                                app.status = "DELETED TEXT RESTORED".into();
                             }
-                            None => app.status = "NO SENT MESSAGE TO UNSEND HERE".into(),
+                            None => {
+                                app.input.clear();
+                                app.cursor = 0;
+                                app.status = "NO DELETED TEXT TO RESTORE".into();
+                            }
                         }
                     }
                     "/reply" if rest.is_empty() => {
@@ -7560,6 +7568,23 @@ fn apply_reaction(message: &mut Message, emoji: &str, author: &str, remove: bool
 
 /// Toggle our `emoji` reaction on the selected message (Session behaviour:
 /// reacting again with the same emoji removes it).
+/// Called on every key press, before it is handled: remembers the composer
+/// text from before a run of deletions (Backspace, Ctrl+W, Esc…) so `/undo`
+/// can bring it back. Sending, commands and switching chats don't count.
+fn note_input_for_undo(app: &mut App, enter: bool) {
+    let (previous, chat, was_enter) = &app.input_seen;
+    if app.input.len() < previous.len() {
+        if !was_enter && *chat == app.selected && !previous.starts_with('/') && !app.input_shrinking
+        {
+            app.input_undo = Some(previous.clone());
+        }
+        app.input_shrinking = true;
+    } else if app.input.len() > previous.len() {
+        app.input_shrinking = false;
+    }
+    app.input_seen = (app.input.clone(), app.selected, enter);
+}
+
 /// `/r1`…`/r5` → ('r', n); likewise `/e…` and `/u…`.
 fn quick_message_command(command: &str) -> Option<(char, usize)> {
     let mut chars = command.strip_prefix('/')?.chars();
