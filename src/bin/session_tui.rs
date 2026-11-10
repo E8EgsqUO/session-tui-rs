@@ -582,6 +582,8 @@ struct App {
     reaction_picker: bool,
     /// Delete choice is open; `true` when "delete for everyone" is allowed.
     delete_prompt: Option<bool>,
+    /// Asking whether to unsend the selected (own) message.
+    unsend_prompt: bool,
     /// `/delete` or `/remove` waiting for confirmation, for this chat ID.
     chat_prompt: Option<(ChatAction, String)>,
     /// Emoji shortcode list is open.
@@ -671,6 +673,7 @@ impl App {
             window_focused: true,
             reaction_picker: false,
             delete_prompt: None,
+            unsend_prompt: false,
             chat_prompt: None,
             show_emoji: false,
             help_scroll: 0,
@@ -6173,6 +6176,15 @@ async fn run(
             }
             continue;
         }
+        if app.unsend_prompt {
+            app.unsend_prompt = false;
+            app.status = if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                delete_selected(app, client, store, &mut background_tasks, true)
+            } else {
+                "CANCELLED".into()
+            };
+            continue;
+        }
         if app.reaction_picker {
             app.reaction_picker = false;
             if let KeyCode::Char(c @ '1'..='6') = key.code {
@@ -6448,15 +6460,23 @@ async fn run(
                 }
                 // `/r1`–`/r5` and `/e1`–`/e5`: reply or react to a message
                 // counted up from the bottom of what the transcript shows.
+                // `/u1`–`/u3` unsend, counting only our own sent messages.
                 if let Some((kind, number)) = quick_message_command(command) {
                     app.input.clear();
                     app.cursor = 0;
-                    let Some(index) = visible_message_from_bottom(app, number) else {
-                        app.status = format!("NO MESSAGE {number} ON SCREEN");
+                    let Some(index) = visible_message_from_bottom(app, number, kind == 'u') else {
+                        app.status = if kind == 'u' {
+                            format!("NO SENT MESSAGE {number} OF YOURS ON SCREEN")
+                        } else {
+                            format!("NO MESSAGE {number} ON SCREEN")
+                        };
                         continue;
                     };
                     app.conversations[app.selected].selected_message = index;
-                    if kind == 'r' {
+                    if kind == 'u' {
+                        // Asks first, showing the message: it can't be undone.
+                        app.unsend_prompt = true;
+                    } else if kind == 'r' {
                         if start_reply(app) {
                             // `/r2 text` leaves the text ready to send.
                             app.input = rest.to_owned();
@@ -6475,6 +6495,23 @@ async fn run(
                     continue;
                 }
                 match command {
+                    "/undo" if rest.is_empty() => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        // The newest message we sent, on screen or not.
+                        let newest = app.conversations.get(app.selected).and_then(|c| {
+                            c.messages.iter().rposition(|m| {
+                                m.outgoing && !m.system && m.send_state == SendState::Sent
+                            })
+                        });
+                        match newest {
+                            Some(index) => {
+                                app.conversations[app.selected].selected_message = index;
+                                app.unsend_prompt = true;
+                            }
+                            None => app.status = "NO SENT MESSAGE TO UNSEND HERE".into(),
+                        }
+                    }
                     "/reply" if rest.is_empty() => {
                         app.input.clear();
                         app.cursor = 0;
@@ -7523,17 +7560,22 @@ fn apply_reaction(message: &mut Message, emoji: &str, author: &str, remove: bool
 
 /// Toggle our `emoji` reaction on the selected message (Session behaviour:
 /// reacting again with the same emoji removes it).
-/// `/r1`…`/r5` → ('r', n); `/e1`…`/e5` → ('e', n).
+/// `/r1`…`/r5` → ('r', n); likewise `/e…` and `/u…`.
 fn quick_message_command(command: &str) -> Option<(char, usize)> {
     let mut chars = command.strip_prefix('/')?.chars();
-    let kind = chars.next().filter(|kind| matches!(kind, 'r' | 'e'))?;
+    let kind = chars
+        .next()
+        .filter(|kind| matches!(kind, 'r' | 'e' | 'u'))?;
     let number = chars.next()?.to_digit(10)? as usize;
-    (chars.next().is_none() && (1..=5).contains(&number)).then_some((kind, number))
+    // Unsending is limited to the nearest three: miscounting costs more.
+    let most = if kind == 'u' { 3 } else { 5 };
+    (chars.next().is_none() && (1..=most).contains(&number)).then_some((kind, number))
 }
 
 /// The message `number` up from the bottom of the transcript as last drawn
-/// (1 = the lowest one on screen), not counting notice lines.
-fn visible_message_from_bottom(app: &App, number: usize) -> Option<usize> {
+/// (1 = the lowest one on screen), not counting notice lines; with
+/// `own_sent`, counting only messages we sent.
+fn visible_message_from_bottom(app: &App, number: usize, own_sent: bool) -> Option<usize> {
     if app.transcript_conversation != app.selected {
         return None;
     }
@@ -7542,7 +7584,11 @@ fn visible_message_from_bottom(app: &App, number: usize) -> Option<usize> {
         .iter()
         .filter(|(_, _, _, attachment)| attachment.is_none())
         .map(|(_, _, index, _)| *index)
-        .filter(|index| conversation.messages.get(*index).is_some_and(|m| !m.system))
+        .filter(|index| {
+            conversation.messages.get(*index).is_some_and(|m| {
+                !m.system && (!own_sent || (m.outgoing && m.send_state == SendState::Sent))
+            })
+        })
         .rev()
         .nth(number.checked_sub(1)?)
 }
@@ -9047,6 +9093,34 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
         });
         app.search = Some(view);
     }
+    if app.unsend_prompt {
+        let preview: String = app
+            .selected_message()
+            .map(|m| m.preview_text())
+            .unwrap_or_default()
+            .chars()
+            .take(40)
+            .collect();
+        let text = format!("  Unsend \"{preview}\" for everyone?    Y yes    Esc no");
+        let width = (text.chars().count() as u16 + 4).min(area.width);
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(6),
+            width,
+            height: 3.min(area.height),
+        };
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(TEXT)))).block(
+                Block::default()
+                    .title(" Unsend message ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .style(Style::default().bg(PANEL)),
+            ),
+            popup,
+        );
+    }
     if let Some(can_unsend) = app.delete_prompt {
         let text = if can_unsend {
             "  1 Delete on this device only    2 Delete for everyone    Esc cancel"
@@ -9954,6 +10028,7 @@ fn draw_chat(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         && !app.show_emoji
         && !app.reaction_picker
         && app.delete_prompt.is_none()
+        && !app.unsend_prompt
         && app.chat_prompt.is_none()
         && app.recovery_seed.is_none()
     {
@@ -11596,8 +11671,10 @@ mod quick_message_tests {
     fn only_r_and_e_with_one_digit_from_1_to_5() {
         assert_eq!(quick_message_command("/r1"), Some(('r', 1)));
         assert_eq!(quick_message_command("/e5"), Some(('e', 5)));
+        assert_eq!(quick_message_command("/u3"), Some(('u', 3)));
         for other in [
-            "/r0", "/r6", "/r12", "/r", "/e", "/x1", "/react", "/rsync", "/1", "r1",
+            "/u4", "/u5", "/r0", "/r6", "/r12", "/r", "/e", "/x1", "/react", "/rsync", "/undo",
+            "/unread", "/1", "r1",
         ] {
             assert_eq!(quick_message_command(other), None, "{other}");
         }

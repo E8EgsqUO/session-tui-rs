@@ -61,6 +61,14 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "/e1 … /e5 [EMOJI]",
                 "React to it the same way: 👍, or an emoji, :shortcode: or 1-6",
             ),
+            (
+                "/u1 … /u3",
+                "Unsend one of your messages on screen (1 = your lowest; asks first)",
+            ),
+            (
+                "/undo",
+                "Unsend the last message you sent here (asks first)",
+            ),
             ("/reply", "Reply to the selected message (Esc cancels)"),
             ("/react", "Reaction bar, then 1-6: 😂 🥰 😢 😡 😮 😈"),
             ("+", "React 👍"),
