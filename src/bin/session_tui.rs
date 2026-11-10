@@ -7824,6 +7824,19 @@ fn open_members(app: &mut App) {
         return;
     };
     let mut members = members.clone();
+    // The group's list can lag (the admin's phone has been seen writing
+    // "invite sent" back over an accepted invite). We are in the group, and
+    // so is anyone whose messages we see here.
+    for member in &mut members {
+        if member.pending
+            && (member.id == app.local_id
+                || c.messages
+                    .iter()
+                    .any(|m| m.sender.as_deref() == Some(member.id.as_str())))
+        {
+            member.pending = false;
+        }
+    }
     members.sort_by_key(|m| (!m.admin, m.pending, app.sender_label(&m.id).to_lowercase()));
     let items = members
         .iter()
