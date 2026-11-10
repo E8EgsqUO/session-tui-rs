@@ -3600,7 +3600,35 @@ impl SessionClient {
                     .iter()
                     .map(|(hash, bytes)| (hash.as_str(), bytes.as_slice()))
                     .collect();
-                let _ = members.merge(&merge);
+                let merged = members.merge(&merge);
+                debug_log(
+                    "group.members",
+                    &format!(
+                        "group_prefix={} messages={} merge_ok={} seqno={} hashes={} members={}",
+                        &id[..8],
+                        merge.len(),
+                        merged.is_ok(),
+                        members.seqno(),
+                        merge
+                            .iter()
+                            .map(|(hash, _)| &hash[..hash.len().min(8)])
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        members
+                            .get()
+                            .iter()
+                            .map(|member| format!(
+                                "{}:I{}A{}P{}s{}",
+                                &member.session_id[..member.session_id.len().min(8)],
+                                member.invite_status,
+                                u8::from(member.admin),
+                                member.promotion_status,
+                                u8::from(member.supplement)
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                );
                 discovered.members = members
                     .get()
                     .iter()
