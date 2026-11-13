@@ -1,6 +1,6 @@
 [package]
 name = "libsession"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 # Files beside session_tui.rs are modules, not independent executables.
 autobins = false
@@ -62,7 +62,7 @@ ratatui-image = "3.0.0"
 time = { version = "0.3", features = ["local-offset", "formatting"] }
 crossterm = "0.28.1"
 rpassword = "7.4.0"
-rusqlite = { version = "0.41.1", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.42.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # Logging / errors
 tracing = "0.1.44"
