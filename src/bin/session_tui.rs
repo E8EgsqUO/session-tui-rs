@@ -119,6 +119,10 @@ fn debug_log(event: &str, detail: &str) {
     }
 }
 
+/// Notices left in place of a deleted message, worded as in Session.
+const DELETED_EVERYWHERE: &str = "This message was deleted";
+const DELETED_HERE: &str = "This message was deleted on this device";
+
 #[derive(Clone)]
 struct Message {
     /// Text body; for attachment messages this is the caption, as in Session.
@@ -245,6 +249,31 @@ impl Message {
             server_hash: None,
             swarm_expiry: None,
         }
+    }
+
+    /// A chat message, or the "deleted on this device" notice of one: what
+    /// a delete for everyone can still turn into its notice.
+    fn can_mark_deleted(&self) -> bool {
+        !self.system || self.body == DELETED_HERE
+    }
+
+    /// Replace the content with the notice Session leaves in its place.
+    /// Time, direction and author stay, so the stored row keeps its key.
+    fn mark_deleted(&mut self, everyone: bool) {
+        self.body = if everyone {
+            DELETED_EVERYWHERE
+        } else {
+            DELETED_HERE
+        }
+        .into();
+        self.attachments.clear();
+        self.image_previews.clear();
+        self.quote = None;
+        self.reactions.clear();
+        self.links.clear();
+        self.swarm_hashes.clear();
+        self.system = true;
+        self.is_read = true;
     }
 
     fn system(text: String, timestamp_ms: u64) -> Self {
@@ -584,12 +613,6 @@ struct App {
     delete_prompt: Option<bool>,
     /// Asking whether to unsend the selected (own) message.
     unsend_prompt: bool,
-    /// For `/undo`: the composer text before the last run of deletions.
-    input_undo: Option<String>,
-    /// The composer as of the previous key press: (text, chat, was Enter).
-    input_seen: (String, usize, bool),
-    /// Deleting is under way (the text to restore is already saved).
-    input_shrinking: bool,
     /// `/delete` or `/remove` waiting for confirmation, for this chat ID.
     chat_prompt: Option<(ChatAction, String)>,
     /// Emoji shortcode list is open.
@@ -680,9 +703,6 @@ impl App {
             reaction_picker: false,
             delete_prompt: None,
             unsend_prompt: false,
-            input_undo: None,
-            input_seen: (String::new(), 0, false),
-            input_shrinking: false,
             chat_prompt: None,
             show_emoji: false,
             help_scroll: 0,
@@ -2949,6 +2969,30 @@ impl LocalStore {
 
     /// Delete one stored message and its cached attachment files.
     fn delete_message(&self, peer: &str, message: &Message) -> Result<(), String> {
+        self.drop_message_work(peer, message)?;
+        self.exec(
+                "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3 AND sender = ?4",
+                params![peer, message.timestamp_ms as i64, message.outgoing, sender_key(message)],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Keep the message as the notice Session shows in its place ("This
+    /// message was deleted"); its content, files and pending work go.
+    fn mark_message_deleted(
+        &self,
+        peer: &str,
+        message: &mut Message,
+        everyone: bool,
+    ) -> Result<(), String> {
+        self.drop_message_work(peer, message)?;
+        message.mark_deleted(everyone);
+        self.update_message(peer, message)
+    }
+
+    /// Outbox work and attachment files of a message that is being deleted.
+    fn drop_message_work(&self, peer: &str, message: &Message) -> Result<(), String> {
         // A deleted message is never sent, synced or expired later.
         let kinds = if message.outgoing {
             "('text', 'sync_copy')"
@@ -2962,11 +3006,6 @@ impl LocalStore {
             params![peer, message.timestamp_ms as i64],
         )
         .map_err(|e| e.to_string())?;
-        self.exec(
-                "DELETE FROM messages WHERE peer_id = ?1 AND timestamp_ms = ?2 AND outgoing = ?3 AND sender = ?4",
-                params![peer, message.timestamp_ms as i64, message.outgoing, sender_key(message)],
-            )
-            .map_err(|e| e.to_string())?;
         if let Ok(root) = session_data_dir() {
             for index in 0..message.attachments.len() {
                 self.delete_file_after_commit(session_tui_media::attachment_blob_path(
@@ -6126,7 +6165,6 @@ async fn run(
             continue;
         }
         dismiss_unread_marker(app);
-        note_input_for_undo(app, key.code == KeyCode::Enter);
         if let Some(viewer) = app.image_viewer.as_ref() {
             let step: isize = match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -6505,21 +6543,6 @@ async fn run(
                     continue;
                 }
                 match command {
-                    "/undo" if rest.is_empty() => {
-                        // Bring back composer text that was deleted.
-                        match app.input_undo.take() {
-                            Some(text) => {
-                                app.input = text;
-                                app.cursor = app.input.len();
-                                app.status = "DELETED TEXT RESTORED".into();
-                            }
-                            None => {
-                                app.input.clear();
-                                app.cursor = 0;
-                                app.status = "NO DELETED TEXT TO RESTORE".into();
-                            }
-                        }
-                    }
                     "/reply" if rest.is_empty() => {
                         app.input.clear();
                         app.cursor = 0;
@@ -7568,23 +7591,6 @@ fn apply_reaction(message: &mut Message, emoji: &str, author: &str, remove: bool
 
 /// Toggle our `emoji` reaction on the selected message (Session behaviour:
 /// reacting again with the same emoji removes it).
-/// Called on every key press, before it is handled: remembers the composer
-/// text from before a run of deletions (Backspace, Ctrl+W, Esc…) so `/undo`
-/// can bring it back. Sending, commands and switching chats don't count.
-fn note_input_for_undo(app: &mut App, enter: bool) {
-    let (previous, chat, was_enter) = &app.input_seen;
-    if app.input.len() < previous.len() {
-        if !was_enter && *chat == app.selected && !previous.starts_with('/') && !app.input_shrinking
-        {
-            app.input_undo = Some(previous.clone());
-        }
-        app.input_shrinking = true;
-    } else if app.input.len() > previous.len() {
-        app.input_shrinking = false;
-    }
-    app.input_seen = (app.input.clone(), app.selected, enter);
-}
-
 /// `/r1`…`/r5` → ('r', n); likewise `/e…` and `/u…`.
 fn quick_message_command(command: &str) -> Option<(char, usize)> {
     let mut chars = command.strip_prefix('/')?.chars();
@@ -7716,8 +7722,37 @@ fn delete_selected(
     let Some(peer) = app.conversations.get(app.selected).map(|c| c.id.clone()) else {
         return "NO CHAT SELECTED".into();
     };
-    let Some(removed) = app.remove_selected_message() else {
+    let Some(selected) = app.selected_message() else {
         return "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+    };
+    // As Session: a deleted message stays as a "This message was deleted"
+    // notice. Gone completely are notices (also that one, when deleted
+    // again), messages that never left this device, and Note to Self
+    // messages deleted on all devices.
+    let complete = selected.system
+        || (selected.outgoing && selected.send_state != SendState::Sent)
+        || (everyone && peer == app.local_id);
+    let removed = if complete {
+        let Some(removed) = app.remove_selected_message() else {
+            return "SELECT A MESSAGE WITH ↑/↓ FIRST".into();
+        };
+        if let Err(error) = store.delete_message(&peer, &removed) {
+            return format!("LOCAL DELETE ERROR · {error}");
+        }
+        removed
+    } else {
+        let conversation = &mut app.conversations[app.selected];
+        let message = &mut conversation.messages[conversation.selected_message];
+        let before = Message {
+            swarm_hashes: message.swarm_hashes.clone(),
+            ..Message::new(String::new(), message.timestamp_ms, message.outgoing)
+        };
+        let marked = store.mark_message_deleted(&peer, message, everyone);
+        conversation.refresh_preview();
+        if let Err(error) = marked {
+            return format!("LOCAL DELETE ERROR · {error}");
+        }
+        before
     };
     if everyone && removed.outgoing {
         // Removed here at once, like Session; the unsend request (to the
@@ -7734,9 +7769,6 @@ fn delete_selected(
             }),
             "unsend",
         ));
-    }
-    if let Err(error) = store.delete_message(&peer, &removed) {
-        return format!("LOCAL DELETE ERROR · {error}");
     }
     if everyone {
         "MESSAGE DELETED FOR EVERYONE".into()
@@ -8255,7 +8287,8 @@ fn verify_delete_content_signature(
 }
 
 /// Apply an UnsendRequest the way Session does: only the author may unsend,
-/// and only that author's message with the given timestamp is removed.
+/// and only that author's message with the given timestamp. It stays as a
+/// "This message was deleted" notice, except in Note to Self, where it goes.
 fn apply_unsend(
     app: &mut App,
     store: &LocalStore,
@@ -8282,6 +8315,7 @@ fn apply_unsend(
         while index < conversation.messages.len() {
             let message = &conversation.messages[index];
             let matches = message.timestamp_ms == timestamp
+                && message.can_mark_deleted()
                 && if author_is_me {
                     message.outgoing
                 } else {
@@ -8291,13 +8325,18 @@ fn apply_unsend(
                             .as_deref()
                             .is_none_or(|sender| sender == author)
                 };
-            if matches {
+            if matches && peer == local_id {
                 let removed = conversation.messages.remove(index);
                 let _ = store.delete_message(&peer, &removed);
                 removed_any = true;
-            } else {
-                index += 1;
+                continue;
             }
+            if matches {
+                let message = &mut conversation.messages[index];
+                let _ = store.mark_message_deleted(&peer, message, true);
+                removed_any = true;
+            }
+            index += 1;
         }
         conversation.clamp_selection();
         conversation.refresh_preview();
@@ -8740,15 +8779,13 @@ fn finish_sync(
                         .find(|c| c.id == message.contact_id)
                     {
                         let peer = conversation.id.clone();
-                        conversation.messages.retain(|m| {
-                            let remove = rule.matches(m, local_id);
-                            if remove {
+                        // They stay as "This message was deleted" notices.
+                        for m in &mut conversation.messages {
+                            if rule.matches(m, local_id) {
                                 removed += 1;
-                                let _ = store.delete_message(&peer, m);
+                                let _ = store.mark_message_deleted(&peer, m, true);
                             }
-                            !remove
-                        });
-                        conversation.clamp_selection();
+                        }
                         conversation.refresh_preview();
                     }
                     if removed == 0 {
@@ -11698,8 +11735,8 @@ mod quick_message_tests {
         assert_eq!(quick_message_command("/e5"), Some(('e', 5)));
         assert_eq!(quick_message_command("/u3"), Some(('u', 3)));
         for other in [
-            "/u4", "/u5", "/r0", "/r6", "/r12", "/r", "/e", "/x1", "/react", "/rsync", "/undo",
-            "/unread", "/1", "r1",
+            "/u4", "/u5", "/r0", "/r6", "/r12", "/r", "/e", "/x1", "/react", "/rsync", "/unread",
+            "/1", "r1",
         ] {
             assert_eq!(quick_message_command(other), None, "{other}");
         }

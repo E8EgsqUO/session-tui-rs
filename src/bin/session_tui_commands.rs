@@ -65,7 +65,6 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "/u1 … /u3",
                 "Unsend one of your messages on screen (1 = your lowest; asks first)",
             ),
-            ("/undo", "Bring back text you deleted from the message box"),
             ("/reply", "Reply to the selected message (Esc cancels)"),
             ("/react", "Reaction bar, then 1-6: 😂 🥰 😢 😡 😮 😈"),
             ("+", "React 👍"),

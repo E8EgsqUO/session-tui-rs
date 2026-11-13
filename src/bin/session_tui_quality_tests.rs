@@ -292,3 +292,38 @@ fn forged_unsend_never_removes_another_authors_message() {
     ));
     assert_eq!(app.conversations[i].messages.len(), 1);
 }
+#[test]
+fn unsend_leaves_a_deleted_notice_except_in_note_to_self() {
+    let f = Fixture::new();
+    let s = f.store();
+    s.add_sender_to_message_key().unwrap();
+    let (me, peer) = ids();
+    let mut app = App::new(me.clone());
+    for (chat, outgoing) in [(&peer, false), (&peer, true), (&me, true)] {
+        let i = app.ensure_contact(chat);
+        let m = Message::new("secret".into(), if outgoing { 200 } else { 100 }, outgoing);
+        s.save_message(chat, &m).unwrap();
+        app.conversations[i].messages.push(m);
+    }
+    // Theirs, unsent by them; ours, unsent on another of our devices.
+    assert!(apply_unsend(&mut app, &s, &me, &peer, &peer, 100, &peer));
+    assert!(apply_unsend(&mut app, &s, &me, &me, &me, 200, &me));
+    let chat = &app.conversations[app.conversations.iter().position(|c| c.id == peer).unwrap()];
+    assert_eq!(chat.messages.len(), 2);
+    assert!(
+        chat.messages
+            .iter()
+            .all(|m| m.system && m.body == DELETED_EVERYWHERE)
+    );
+    assert_eq!(chat.preview, DELETED_EVERYWHERE);
+    let own = &app.conversations[app.conversations.iter().position(|c| c.id == me).unwrap()];
+    assert!(own.messages.is_empty(), "Note to Self: gone completely");
+    // A second request finds nothing left to delete.
+    assert!(!apply_unsend(&mut app, &s, &me, &peer, &peer, 100, &peer));
+    // The notice, not the text, is what a restart loads.
+    let mut stored = App::new(me.clone());
+    s.load(&mut stored).unwrap();
+    let chat = stored.conversations.iter().find(|c| c.id == peer).unwrap();
+    assert_eq!(chat.messages.len(), 2);
+    assert!(chat.messages.iter().all(|m| m.body == DELETED_EVERYWHERE));
+}
