@@ -1031,6 +1031,50 @@ fn write_attachment_blob(
     std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
+/// What an attachment upload needs, kept after a failure for `/retry`.
+#[derive(Clone)]
+struct UploadJob {
+    paths: Vec<std::path::PathBuf>,
+    caption: String,
+    profile_name: String,
+    quote: Option<DataQuote>,
+    expiration: Option<Expiration>,
+}
+
+impl UploadJob {
+    /// Pasted screenshots are temporary: deleted once sent (a failed one
+    /// stays for `/retry`; leftovers go on the next start).
+    fn remove_pasted(&self) {
+        for path in self.paths.iter().filter(|p| is_pasted_image(p)) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn spawn_upload(
+    client: &Arc<SessionClient>,
+    peer: &str,
+    job: &UploadJob,
+    timestamp_ms: u64,
+) -> tokio::task::JoinHandle<Result<SentAttachments, String>> {
+    let client = Arc::clone(client);
+    let peer = peer.to_owned();
+    let job = job.clone();
+    spawn_network(move || async move {
+        client
+            .send_attachments(
+                &peer,
+                &job.paths,
+                &job.caption,
+                &job.profile_name,
+                job.quote,
+                job.expiration,
+                timestamp_ms,
+            )
+            .await
+    })
+}
+
 /// Folder for `/paste` images between reading the clipboard and uploading.
 fn paste_dir() -> Result<std::path::PathBuf, String> {
     Ok(session_data_dir()?.join("paste"))
@@ -5832,7 +5876,10 @@ async fn run(
         tokio::task::JoinHandle<Result<SentAttachments, String>>,
         String,
         u64,
+        UploadJob,
     )> = None;
+    // Failed uploads by (chat, placeholder timestamp), for `/retry`.
+    let mut failed_uploads: HashMap<(String, u64), UploadJob> = HashMap::new();
     let mut download_task: Option<DownloadTask> = None;
     let mut save_task: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
     let mut download_queue = std::collections::VecDeque::new();
@@ -5944,8 +5991,8 @@ async fn run(
         }
         if attachment_task
             .as_ref()
-            .is_some_and(|(task, _, _)| task.is_finished())
-            && let Some((task, peer, pending_timestamp)) = attachment_task.take()
+            .is_some_and(|(task, _, _, _)| task.is_finished())
+            && let Some((task, peer, pending_timestamp, job)) = attachment_task.take()
         {
             let result = match task.await {
                 Ok(result) => result,
@@ -5959,6 +6006,7 @@ async fn run(
                     .position(|m| m.timestamp_ms == pending_timestamp && m.outgoing);
                 match result {
                     Ok(sent) => {
+                        job.remove_pasted();
                         if let Some(pending_index) = pending {
                             convo.messages.remove(pending_index);
                         }
@@ -6001,10 +6049,17 @@ async fn run(
                     Err(error) => {
                         debug_log("attachment.task.failed", &format!("error={error}"));
                         if let Some(pending_index) = pending {
-                            convo.messages[pending_index].body = format!("Upload failed · {error}");
+                            let message = &mut convo.messages[pending_index];
+                            message.body = format!("Upload failed · {error}");
+                            message.send_state = SendState::Failed;
                             convo.refresh_preview();
+                            failed_uploads.insert((peer.clone(), pending_timestamp), job);
+                            app.status =
+                                format!("ATTACHMENT FAILED · {error} · SELECT IT AND /retry");
+                        } else {
+                            job.remove_pasted();
+                            app.status = format!("ATTACHMENT FAILED · {error}");
                         }
-                        app.status = format!("ATTACHMENT FAILED · {error}");
                     }
                 }
             }
@@ -6606,44 +6661,21 @@ async fn run(
                             conversation.refresh_preview();
                         }
                         app.status = format!("UPLOADING ATTACHMENT · {label}");
-                        let task_client = Arc::clone(client);
-                        let task_peer = recipient.clone();
-                        let profile_name = app.profile_name.clone();
-                        let quote = app.reply_to.take().map(data_quote);
-                        let expiration = app
-                            .conversations
-                            .get(app.selected)
-                            .and_then(|c| c.disappearing);
-                        let paths: Vec<std::path::PathBuf> =
-                            paths.into_iter().map(std::path::PathBuf::from).collect();
-                        let pasted: Vec<std::path::PathBuf> = paths
-                            .iter()
-                            .filter(|p| is_pasted_image(p))
-                            .cloned()
-                            .collect();
+                        let job = UploadJob {
+                            paths: paths.into_iter().map(std::path::PathBuf::from).collect(),
+                            caption,
+                            profile_name: app.profile_name.clone(),
+                            quote: app.reply_to.take().map(data_quote),
+                            expiration: app
+                                .conversations
+                                .get(app.selected)
+                                .and_then(|c| c.disappearing),
+                        };
                         attachment_task = Some((
-                            spawn_network(move || async move {
-                                let result = task_client
-                                    .send_attachments(
-                                        &task_peer,
-                                        &paths,
-                                        &caption,
-                                        &profile_name,
-                                        quote,
-                                        expiration,
-                                        pending_timestamp,
-                                    )
-                                    .await;
-                                // Pasted screenshots are temporary: gone once
-                                // sent (or failed); the sent copy is cached
-                                // encrypted like any attachment.
-                                for path in &pasted {
-                                    let _ = std::fs::remove_file(path);
-                                }
-                                result
-                            }),
+                            spawn_upload(client, &recipient, &job, pending_timestamp),
                             recipient,
                             pending_timestamp,
+                            job,
                         ));
                     }
                     "/save" => {
@@ -7041,6 +7073,31 @@ async fn run(
                             app.status = "SELECT ONE OF YOUR MESSAGES TO RETRY".into();
                             continue;
                         };
+                        let key = (peer.clone(), message.timestamp_ms);
+                        if failed_uploads.contains_key(&key) {
+                            if attachment_task.is_some() {
+                                app.status = "AN ATTACHMENT IS ALREADY UPLOADING".into();
+                                continue;
+                            }
+                            let job = failed_uploads.remove(&key).expect("checked above");
+                            if let Some(missing) = job.paths.iter().find(|p| !p.is_file()) {
+                                app.status =
+                                    format!("FILE NOT FOUND · {} · SEND IT AGAIN", missing.display());
+                                continue;
+                            }
+                            if let Some(m) = app.selected_message_mut() {
+                                m.body = "Uploading · retry".into();
+                                m.send_state = SendState::Sending;
+                            }
+                            app.status = "RETRYING UPLOAD…".into();
+                            attachment_task = Some((
+                                spawn_upload(client, &peer, &job, message.timestamp_ms),
+                                peer,
+                                message.timestamp_ms,
+                                job,
+                            ));
+                            continue;
+                        }
                         let queued = store
                             .outbox_retry_now(&peer, message.timestamp_ms)
                             .unwrap_or(false);
