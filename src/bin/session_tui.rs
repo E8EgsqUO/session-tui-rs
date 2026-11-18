@@ -7477,6 +7477,12 @@ fn finish_outbox(
                 (OutboxKind::Text, Some(message)) => {
                     message.send_state = SendState::Sent;
                     let _ = store.update_message(&entry.peer, message);
+                    // As the official clients: sending means the chat was
+                    // read up to here, so other devices don't show it unread.
+                    store.queue_account_change(session_tui_account::AccountChange::ReadUpTo {
+                        conversation: entry.peer.clone(),
+                        timestamp_ms: entry.timestamp_ms as i64,
+                    });
                     // Then its copy for our other devices, as its own step.
                     if entry.peer.starts_with("05") && entry.peer != local_id {
                         let _ = store.outbox_add(
