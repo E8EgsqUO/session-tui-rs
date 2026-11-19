@@ -148,7 +148,16 @@ impl OnionRequestRouter {
             method: "POST".to_string(),
             body: blob,
             headers: Vec::new(),
-            timeout: self.config.request_timeout,
+            // Storage-node RPCs are small: give up on a stuck path sooner
+            // and retry on another. Server requests (file uploads and
+            // downloads) keep the full timeout.
+            timeout: match destination {
+                NetworkDestination::ServiceNode(_) => self
+                    .config
+                    .request_timeout
+                    .min(std::time::Duration::from_secs(SNODE_REQUEST_TIMEOUT_SECS)),
+                _ => self.config.request_timeout,
+            },
             accept_invalid_certs: true,
         };
 
@@ -197,6 +206,9 @@ impl PreparedRequest {
 /// Required path length (3 hops). Re-exported so callers don't need to
 /// import from
 /// [`path_manager`][crate::network::routing::path_manager].
+/// Timeout for an onion request to a storage node.
+pub const SNODE_REQUEST_TIMEOUT_SECS: u64 = 15;
+
 pub const REQUIRED_PATH_HOPS: usize = PATH_HOPS;
 
 #[cfg(test)]

@@ -1937,6 +1937,68 @@ struct SessionClient {
     /// only once `finish_sync` has committed that sync's messages, so a
     /// failed write, rollback or timeout never moves the next start point.
     pending_cursors: Mutex<HashMap<String, String>>,
+    /// When the account config was last fetched and merged in full.
+    last_full_account_sync: Mutex<Option<Instant>>,
+    /// Per group: when its keys/info/members were last read in full, the
+    /// access it was read with, and the result, reused while a poll sees
+    /// no change in those namespaces.
+    group_cache: Mutex<HashMap<String, (Instant, String, DiscoveredGroup, GroupRuntime)>>,
+    /// First page of new group messages fetched with this poll's batch:
+    /// group id -> (node key, response body).
+    group_pages: Mutex<HashMap<String, (String, Value)>>,
+}
+
+/// Group config namespaces: keys, info, members.
+const GROUP_CONFIG_NAMESPACES: [i32; 3] = [12, 13, 14];
+
+/// Account config namespaces: profile, contacts, read state, groups.
+const ACCOUNT_NAMESPACES: [i32; 4] = [2, 3, 4, 5];
+
+/// A full account config fetch even without a sign of change, in case a
+/// change was missed (e.g. it reached only another swarm member).
+const FULL_ACCOUNT_SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// Messages (hash, bytes) and the `more` flag of one `retrieve` response.
+fn parse_namespace_page(
+    pubkey: &str,
+    namespace: i32,
+    value: &Value,
+) -> Result<(Vec<(String, Vec<u8>)>, bool), String> {
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("namespace {namespace} response has no messages"))?;
+    let more = value.get("more").and_then(Value::as_bool).unwrap_or(false);
+    let mut result = Vec::new();
+    for item in messages {
+        let (Some(hash), Some(data)) = (
+            item.get("hash").and_then(Value::as_str),
+            item.get("data").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let Ok(mut bytes) = STANDARD.decode(data) else {
+            continue;
+        };
+        if namespace != 5
+            && let Ok(ws) = WebSocketMessage::decode(bytes.as_slice())
+            && ws.r#type == Some(web_socket_message::Type::Request as i32)
+            && let Some(body) = ws.request.and_then(|request| request.body)
+        {
+            bytes = body;
+        }
+        result.push((hash.to_owned(), bytes));
+    }
+    debug_log(
+        "namespace.retrieve",
+        &format!(
+            "namespace={namespace} pubkey_prefix={} messages={} total_bytes={}",
+            &pubkey[..pubkey.len().min(8)],
+            result.len(),
+            result.iter().map(|(_, bytes)| bytes.len()).sum::<usize>()
+        ),
+    );
+    Ok((result, more))
 }
 
 fn node_cursor_key(pubkey: &str, namespace: i32, node: &ServiceNode) -> String {
@@ -3231,6 +3293,9 @@ impl SessionClient {
             poll_nodes: Mutex::new(HashMap::new()),
             node_cursors: Mutex::new(HashMap::new()),
             pending_cursors: Mutex::new(HashMap::new()),
+            last_full_account_sync: Mutex::new(None),
+            group_cache: Mutex::new(HashMap::new()),
+            group_pages: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3366,16 +3431,30 @@ impl SessionClient {
             .as_deref()
             .and_then(|key| self.cursor_for(key))
             .or_else(|| cursor.map(str::to_owned));
+        // A first page this poll's batch already fetched from the same node.
+        let mut prefetched = None;
+        if namespace == 11
+            && let Some(node) = &node
+            && let Ok(mut pages) = self.group_pages.lock()
+            && let Some((node_key, page)) = pages.remove(pubkey)
+            && node_key == hex::encode(node.ed25519_pubkey.0)
+        {
+            prefetched = Some(page);
+        }
         for _ in 0..MAX_RETRIEVE_PAGES {
-            let page = self
-                .retrieve_namespace_page(
-                    pubkey,
-                    namespace,
-                    auth,
-                    last_hash.as_deref(),
-                    node.as_ref(),
-                )
-                .await;
+            let page = match prefetched.take() {
+                Some(page) => parse_namespace_page(pubkey, namespace, &page),
+                None => {
+                    self.retrieve_namespace_page(
+                        pubkey,
+                        namespace,
+                        auth,
+                        last_hash.as_deref(),
+                        node.as_ref(),
+                    )
+                    .await
+                }
+            };
             let (page, more) = match page {
                 Ok(page) => page,
                 Err(error) => {
@@ -3479,41 +3558,7 @@ impl SessionClient {
                 .ok_or("retrieve returned no body")?,
         )
         .map_err(|error| format!("invalid namespace {namespace} response: {error}"))?;
-        let messages = value
-            .get("messages")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("namespace {namespace} response has no messages"))?;
-        let more = value.get("more").and_then(Value::as_bool).unwrap_or(false);
-        let mut result = Vec::new();
-        for item in messages {
-            let (Some(hash), Some(data)) = (
-                item.get("hash").and_then(Value::as_str),
-                item.get("data").and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            let Ok(mut bytes) = STANDARD.decode(data) else {
-                continue;
-            };
-            if namespace != 5
-                && let Ok(ws) = WebSocketMessage::decode(bytes.as_slice())
-                && ws.r#type == Some(web_socket_message::Type::Request as i32)
-                && let Some(body) = ws.request.and_then(|request| request.body)
-            {
-                bytes = body;
-            }
-            result.push((hash.to_owned(), bytes));
-        }
-        debug_log(
-            "namespace.retrieve",
-            &format!(
-                "namespace={namespace} pubkey_prefix={} messages={} total_bytes={}",
-                &pubkey[..pubkey.len().min(8)],
-                result.len(),
-                result.iter().map(|(_, bytes)| bytes.len()).sum::<usize>()
-            ),
-        );
-        Ok((result, more))
+        parse_namespace_page(pubkey, namespace, &value)
     }
 
     async fn discover_groups(
@@ -3521,6 +3566,7 @@ impl SessionClient {
         local_groups: &[LocalGroup],
         user_groups: Vec<UserGroupInfo>,
         removed: &[String],
+        group_cursors: &HashMap<String, String>,
     ) -> Result<Vec<DiscoveredGroup>, String> {
         debug_log(
             "group.user_config.parsed",
@@ -3570,6 +3616,8 @@ impl SessionClient {
                 can_write: false,
                 members: Vec::new(),
             };
+            // What access the group is read with: a change forces a re-read.
+            let access = format!("{}:{}", hex::encode(&admin_seed), hex::encode(&auth_data));
             let auth = if admin_seed.len() == 32 {
                 let (derived_pk, secret_key) =
                     ed25519::ed25519_key_pair_from_seed(&admin_seed).map_err(|e| e.to_string())?;
@@ -3606,6 +3654,39 @@ impl SessionClient {
                 continue;
             };
             discovered.can_write = auth.can_write();
+            // Poll first (messages + change check in one request); without
+            // a change, reuse what we read last time (re-read in full now
+            // and then anyway).
+            let changed = match self
+                .group_batch_poll(&id, &auth, group_cursors.get(&id).map(String::as_str))
+                .await
+            {
+                Ok(changed) => changed,
+                Err(error) => {
+                    debug_log(
+                        "group.poll.batch_failed",
+                        &format!("group_prefix={} error={error}", &id[..8]),
+                    );
+                    true
+                }
+            };
+            let cached = self
+                .group_cache
+                .lock()
+                .map_err(|error| error.to_string())?
+                .remove(&id);
+            if !changed
+                && let Some((read_at, cached_access, cached_group, runtime)) = cached
+                && cached_access == access
+                && read_at.elapsed() < FULL_ACCOUNT_SYNC_EVERY
+            {
+                discovered_groups.push(cached_group.clone());
+                runtime_groups.insert(id.clone(), runtime.clone());
+                if let Ok(mut cache) = self.group_cache.lock() {
+                    cache.insert(id, (read_at, cached_access, cached_group, runtime));
+                }
+                continue;
+            }
             let swarm_auth = SwarmAuth::Group(&auth);
             let key_messages = match self.retrieve_namespace_raw(&id, 12, &swarm_auth).await {
                 Ok(messages) => messages,
@@ -3744,16 +3825,20 @@ impl SessionClient {
                     keys.len()
                 ),
             );
+            let runtime = GroupRuntime {
+                id: id.clone(),
+                public_key,
+                auth,
+                keys: keys.into_iter().map(|key| key.key).collect(),
+            };
+            if let Ok(mut cache) = self.group_cache.lock() {
+                cache.insert(
+                    id.clone(),
+                    (Instant::now(), access, discovered.clone(), runtime.clone()),
+                );
+            }
             discovered_groups.push(discovered);
-            runtime_groups.insert(
-                id.clone(),
-                GroupRuntime {
-                    id,
-                    public_key,
-                    auth,
-                    keys: keys.into_iter().map(|key| key.key).collect(),
-                },
-            );
+            runtime_groups.insert(id, runtime);
         }
         *self.groups.lock().map_err(|error| error.to_string())? = runtime_groups;
         Ok(discovered_groups)
@@ -4397,23 +4482,36 @@ impl SessionClient {
                 config.port
             ),
         );
-        let upload = self
-            .network
-            .send_server_request(
-                "POST",
-                &config.scheme,
-                &config.host,
-                Some(config.port),
-                &config.pubkey_hex,
-                libsession::network::backends::file_server::ENDPOINT_FILE,
-                vec![("Content-Type".into(), "application/octet-stream".into())],
-                Some(&encrypted),
-            )
-            .await
-            .map_err(|e| {
-                debug_log("attachment.upload_failed", &format!("error={e}"));
-                format!("attachment upload failed: {e}")
-            })?;
+        // A server error (5xx) is often momentary: try twice more.
+        let mut attempt = 0;
+        let upload = loop {
+            attempt += 1;
+            let upload = self
+                .network
+                .send_server_request(
+                    "POST",
+                    &config.scheme,
+                    &config.host,
+                    Some(config.port),
+                    &config.pubkey_hex,
+                    libsession::network::backends::file_server::ENDPOINT_FILE,
+                    vec![("Content-Type".into(), "application/octet-stream".into())],
+                    Some(&encrypted),
+                )
+                .await
+                .map_err(|e| {
+                    debug_log("attachment.upload_failed", &format!("error={e}"));
+                    format!("attachment upload failed: {e}")
+                })?;
+            if upload.status_code < 500 || attempt >= 3 {
+                break upload;
+            }
+            debug_log(
+                "attachment.upload_retry",
+                &format!("http_status={} attempt={attempt}", upload.status_code),
+            );
+            tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+        };
         if upload.status_code != 200 {
             debug_log(
                 "attachment.upload_failed",
@@ -4884,6 +4982,190 @@ impl SessionClient {
         Ok(())
     }
 
+    /// One onion request for a poll: the first page of new 1:1 messages
+    /// (namespace 0, after `cursor`) plus whether any account config
+    /// namespace has messages newer than our cursor on this node. Returns
+    /// the namespace-0 response body and that flag.
+    async fn batch_poll(
+        &self,
+        node: &ServiceNode,
+        cursor: Option<&str>,
+    ) -> Result<(Value, bool), String> {
+        let pubkey = self.identity.session_id.as_str();
+        let pubkey_ed25519 = hex::encode(self.identity.ed_public);
+        let config_cursors: Vec<(String, Option<String>)> = ACCOUNT_NAMESPACES
+            .iter()
+            .map(|namespace| {
+                let key = node_cursor_key(pubkey, *namespace, node);
+                let cursor = self.cursor_for(&key);
+                (key, cursor)
+            })
+            .collect();
+        let mut requests = Vec::new();
+        for (namespace, last_hash) in std::iter::once((0, cursor)).chain(
+            ACCOUNT_NAMESPACES
+                .iter()
+                .zip(&config_cursors)
+                .map(|(namespace, (_, cursor))| (*namespace, cursor.as_deref())),
+        ) {
+            let params = rpc::build_retrieve_params(&RetrieveParams {
+                pubkey,
+                pubkey_ed25519: &pubkey_ed25519,
+                namespace,
+                timestamp_ms: now_ms(),
+                last_hash,
+                max_size: Some(if namespace == 0 { 1_000_000 } else { 200_000 }),
+                signing_key: &self.identity.ed_secret,
+            })
+            .map_err(|error| error.to_string())?;
+            requests.push(serde_json::json!({ "method": "retrieve", "params": params }));
+        }
+        let mut bodies = self.send_retrieve_batch(node, requests).await?;
+        let mut changed = false;
+        for ((key, _), body) in config_cursors.into_iter().zip(&bodies[1..]) {
+            if let Some(hash) = body["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message.get("hash"))
+                .and_then(Value::as_str)
+            {
+                changed = true;
+                self.set_cursor(key, hash.to_owned());
+            }
+        }
+        debug_log(
+            "poll.batch",
+            &format!(
+                "messages={} account_changed={changed}",
+                bodies[0]["messages"].as_array().map_or(0, Vec::len)
+            ),
+        );
+        Ok((bodies.swap_remove(0), changed))
+    }
+
+    /// Several `retrieve` requests to one node in a single onion request.
+    /// Returns each response body, in order; any failed one fails all.
+    async fn send_retrieve_batch(
+        &self,
+        node: &ServiceNode,
+        requests: Vec<Value>,
+    ) -> Result<Vec<Value>, String> {
+        let count = requests.len();
+        let response = self
+            .network
+            .send_rpc_to(node, "batch", serde_json::json!({ "requests": requests }))
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status_code != 200 {
+            return Err(format!("batch returned HTTP {}", response.status_code));
+        }
+        let mut value: Value = serde_json::from_str(response.body.as_deref().unwrap_or(""))
+            .map_err(|error| format!("invalid batch response: {error}"))?;
+        let mut results = match value.get_mut("results").map(Value::take) {
+            Some(Value::Array(results)) if results.len() == count => results,
+            _ => return Err("batch response has no matching results".into()),
+        };
+        let mut bodies = Vec::new();
+        for result in &mut results {
+            let code = result.get("code").and_then(Value::as_u64).unwrap_or(0);
+            let body = result.get_mut("body").map(Value::take).unwrap_or(Value::Null);
+            if code != 200 || body.get("messages").and_then(Value::as_array).is_none() {
+                return Err(format!("batch sub-request returned {code}"));
+            }
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+
+    /// A group's poll in one onion request: the first page of new messages
+    /// (namespace 11, kept for `retrieve_group_messages`) and whether its
+    /// keys, info or member list changed since we last read them from this
+    /// node. Returns that flag.
+    async fn group_batch_poll(
+        &self,
+        group_id: &str,
+        auth: &GroupAuth,
+        fallback_cursor: Option<&str>,
+    ) -> Result<bool, String> {
+        let node = self.poll_node(group_id).await?;
+        let message_key = node_cursor_key(group_id, 11, &node);
+        let message_cursor = self
+            .cursor_for(&message_key)
+            .or_else(|| fallback_cursor.map(str::to_owned));
+        let config_keys: Vec<String> = GROUP_CONFIG_NAMESPACES
+            .iter()
+            .map(|namespace| node_cursor_key(group_id, *namespace, &node))
+            .collect();
+        let mut requests = Vec::new();
+        for (namespace, cursor) in std::iter::once((11, message_cursor)).chain(
+            GROUP_CONFIG_NAMESPACES
+                .iter()
+                .zip(&config_keys)
+                .map(|(namespace, key)| (*namespace, self.cursor_for(key))),
+        ) {
+            let mut params =
+                self.group_auth_params(auth, group_id, "retrieve", namespace, now_ms())?;
+            params.insert(
+                "max_size".to_owned(),
+                Value::from(if namespace == 11 { 1_000_000u32 } else { 200_000 }),
+            );
+            if let Some(cursor) = cursor {
+                params.insert("last_hash".to_owned(), Value::String(cursor));
+            }
+            requests.push(serde_json::json!({ "method": "retrieve", "params": params }));
+        }
+        let mut bodies = match self.send_retrieve_batch(&node, requests).await {
+            Ok(bodies) => bodies,
+            Err(error) => {
+                self.drop_poll_node(group_id).await;
+                return Err(error);
+            }
+        };
+        let mut changed = false;
+        for (key, body) in config_keys.into_iter().zip(&bodies[1..]) {
+            if let Some(hash) = body["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message.get("hash"))
+                .and_then(Value::as_str)
+            {
+                changed = true;
+                self.set_cursor(key, hash.to_owned());
+            }
+        }
+        debug_log(
+            "group.poll.batch",
+            &format!(
+                "group_prefix={} messages={} config_changed={changed}",
+                &group_id[..group_id.len().min(8)],
+                bodies[0]["messages"].as_array().map_or(0, Vec::len)
+            ),
+        );
+        if let Ok(mut pages) = self.group_pages.lock() {
+            pages.insert(
+                group_id.to_owned(),
+                (hex::encode(node.ed25519_pubkey.0), bodies.swap_remove(0)),
+            );
+        }
+        Ok(changed)
+    }
+
+    /// The account state from the stored dumps alone, for a poll that saw
+    /// no config change: nothing is fetched, pushed or removed.
+    fn local_account_state(
+        &self,
+        dumps: &[Option<Vec<u8>>; 4],
+    ) -> Result<AccountSyncResult, String> {
+        let configs = session_tui_account::AccountConfigs::new(&self.identity.ed_secret, dumps)?;
+        Ok(AccountSyncResult {
+            state: configs.state(),
+            user_groups: configs.groups.get().iter_groups().cloned().collect(),
+            dumps: [None, None, None, None],
+            applied: Vec::new(),
+            removed: Vec::new(),
+        })
+    }
+
     async fn retrieve_messages(
         &self,
         last_hash: Option<&str>,
@@ -4898,6 +5180,10 @@ impl SessionClient {
         );
         // Candidates left by a sync that failed or timed out are dropped.
         let _ = self.take_pending_cursors();
+        // Group pages left by an earlier poll are never used.
+        if let Ok(mut pages) = self.group_pages.lock() {
+            pages.clear();
+        }
         let pubkey_ed25519 = hex::encode(self.identity.ed_public);
         let mut items: Vec<Value> = Vec::new();
         // One sticky node with its own cursor (see `node_cursors`); the
@@ -4915,7 +5201,20 @@ impl SessionClient {
                 self.cursor_for(&node_key).is_some()
             ),
         );
+        // Namespace 0 and the account config check in one round trip; on
+        // any batch problem, the separate requests as before.
+        let (mut first_page, account_changed) =
+            match self.batch_poll(&node, cursor.as_deref()).await {
+                Ok((page, changed)) => (Some(page), Some(changed)),
+                Err(error) => {
+                    debug_log("poll.batch_failed", &format!("error={error}"));
+                    (None, None)
+                }
+            };
         for _ in 0..MAX_RETRIEVE_PAGES {
+            let mut value = if let Some(page) = first_page.take() {
+                page
+            } else {
             let response = match self
                 .network
                 .send_retrieve_to(
@@ -4962,8 +5261,9 @@ impl SessionClient {
             let body = response
                 .body
                 .ok_or_else(|| "Empty retrieve response".to_string())?;
-            let mut value: Value = serde_json::from_str(&body)
-                .map_err(|e| format!("Invalid retrieve response: {e}"))?;
+            serde_json::from_str::<Value>(&body)
+                .map_err(|e| format!("Invalid retrieve response: {e}"))?
+            };
             let more = value.get("more").and_then(Value::as_bool).unwrap_or(false);
             let page = match value.get_mut("messages").map(Value::take) {
                 Some(Value::Array(page)) => page,
@@ -5079,11 +5379,34 @@ impl SessionClient {
             // history, which re-acknowledged every old message.
             incoming.push(message);
         }
-        let account = match self.sync_account(account_dumps, account_changes).await {
-            Ok(account) => Some(account),
-            Err(error) => {
-                debug_log("account.sync_failed", &error);
-                None
+        // The full config fetch (four more requests) only when something
+        // changed, we have changes to push, or it is due anyway.
+        let full_due = self
+            .last_full_account_sync
+            .lock()
+            .map(|at| at.is_none_or(|at| at.elapsed() >= FULL_ACCOUNT_SYNC_EVERY))
+            .unwrap_or(true);
+        let full = account_changed != Some(false) || !account_changes.is_empty() || full_due;
+        let account = if full {
+            match self.sync_account(account_dumps, account_changes).await {
+                Ok(account) => {
+                    if let Ok(mut at) = self.last_full_account_sync.lock() {
+                        *at = Some(Instant::now());
+                    }
+                    Some(account)
+                }
+                Err(error) => {
+                    debug_log("account.sync_failed", &error);
+                    None
+                }
+            }
+        } else {
+            match self.local_account_state(&account_dumps) {
+                Ok(account) => Some(account),
+                Err(error) => {
+                    debug_log("account.local_state_failed", &error);
+                    None
+                }
             }
         };
         let user_groups = account
@@ -5095,7 +5418,7 @@ impl SessionClient {
             .map(|account| account.removed.clone())
             .unwrap_or_default();
         let groups = match self
-            .discover_groups(&local_groups, user_groups, &removed)
+            .discover_groups(&local_groups, user_groups, &removed, &group_cursors)
             .await
         {
             Ok(groups) => groups,
@@ -6129,16 +6452,9 @@ async fn run(
                 let _ = terminal.backend_mut().flush();
             }
         }
-        let waiting_for_receipt = app.conversations.iter().flat_map(|c| &c.messages).any(|m| {
-            m.outgoing
-                && m.receipt_status < 2
-                && now_ms().saturating_sub(m.timestamp_ms) < 5 * 60 * 1000
-        });
-        let sync_interval = if waiting_for_receipt {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(30)
-        };
+        // A poll is one onion request (plus one per group) when nothing
+        // changed, so poll often.
+        let sync_interval = Duration::from_secs(3);
         if app.recovery_seed.is_none()
             && sync_task.is_none()
             && last_sync.elapsed() >= sync_interval
@@ -10266,6 +10582,41 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    /// Live check of the batched poll against the real network with a
+    /// throwaway account: `cargo test -- --ignored live_batch_poll`.
+    #[tokio::test]
+    #[ignore = "uses the Session network"]
+    async fn live_batch_poll() {
+        let seed = random::random(32);
+        let client = SessionClient::new(identity_from_seed(seed, None).unwrap()).unwrap();
+        client.network.ensure_bootstrapped().await.unwrap();
+        let node = client.poll_node(&client.identity.session_id).await.unwrap();
+        let (page, changed) = client.batch_poll(&node, None).await.unwrap();
+        assert!(page["messages"].as_array().unwrap().is_empty());
+        assert!(!changed, "a new account has no config messages");
+    }
+
+    /// The same for a group's poll, with a throwaway group we are admin of.
+    #[tokio::test]
+    #[ignore = "uses the Session network"]
+    async fn live_group_batch_poll() {
+        let client =
+            SessionClient::new(identity_from_seed(random::random(32), None).unwrap()).unwrap();
+        client.network.ensure_bootstrapped().await.unwrap();
+        let seed = random::random(32);
+        let (public_key, secret_key) = ed25519::ed25519_key_pair_from_seed(&seed).unwrap();
+        let group_id = format!("03{}", hex::encode(public_key));
+        let auth = GroupAuth::Admin {
+            seed,
+            secret_key: secret_key.to_vec(),
+        };
+        let changed = client.group_batch_poll(&group_id, &auth, None).await.unwrap();
+        assert!(!changed, "a new group has no config messages");
+        let (page_node, page) = client.group_pages.lock().unwrap().remove(&group_id).unwrap();
+        assert_eq!(page_node.len(), 64);
+        assert!(page["messages"].as_array().unwrap().is_empty());
+    }
+
     use super::*;
 
     fn meta(name: &str, content_type: &str) -> AttachmentMeta {
