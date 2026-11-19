@@ -656,6 +656,12 @@ struct App {
     net_task: Option<tokio::task::JoinHandle<libsession::network::NetworkDiagnostics>>,
     /// When a sync last finished and was saved.
     last_sync_ok: Option<std::time::SystemTime>,
+    /// The running sync was asked for (`/rsync`, joining a group): its
+    /// progress and result go to the status line. Automatic polls only
+    /// colour the header dot.
+    sync_manual: bool,
+    /// The last sync failed (red dot).
+    sync_failed: bool,
     /// Composer drafts per chat (local only).
     drafts: session_tui_local::Drafts,
     /// Pinned chats (local only).
@@ -727,6 +733,8 @@ impl App {
             net_view: None,
             net_task: None,
             last_sync_ok: None,
+            sync_manual: false,
+            sync_failed: false,
             drafts: Default::default(),
             pinned: HashSet::new(),
             bookmarks: HashSet::new(),
@@ -851,7 +859,7 @@ impl App {
             return;
         }
         self.selected = self.ensure_contact(&id);
-        self.status = "CONTACT READY · INBOX AUTO-SYNC EVERY 30 SECONDS".into();
+        self.status = "CONTACT READY · NEW MESSAGES ARRIVE AUTOMATICALLY".into();
         self.input.clear();
         self.input_mode = InputMode::Message;
     }
@@ -6460,7 +6468,7 @@ async fn run(
             && last_sync.elapsed() >= sync_interval
         {
             last_sync = Instant::now();
-            start_sync(app, client, store, &mut sync_task);
+            start_sync(app, client, store, &mut sync_task, false);
         }
         // Coalesce bursts of input (e.g. mouse-wheel spins): redraw once the
         // queue is empty, but at least every 50 ms.
@@ -7174,7 +7182,7 @@ async fn run(
                     "/rsync" if rest.is_empty() => {
                         app.input.clear();
                         last_sync = Instant::now();
-                        start_sync(app, client, store, &mut sync_task);
+                        start_sync(app, client, store, &mut sync_task, true);
                     }
                     "/view" => {
                         app.input.clear();
@@ -7583,7 +7591,7 @@ async fn run(
                                 let _ = store.save_contact_name(&group.id, &group.name);
                                 app.selected = index;
                                 last_sync = Instant::now();
-                                start_sync(app, client, store, &mut sync_task);
+                                start_sync(app, client, store, &mut sync_task, true);
                                 app.status = format!("JOINING GROUP · {}", group.name);
                             }
                             None => app.status = "NO PENDING GROUP INVITES".into(),
@@ -8299,9 +8307,12 @@ fn start_sync(
     client: &Arc<SessionClient>,
     store: &LocalStore,
     task: &mut Option<SyncTask>,
+    manual: bool,
 ) {
     if task.is_some() {
-        app.status = "SYNC ALREADY RUNNING".into();
+        if manual {
+            app.status = "SYNC ALREADY RUNNING".into();
+        }
         return;
     }
     let (cursor, group_cursors, local_groups) = match (
@@ -8319,7 +8330,10 @@ fn start_sync(
             return;
         }
     };
-    app.status = "SYNCING IN BACKGROUND · TYPE /? FOR HELP".into();
+    app.sync_manual = manual;
+    if manual {
+        app.status = "SYNCING IN BACKGROUND · TYPE /? FOR HELP".into();
+    }
     debug_log(
         "sync.spawn",
         &format!("cursor_present={}", cursor.is_some()),
@@ -8845,7 +8859,11 @@ fn finish_sync(
         Ok(result) => result,
         Err(error) => {
             debug_log("sync.failed", "request_failed=true");
-            app.status = format!("SYNC FAILED · {error}");
+            // Automatic polls say it once; the dot stays red until one works.
+            if app.sync_manual || !app.sync_failed {
+                app.status = format!("SYNC FAILED · {error}");
+            }
+            app.sync_failed = true;
             return 0;
         }
     };
@@ -9344,11 +9362,28 @@ fn finish_sync(
         app.sort_conversations();
     }
     app.last_sync_ok = Some(std::time::SystemTime::now());
-    app.status = format!(
-        "SYNC · {added} NEW · {groups_found} GROUPS · {} QUEUED · {} DECRYPT FAIL · {} BAD ENVELOPE · {} BAD CONTENT",
-        result.queued, result.undecryptable, result.bad_envelope, result.bad_content
-    );
+    let recovered = std::mem::take(&mut app.sync_failed);
+    if app.sync_manual {
+        app.status = format!(
+            "SYNC · {added} NEW · {groups_found} GROUPS · {} QUEUED · {} DECRYPT FAIL · {} BAD ENVELOPE · {} BAD CONTENT",
+            result.queued, result.undecryptable, result.bad_envelope, result.bad_content
+        );
+    } else if recovered {
+        app.status = "CONNECTED AGAIN".into();
+    }
     notify
+}
+
+/// Header dot: green while polls succeed, red after a failed one, yellow
+/// before the first one finished or when none has worked for a minute.
+fn sync_light(app: &App) -> Color {
+    if app.sync_failed {
+        return Color::Red;
+    }
+    match app.last_sync_ok.and_then(|at| at.elapsed().ok()) {
+        Some(age) if age < Duration::from_secs(60) => Color::Green,
+        _ => Color::Yellow,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -9455,7 +9490,7 @@ fn draw_screen(frame: &mut ratatui::Frame<'_>, app: &mut App) -> Option<Rect> {
             Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
         ),
         Span::raw("                                  "),
-        Span::styled("● ", Style::default().fg(Color::Yellow)),
+        Span::styled("● ", Style::default().fg(sync_light(app))),
         Span::styled(
             &app.status,
             Style::default()
